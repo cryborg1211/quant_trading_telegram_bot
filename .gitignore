@@ -1,0 +1,43 @@
+# --- Secrets & local config ---
+.env
+.env.local
+.env.*.local
+
+# --- Python build artefacts ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtualenvs ---
+venv/
+.venv/
+env/
+
+# --- Data & model artefacts (regenerable) ---
+*.duckdb
+*.duckdb.wal
+data/*.parquet
+data/ohlcv_*.parquet
+data/macro_daily.parquet
+data/alpha360_features.parquet
+models/stacking/
+
+# --- Logs ---
+logs/
+*.log
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# --- Vendored / archived code (not part of source) ---
+old-data/
+TradingAgents-main/

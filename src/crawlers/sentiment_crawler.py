@@ -1,0 +1,382 @@
+import json
+import logging
+import os
+import re
+import time
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from typing import Any, Iterable
+from urllib.parse import urlparse
+
+import duckdb  # type: ignore[import-untyped]
+import pandas as pd
+
+from config.settings import CONFIG
+
+LOGGER = logging.getLogger(__name__)
+
+try:
+    import feedparser
+except ImportError:  # pragma: no cover
+    feedparser = None
+
+try:
+    from gnews import GNews  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover
+    GNews = None
+
+try:
+    from googlenewsdecoder import new_decoderv1  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover
+    new_decoderv1 = None
+
+# New official Google GenAI SDK (replaces deprecated `google.generativeai`).
+# Install: pip install google-genai
+try:
+    from google import genai  # type: ignore[import-untyped]
+    from google.genai import types as genai_types  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover
+    genai = None  # type: ignore[assignment]
+    genai_types = None  # type: ignore[assignment]
+
+
+RSS_FEEDS = {
+    "cafef": "https://cafef.vn/tin-moi.rss",
+    "vietstock": "https://vietstock.vn/rss/chung-khoan.rss",
+    "tinnhanhchungkhoan": "https://www.tinnhanhchungkhoan.vn/rss/chung-khoan-7.rss",
+}
+
+DEFAULT_PROMPT = """
+Bạn là Senior Vietnam Equity Sentiment Analyst trong hệ multi-agent kiểu TradingAgents.
+
+Nhiệm vụ: đọc tin tức, tách tín hiệu đầu tư có thể giao dịch, chấm sentiment theo tác động kỳ vọng lên giá cổ phiếu/ngành/thị trường Việt Nam trong ngắn-trung hạn.
+
+Bắt buộc phân tích theo khung:
+1. Direction: tin hỗ trợ hay gây áp lực giá?
+2. Materiality: tác động có đáng kể không, hay chỉ nhiễu?
+3. Horizon: tác động tức thời, vài phiên, hay dài hơn?
+4. Breadth: tác động riêng ticker, ngành, hay toàn thị trường?
+5. Evidence: nêu chi tiết trong bài làm căn cứ.
+6. Counterpoint: rủi ro diễn giải ngược/không chắc chắn.
+
+Schema JSON hợp lệ:
+{
+  "sentiment_score": float -1..1,
+  "magnitude": float 0..1,
+  "horizon": "intraday|short_term|medium_term|unclear",
+  "breadth": "ticker|sector|market|macro|unclear",
+  "materiality": "low|medium|high",
+  "reason": "tiếng Việt, <= 5 câu, có evidence + counterpoint"
+}
+
+Quy ước chấm:
+- +0.7..+1.0: catalyst tích cực rõ, xác suất ảnh hưởng giá cao.
+- +0.2..+0.6: tích cực vừa/gián tiếp.
+- -0.2..-0.6: tiêu cực vừa/gián tiếp.
+- -0.7..-1.0: rủi ro/catalyst tiêu cực rõ.
+- Gần 0: không liên quan, đã phản ánh, thiếu bằng chứng, hoặc tác động hai chiều.
+- magnitude đo độ mạnh/độ chắc của tác động, không phải hướng.
+- Không phóng đại tiêu đề giật gân; ưu tiên dữ kiện định lượng, chính sách, KQKD, dòng tiền, thanh khoản, pháp lý.
+
+Chỉ trả JSON, không markdown, không giải thích ngoài JSON.
+"""
+
+
+@dataclass
+class NewsItem:
+    date: date
+    title: str
+    url: str
+    text: str
+    ticker: str | None = None
+    is_market_wide: bool = False
+
+
+class SentimentCrawler:
+    """Daily Vietnamese market/news sentiment crawler -> hist_sentiment_llm_labeled."""
+
+    def __init__(
+        self,
+        db_path: str | None = None,
+        model_name: str | None = None,
+    ):
+        self.db_path = db_path or str(CONFIG.paths.duckdb_path)
+        # Strip legacy "models/" prefix — new SDK accepts bare model name only.
+        raw_model = model_name or CONFIG.sentiment.gemini_model
+        self.model_name = raw_model.removeprefix("models/")
+        self._client: Any | None = None
+        api_key = os.getenv("GEMINI_API_KEY")
+        if api_key and genai is not None and genai_types is not None:
+            self._client = genai.Client(api_key=api_key)
+            LOGGER.info("[SentimentCrawler] Gemini client (google-genai) initialised; model=%s", self.model_name)
+        else:
+            LOGGER.warning("[SentimentCrawler] GEMINI_API_KEY not set or google-genai missing — scoring disabled.")
+
+    def update_daily_sentiment(self, lookback_days: int | None = None, max_tickers: int | None = None) -> pd.DataFrame:
+        start_date = self._compute_start_date(lookback_days)
+        end_date = datetime.now().date()
+        tickers = self._active_tickers(limit=max_tickers or CONFIG.sentiment.max_tickers)
+
+        LOGGER.info("[SentimentCrawler] Crawl window: %s..%s; tickers=%s", start_date, end_date, len(tickers))
+        items = []
+        items.extend(self._fetch_rss_items(start_date=start_date, end_date=end_date))
+        items.extend(self._fetch_gnews_items(tickers=tickers, start_date=start_date, end_date=end_date))
+
+        deduped = self._dedupe(items)
+        existing_urls = self._existing_urls()
+        new_items = [item for item in deduped if item.url and item.url not in existing_urls]
+
+        if not new_items:
+            LOGGER.info("[SentimentCrawler] No new sentiment articles found.")
+            return pd.DataFrame()
+
+        rows = [self._score_item(item) for item in new_items]
+        df = pd.DataFrame(rows)
+        self._append_rows(df)
+        LOGGER.info("[SentimentCrawler] Appended %s sentiment rows to hist_sentiment_llm_labeled.", len(df))
+        return df
+
+    def _compute_start_date(self, lookback_days: int | None) -> date:
+        today = datetime.now().date()
+        if lookback_days is None:
+            lookback_days = (
+                CONFIG.sentiment.rss_lookback_monday_days
+                if today.weekday() == 0
+                else CONFIG.sentiment.rss_lookback_weekday_days
+            )
+
+        fallback = today - timedelta(days=lookback_days)
+        try:
+            with duckdb.connect(self.db_path, read_only=True) as conn:
+                row = conn.execute("SELECT MAX(CAST(date AS DATE)) FROM hist_sentiment_llm_labeled").fetchone()
+                max_dt = row[0] if row else None
+            if max_dt:
+                return min(max_dt, fallback)
+        except Exception:
+            pass
+        return fallback
+
+    def _active_tickers(self, limit: int) -> list[str]:
+        query = """
+            SELECT ticker
+            FROM stock_ohlcv
+            WHERE date >= (SELECT MAX(date) - INTERVAL 10 DAY FROM stock_ohlcv)
+            GROUP BY ticker
+            ORDER BY SUM(volume) DESC NULLS LAST
+            LIMIT ?
+        """
+        try:
+            with duckdb.connect(self.db_path, read_only=True) as conn:
+                rows = conn.execute(query, [limit]).fetchall()
+            return [str(r[0]).upper() for r in rows]
+        except Exception:
+            return []
+
+    def _fetch_rss_items(self, start_date: date, end_date: date) -> list[NewsItem]:
+        if feedparser is None:
+            LOGGER.warning("[SentimentCrawler] feedparser missing. Skipping RSS sentiment.")
+            return []
+
+        items = []
+        for source, feed_url in RSS_FEEDS.items():
+            try:
+                parsed = feedparser.parse(feed_url)
+                for entry in parsed.entries:
+                    published = self._parse_entry_date(entry)
+                    if published and not (start_date <= published <= end_date):
+                        continue
+                    title = self._clean_text(getattr(entry, "title", ""))
+                    summary = self._clean_text(getattr(entry, "summary", ""))
+                    url = getattr(entry, "link", "")
+                    if title and url:
+                        items.append(
+                            NewsItem(
+                                date=published or end_date,
+                                title=title,
+                                url=url,
+                                text=f"{title}\n{summary}",
+                                is_market_wide=True,
+                            )
+                        )
+                LOGGER.info("[SentimentCrawler] RSS %s: %s entries scanned.", source, len(parsed.entries))
+            except Exception as exc:
+                LOGGER.warning("[SentimentCrawler] RSS %s failed: %s", source, exc)
+        return items
+
+    def _fetch_gnews_items(self, tickers: Iterable[str], start_date: date, end_date: date) -> list[NewsItem]:
+        if GNews is None:
+            LOGGER.warning("[SentimentCrawler] gnews missing. Skipping ticker GNews sentiment.")
+            return []
+
+        client = GNews(language="vi", country="VN", max_results=CONFIG.sentiment.gnews_max_results)
+        items = []
+        for ticker in tickers:
+            query = f'"{ticker}" chứng khoán OR cổ phiếu site:cafef.vn OR site:vietstock.vn'
+            try:
+                results = client.get_news(query) or []
+                for result in results:
+                    title = self._clean_text(result.get("title", ""))
+                    url = self._decode_google_url(result.get("url", ""))
+                    published = self._parse_gnews_date(result.get("published date")) or end_date
+                    if not (start_date <= published <= end_date):
+                        continue
+                    text = title
+                    if hasattr(client, "get_full_article"):
+                        try:
+                            article = client.get_full_article(url)
+                            if article and getattr(article, "text", None):
+                                text = article.text[: CONFIG.sentiment.article_char_limit]
+                        except Exception:
+                            pass
+                    if title and url:
+                        items.append(NewsItem(date=published, title=title, url=url, text=text, ticker=ticker))
+                time.sleep(CONFIG.sentiment.gnews_sleep_seconds)
+            except Exception as exc:
+                LOGGER.warning("[SentimentCrawler] GNews %s failed: %s", ticker, exc)
+        return items
+
+    @staticmethod
+    def _parse_entry_date(entry) -> date | None:
+        for attr in ("published_parsed", "updated_parsed"):
+            value = getattr(entry, attr, None)
+            if value:
+                return datetime(*value[:6]).date()
+        return None
+
+    @staticmethod
+    def _parse_gnews_date(value) -> date | None:
+        if not value:
+            return None
+        for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(str(value), fmt).date()
+            except ValueError:
+                continue
+        try:
+            return pd.to_datetime(value).date()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _clean_text(value: str) -> str:
+        value = re.sub(r"<[^>]+>", " ", str(value or ""))
+        return re.sub(r"\s+", " ", value).strip()
+
+    @staticmethod
+    def _decode_google_url(url: str) -> str:
+        if not url:
+            return ""
+        if new_decoderv1 and "news.google.com" in urlparse(url).netloc:
+            try:
+                decoded = new_decoderv1(url, interval=1)
+                if isinstance(decoded, dict) and decoded.get("status") and decoded.get("decoded_url"):
+                    return decoded["decoded_url"]
+            except Exception:
+                return url
+        return url
+
+    @staticmethod
+    def _dedupe(items: list[NewsItem]) -> list[NewsItem]:
+        seen = set()
+        out = []
+        for item in items:
+            key = item.url.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
+
+    def _existing_urls(self) -> set[str]:
+        try:
+            with duckdb.connect(self.db_path, read_only=True) as conn:
+                rows = conn.execute("SELECT DISTINCT url FROM hist_sentiment_llm_labeled WHERE url IS NOT NULL").fetchall()
+            return {str(r[0]) for r in rows}
+        except Exception:
+            return set()
+
+    def _score_item(self, item: NewsItem) -> dict:
+        score = {"sentiment_score": 0.0, "magnitude": 0.0, "reason": "Neutral fallback"}
+        if self._client is not None and genai_types is not None:
+            # DEFAULT_PROMPT is passed as system_instruction; user message contains only
+            # the article data so the model can focus on content, not instructions.
+            user_message = (
+                f"TICKER: {item.ticker or 'MARKET_WIDE'}\n"
+                f"DATE: {item.date.isoformat()}\n"
+                f"TITLE: {item.title}\n"
+                f"CONTENT: {item.text[: CONFIG.sentiment.article_char_limit]}"
+            )
+            try:
+                response = self._client.models.generate_content(
+                    model=self.model_name,
+                    contents=user_message,
+                    config=genai_types.GenerateContentConfig(
+                        system_instruction=DEFAULT_PROMPT,
+                        response_mime_type="application/json",
+                        temperature=0.0,
+                    ),
+                )
+                raw = (response.text or "").strip()
+                # response_mime_type="application/json" avoids markdown fences,
+                # but keep the strip as a defensive fallback.
+                raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                parsed = json.loads(raw)
+                score = {
+                    "sentiment_score": float(parsed.get("sentiment_score", parsed.get("score", 0.0))),
+                    "magnitude": float(parsed.get("magnitude", 0.0)),
+                    "reason": str(parsed.get("reason", ""))[:1000],
+                }
+            except Exception as exc:
+                LOGGER.warning("[SentimentCrawler] Gemini scoring failed for %s: %s", item.url, exc)
+                score["reason"] = f"Gemini fallback: {exc}"
+
+        sentiment = max(-1.0, min(1.0, float(score["sentiment_score"])))
+        magnitude = max(0.0, min(1.0, float(score["magnitude"])))
+        return {
+            "date": pd.Timestamp(item.date),
+            "title": item.title[:1000],
+            "sentiment_score": sentiment,
+            "magnitude": magnitude,
+            "reason": score["reason"],
+            "url": item.url,
+            "sentiment_nlp": sentiment,
+            "impact_force": sentiment * magnitude,
+            "is_market_wide": bool(item.is_market_wide),
+        }
+
+    def _append_rows(self, df: pd.DataFrame) -> None:
+        if df.empty:
+            return
+        df = df.replace({"NaN": None, "nan": None})
+        with duckdb.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hist_sentiment_llm_labeled (
+                    date TIMESTAMP,
+                    title VARCHAR,
+                    sentiment_score DOUBLE,
+                    magnitude DOUBLE,
+                    reason VARCHAR,
+                    url VARCHAR,
+                    sentiment_nlp DOUBLE,
+                    impact_force DOUBLE,
+                    is_market_wide BOOLEAN
+                )
+                """
+            )
+            conn.execute("INSERT INTO hist_sentiment_llm_labeled BY NAME SELECT * FROM df")
+
+
+def update_daily_sentiment(
+    db_path: str | None = None,
+    lookback_days: int | None = None,
+    max_tickers: int | None = None,
+) -> pd.DataFrame:
+    return SentimentCrawler(db_path=db_path).update_daily_sentiment(
+        lookback_days=lookback_days,
+        max_tickers=max_tickers,
+    )
+
+
+if __name__ == "__main__":
+    update_daily_sentiment()

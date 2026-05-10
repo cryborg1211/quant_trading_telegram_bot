@@ -1,0 +1,9 @@
+{
+    "cash": 4609600.0,
+    "positions": {
+        "FPT": {
+            "quantity": 700,
+            "average_entry_price": 136000
+        }
+    }
+}

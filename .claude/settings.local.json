@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python main.py --task full_pipeline)",
+      "Bash(python -X utf8 main.py --task full_pipeline)",
+      "Bash(Get-Content \"C:\\\\Users\\\\caokh\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-caokh-Desktop-vscode-stock-price-v3\\\\a402128c-09f8-427c-9f3f-e5c45e2e31a4\\\\tasks\\\\bow351zna.output\" -Wait)",
+      "Bash(Select-String -Pattern \"ERROR|error|Exception|Traceback|LiquidityFilter|Brain|TelegramBot|News Fetcher|Alpha360|Stacking|Pipeline|crawl|Macro|completed|finished|dispatched|MOCK ALERT|Alert sent|WARNING|WARN\" --SimpleMatch)",
+      "Bash(python -X utf8 main.py --task daily_inference)",
+      "Bash(python -X utf8 -c ' *)",
+      "Bash(pip show *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/utils/telegram_bot.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('main.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('run_bot.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK: all three files parse cleanly'\\)\")"
+    ]
+  }
+}
