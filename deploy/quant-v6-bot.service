@@ -1,0 +1,35 @@
+[Unit]
+Description=Quant V6 Telegram Bot (run_bot.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Adjust User/Group and the paths below for your install.
+# Recommended: dedicated unprivileged user (see install instructions below).
+User=quantbot
+Group=quantbot
+
+WorkingDirectory=/opt/stock_price_v3
+EnvironmentFile=/opt/stock_price_v3/.env
+
+# Use the project's venv interpreter so the locked dependency set is used.
+ExecStart=/opt/stock_price_v3/.venv/bin/python /opt/stock_price_v3/run_bot.py
+
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Systemd captures stdout/stderr (Python's StreamHandler stream) in addition
+# to the rotating ./logs/quant_v6.log produced by TD-26.
+StandardOutput=append:/var/log/quant-v6-bot.log
+StandardError=append:/var/log/quant-v6-bot.err.log
+
+# Graceful shutdown — give the polling loop 30s to finish current requests.
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

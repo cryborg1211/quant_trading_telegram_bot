@@ -147,7 +147,9 @@ class SentimentCrawler:
 
         fallback = today - timedelta(days=lookback_days)
         try:
-            with duckdb.connect(self.db_path, read_only=True) as conn:
+            # No `read_only=True` — DuckDB rejects mixed-config connections to
+            # the same file in one process (see db_engine.py docstring).
+            with duckdb.connect(self.db_path) as conn:
                 row = conn.execute("SELECT MAX(CAST(date AS DATE)) FROM hist_sentiment_llm_labeled").fetchone()
                 max_dt = row[0] if row else None
             if max_dt:
@@ -166,7 +168,9 @@ class SentimentCrawler:
             LIMIT ?
         """
         try:
-            with duckdb.connect(self.db_path, read_only=True) as conn:
+            # No `read_only=True` — DuckDB rejects mixed-config connections to
+            # the same file in one process (see db_engine.py docstring).
+            with duckdb.connect(self.db_path) as conn:
                 rows = conn.execute(query, [limit]).fetchall()
             return [str(r[0]).upper() for r in rows]
         except Exception:
@@ -289,7 +293,9 @@ class SentimentCrawler:
 
     def _existing_urls(self) -> set[str]:
         try:
-            with duckdb.connect(self.db_path, read_only=True) as conn:
+            # No `read_only=True` — DuckDB rejects mixed-config connections to
+            # the same file in one process (see db_engine.py docstring).
+            with duckdb.connect(self.db_path) as conn:
                 rows = conn.execute("SELECT DISTINCT url FROM hist_sentiment_llm_labeled WHERE url IS NOT NULL").fetchall()
             return {str(r[0]) for r in rows}
         except Exception:
@@ -376,6 +382,53 @@ def update_daily_sentiment(
         lookback_days=lookback_days,
         max_tickers=max_tickers,
     )
+
+
+def fetch_latest_market_news(limit: int = 20) -> list[dict[str, Any]]:
+    """Fetch the N most recent items from the configured Vietnamese RSS feeds.
+
+    Used by the /news Telegram bot command. Independent of the LLM scoring
+    path so it does NOT need a Gemini API key or DuckDB connection.
+
+    Returns:
+        list of {"title": str, "url": str, "source": str, "published": datetime}
+        sorted by `published` DESC. Empty list if feedparser is unavailable
+        or every feed errored.
+    """
+    if feedparser is None:
+        LOGGER.warning("[News] feedparser missing — returning empty list.")
+        return []
+
+    items: list[dict[str, Any]] = []
+    for source, feed_url in RSS_FEEDS.items():
+        try:
+            parsed = feedparser.parse(feed_url)
+            for entry in parsed.entries:
+                title_raw = str(getattr(entry, "title", "") or "")
+                title = re.sub(r"<[^>]+>", " ", title_raw)
+                title = re.sub(r"\s+", " ", title).strip()
+                url = str(getattr(entry, "link", "") or "")
+                published_struct = (
+                    getattr(entry, "published_parsed", None)
+                    or getattr(entry, "updated_parsed", None)
+                )
+                published_dt = (
+                    datetime(*published_struct[:6])
+                    if published_struct
+                    else datetime.min
+                )
+                if title and url:
+                    items.append({
+                        "title": title,
+                        "url": url,
+                        "source": source,
+                        "published": published_dt,
+                    })
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("[News] RSS %s fetch failed: %s", source, exc)
+
+    items.sort(key=lambda x: x["published"], reverse=True)
+    return items[:limit]
 
 
 if __name__ == "__main__":

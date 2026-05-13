@@ -1,9 +1,12 @@
 import argparse
+import html
 import json
 import logging
+import os
 import re
 import sys
 import time
+import traceback
 from contextlib import contextmanager
 from datetime import datetime, time as dt_time
 from pathlib import Path
@@ -20,7 +23,14 @@ from src.trading.portfolio_manager import PortfolioManager
 from src.utils.telegram_alerter import TelegramBot
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
-MARKET_CLOSE = dt_time(14, 45)
+# OHLCV crawl guard: 15:00 ICT.
+# Vietnamese market officially closes at 15:00. The daily candle is NOT
+# considered finalized until then — fetching mid-day:
+#   • returns an incomplete (still-moving) close price
+#   • adds DB write pressure while reads are happening from the bot path
+#   • poisons training data if the new partial candle gets persisted
+# This must be 15:00 sharp (NOT 14:45 ATC) to ensure the close is final.
+MARKET_CLOSE = dt_time(15, 0)
 
 # ---------------------------------------------------------------------------
 # Human-readable feature name mapping for Alpha360 technical indicators
@@ -106,6 +116,9 @@ _MACRO_INNER_NAMES: dict[str, str] = {
     "vnindex_return": "Biến động VN-Index",
     "vnindex_close": "VN-Index",
     "interbank_rate": "Lãi suất liên ngân hàng",
+    "interbank_on_rate": "Lãi suất liên ngân hàng qua đêm (ON)",
+    "vnibor": "Lãi suất liên ngân hàng 1 tháng (VNIBOR 1M)",
+    "inflation_yoy": "Lạm phát YoY (VN CPI)",
     "deposit_rate": "Lãi suất tiền gửi",
 }
 
@@ -261,16 +274,29 @@ def timed_step(message: str):
 
 
 def is_crawl_allowed(force_crawl: bool = False) -> bool:
+    """Return True iff the OHLCV crawl may run.
+
+    Skips with a clear log if current VN local time is before `MARKET_CLOSE`
+    (15:00 ICT). The caller is expected to continue straight into inference
+    using whatever data is already in the DuckDB / parquet store rather than
+    pulling fresh (and incomplete) candles.
+
+    `force_crawl=True` bypasses the guard — for operator-initiated rebuilds.
+    """
     now = datetime.now(VN_TZ)
     if force_crawl:
         LOGGER.warning("force_crawl=True. Market-hour crawl guard bypassed.")
         return True
     if now.time() < MARKET_CLOSE:
-        LOGGER.warning("[WARNING] Market is still open. Skipping crawl phase to prevent unclosed candle data.")
         LOGGER.warning(
-            "Crawl skipped before VN market close (%s ICT). Current time=%s.",
+            "[Crawler] Skipped OHLCV fetch. Current time is before %s. "
+            "Using existing DB data.",
             MARKET_CLOSE.strftime("%H:%M"),
+        )
+        LOGGER.info(
+            "[Crawler] Current VN local time=%s (threshold=%s ICT).",
             now.strftime("%H:%M:%S %Z"),
+            MARKET_CLOSE.strftime("%H:%M"),
         )
         return False
     return True
@@ -423,18 +449,165 @@ def _build_combined_report(signal_data_list: list[dict]) -> str:
     return _REPORT_SEPARATOR.join(parts)
 
 
-def daily_inference(window_rows: int = 120, max_candidates: int = 6) -> str:
+# ---------------------------------------------------------------------------
+# TD-05: RL prediction logging + T+5 outcome backfill
+# ---------------------------------------------------------------------------
+# Before this fix, the `rl_mistake_logs` table was being filled with rows
+# whose `actual_t5_outcome` was a hardcoded `-0.05` — making the entire
+# table useless for Phase-3 RL training. The corrected flow is two-phase:
+#
+#   T0:  INSERT row with actual_t5_outcome = NULL for every high-confidence
+#        UP prediction. We don't know the outcome yet.
+#   T+5: UPDATE every NULL row whose predicted_date is ≥5 days in the past,
+#        looking up the actual close prices from stock_ohlcv and computing
+#        (t5_close - t0_close) / t0_close.
+#
+# Both phases run inside `run_trade_execution` on every daily_inference
+# call, so backfill happens automatically on the next session after a
+# 5-day window elapses.
+
+_RL_UP_CONFIDENCE_THRESHOLD: float = 0.6  # only log strong UP predictions
+_RL_HORIZON_DAYS: int = 5                 # match the model's 5d horizon
+
+
+def _log_rl_predictions(
+    db: Any,
+    predictions_5d: dict[str, list[float]],
+    top_pos_features_text: str,
+) -> int:
+    """Phase 1 (T0): record every high-confidence UP prediction with NULL outcome.
+
+    The actual outcome is filled in by `_backfill_rl_outcomes` once ≥5
+    trading days have elapsed. Returns the number of rows inserted today.
+
+    TD-50: each INSERT runs under `db._audit_lock` so concurrent writers
+    (the bot's audit-log thread + this RL thread) serialize cleanly
+    instead of relying on DuckDB's internal mutex alone.
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    logged = 0
+    for ticker, probs in predictions_5d.items():
+        if not probs or len(probs) < 3:
+            continue
+        if probs[2] <= _RL_UP_CONFIDENCE_THRESHOLD:
+            continue
+        features_json = json.dumps(
+            {
+                "model": "stacking_gbdt_5d",
+                "p_up": round(float(probs[2]), 4),
+                "top_drivers": top_pos_features_text,
+            },
+            ensure_ascii=False,
+        )
+        with db._audit_lock:
+            db.conn.execute(
+                """
+                INSERT INTO rl_mistake_logs
+                (ticker, predicted_date, predicted_action, actual_t5_outcome, features_snapshot)
+                VALUES (?, ?, 'BUY', NULL, ?)
+                """,
+                [ticker, today_str, features_json],
+            )
+        logged += 1
+    return logged
+
+
+def _backfill_rl_outcomes(db: Any) -> int:
+    """Phase 2 (T+5+): fill in `actual_t5_outcome` for rows where predicted_date
+    is ≥5 days in the past and outcome is still NULL.
+
+    For each pending row, looks up:
+        • t0_close = stock_ohlcv close on `predicted_date`
+                     (or the most recent trading day on/before it — handles
+                      weekends/holidays defensively)
+        • t5_close = first available close from stock_ohlcv whose date is
+                     ≥ predicted_date + 5 days
+
+    Computes `(t5_close - t0_close) / t0_close` as the actual % return
+    and UPDATEs the row. Rows with missing OHLCV (delisted, illiquid)
+    stay NULL and will be retried on the next pipeline run.
+
+    Returns the number of rows backfilled in this run.
+
+    TD-50: the UPDATE write runs under `db._audit_lock` so concurrent
+    writers serialize. The two SELECT lookups are read-only and don't
+    need the lock — DuckDB's internal mutex handles read safety.
+    """
+    pending = db.conn.execute(
+        f"""
+        SELECT ticker, predicted_date, predicted_action
+        FROM rl_mistake_logs
+        WHERE actual_t5_outcome IS NULL
+          AND predicted_date <= CURRENT_DATE - INTERVAL {_RL_HORIZON_DAYS} DAY
+        """
+    ).fetchall()
+
+    backfilled = 0
+    for ticker, predicted_date, action in pending:
+        # T0 close — use ≤ predicted_date so a weekend prediction still
+        # finds the prior trading day's close. (Read — no lock needed.)
+        t0_row = db.conn.execute(
+            """
+            SELECT close FROM stock_ohlcv
+            WHERE ticker = ? AND date <= ?
+            ORDER BY date DESC LIMIT 1
+            """,
+            [ticker, predicted_date],
+        ).fetchone()
+        # T+5 close — first available trading day at or after predicted_date + 5d.
+        t5_row = db.conn.execute(
+            f"""
+            SELECT close FROM stock_ohlcv
+            WHERE ticker = ? AND date >= ? + INTERVAL {_RL_HORIZON_DAYS} DAY
+            ORDER BY date ASC LIMIT 1
+            """,
+            [ticker, predicted_date],
+        ).fetchone()
+
+        if not t0_row or not t5_row:
+            continue
+        t0_close, t5_close = t0_row[0], t5_row[0]
+        if t0_close is None or t5_close is None or t0_close <= 0:
+            continue
+
+        actual = (float(t5_close) - float(t0_close)) / float(t0_close)
+        # TD-50: UPDATE is the WRITE — lock it.
+        with db._audit_lock:
+            db.conn.execute(
+                """
+                UPDATE rl_mistake_logs
+                SET actual_t5_outcome = ?
+                WHERE ticker = ? AND predicted_date = ? AND predicted_action = ?
+                  AND actual_t5_outcome IS NULL
+                """,
+                [actual, ticker, predicted_date, action],
+            )
+        backfilled += 1
+    return backfilled
+
+
+def daily_inference(
+    window_rows: int = 120,
+    max_candidates: int = 6,
+    broadcast: bool = True,
+) -> str:
     """Daily trading path. No crawling. No full Alpha360 parquet load.
+
+    Args:
+        window_rows: per-ticker rows to load for live Alpha360 features.
+        max_candidates: Top-N pool size sent to the arbitrator (default 6).
+        broadcast: If True (default, cron path), push per-ticker alerts to
+            every chat ID in `TELEGRAM_CHAT_ID` env. If False (bot on-demand
+            path) suppress those pushes — caller is responsible for routing
+            the returned report to its own chat. This prevents duplicate
+            alerts when `/suggest_buy` triggers `daily_inference()` from the
+            interactive bot.
 
     Returns:
         Combined HTML report of the dispatched Top-3 BUY signals (one block
         per ticker, separated by a horizontal rule). Suitable for posting to
         Telegram with `parse_mode=HTML`. Returns "" when no signals were
         produced (e.g. liquidity filter cleared the pool, or no live prices).
-
-        The on-cron alert path still pushes one message per ticker via
-        `TelegramBot.send_signal_alert()` — this return value is purely an
-        additional channel for chat-reply / on-demand UX.
     """
     LOGGER.info("Starting dual-horizon daily inference. No crawling will run in this task.")
     total_start = time.perf_counter()
@@ -543,6 +716,7 @@ def daily_inference(window_rows: int = 120, max_candidates: int = 6) -> str:
         latest_df=latest_df,
         xgb_model_5d=xgb_model_5d,
         selected_features_5d=selected_features_5d,
+        broadcast=broadcast,
     )
     LOGGER.info("Dual-horizon daily inference completed in %.2fs.", time.perf_counter() - total_start)
     return report_html
@@ -556,17 +730,21 @@ def run_trade_execution(
     latest_df: Any,
     xgb_model_5d: Any,
     selected_features_5d: list[str],
+    broadcast: bool = True,
 ) -> str:
     """Execute portfolio updates, RL outcome logging, and dispatch Telegram alerts.
 
     Args:
         stacking_predictions: dual-horizon dict {"5d": {...}, "20d": {...}} produced by the
             Stacking GBDT (XGBoost+LightGBM+CatBoost → logistic meta) model.
+        broadcast: When False, the per-ticker push alert via
+            `TelegramBot.send_signal_alert()` is skipped. The combined HTML
+            report is still built and returned. Used by the interactive bot
+            path (`/suggest_buy`) to avoid duplicating alerts.
 
     Returns:
         Combined HTML report of every signal dispatched (for chat-reply UX),
-        or "" if no signals were dispatched. Per-ticker push alerts are still
-        broadcast via `TelegramBot.send_signal_alert()` regardless.
+        or "" if no signals were dispatched.
     """
     LOGGER.info("Starting Trade Execution (Portfolio Manager)...")
     dispatched_signals: list[dict] = []
@@ -586,36 +764,26 @@ def run_trade_execution(
                 predictions=final_decisions,
             )
 
-        with timed_step("RL mistake logging"):
+        # TD-05: replaced the hardcoded `actual_t5_outcome = -0.05` stub with
+        # a proper two-phase logger:
+        #   (1) at T0 — INSERT a row per high-confidence UP prediction with
+        #               actual_t5_outcome = NULL (we don't know the outcome yet).
+        #   (2) at T+5+ — UPDATE any old NULL rows by looking up real close
+        #                 prices from stock_ohlcv and computing the actual return.
+        # Both phases run every daily_inference call, so backfill happens on the
+        # next session after a 5-day window elapses for any given prediction.
+        with timed_step("RL prediction logging (T0 INSERT + T+5 backfill UPDATE)"):
             db = manager.db
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            logged = 0
             predictions_5d = stacking_predictions.get("5d", stacking_predictions)
-            for ticker in predictions_5d.keys():
-                if predictions_5d[ticker][2] > 0.6:
-                    actual_t5_outcome = -0.05
-                    if actual_t5_outcome < 0:
-                        features_json = json.dumps(
-                            {
-                                "model": "stacking_gbdt_5d",
-                                "top_drivers": _build_feature_explanation(
-                                    xgb_model_5d,
-                                    selected_features_5d,
-                                    top_k=3,
-                                )[0],
-                            },
-                            ensure_ascii=False,
-                        )
-                        db.conn.execute(
-                            """
-                            INSERT INTO rl_mistake_logs
-                            (ticker, predicted_date, predicted_action, actual_t5_outcome, features_snapshot)
-                            VALUES (?, ?, ?, ?, ?)
-                            """,
-                            [ticker, today_str, "BUY", actual_t5_outcome, features_json],
-                        )
-                        logged += 1
-            LOGGER.info("RL mistakes logged: %s", logged)
+            top_pos_text, _ = _build_feature_explanation(
+                xgb_model_5d, selected_features_5d, top_k=3
+            )
+            logged = _log_rl_predictions(db, predictions_5d, top_pos_text)
+            backfilled = _backfill_rl_outcomes(db)
+            LOGGER.info(
+                "RL T0 logged=%s (UP prob > %.2f); T+5 backfilled=%s",
+                logged, _RL_UP_CONFIDENCE_THRESHOLD, backfilled,
+            )
 
         LOGGER.info("Dispatching Telegram Alerts...")
         bot = TelegramBot()
@@ -653,16 +821,355 @@ def run_trade_execution(
                 "top_neg_features": top_neg_features,
             }
 
-            bot.send_signal_alert(signal_data)
+            if broadcast:
+                bot.send_signal_alert(signal_data)
             dispatched_signals.append(signal_data)
             sent += 1
-        LOGGER.info("Telegram alerts dispatched: %s", sent)
+        LOGGER.info("Telegram alerts dispatched: %s (broadcast=%s)", sent, broadcast)
 
     except Exception:
         LOGGER.exception("Error during trade execution")
         return _build_combined_report(dispatched_signals)
 
     return _build_combined_report(dispatched_signals)
+
+
+# ---------------------------------------------------------------------------
+# /suggest_sell — on-demand inference for an arbitrary ticker list
+# ---------------------------------------------------------------------------
+
+_SELL_DECISION = 0  # arbitrator class label for DOWN / SELL
+
+
+def _build_sell_hold_report(
+    holding_tickers: list[str],
+    final_decisions: dict,
+    all_sentiments: dict,
+    stacking_predictions: dict,
+    live_exec_prices: dict,
+    missing_tickers: list[str] | None = None,
+) -> str:
+    """Build the HTML BÁN/GIỮ digest for /suggest_sell.
+
+    Every ticker passed in `holding_tickers` (that has a prediction) gets one
+    block. `missing_tickers` lists holdings that could not be evaluated
+    (delisted, illiquid, or absent from the live universe).
+    """
+    predictions_5d = stacking_predictions.get("5d", {})
+    parts: list[str] = []
+
+    for ticker in holding_tickers:
+        if ticker not in predictions_5d:
+            continue
+
+        decision = final_decisions.get(ticker)
+        sentiment = all_sentiments.get(ticker, {})
+        sentiment_score = float(sentiment.get("sentiment_score", 0.0) or 0.0)
+        sentiment_status = _format_sentiment_status(sentiment)
+        reasoning = str(sentiment.get("reasoning_vi", "Không có tin tức đáng kể."))
+        confidence_5d = round(predictions_5d.get(ticker, [0, 0, 0])[2] * 100, 2)
+        price = live_exec_prices.get(ticker)
+        price_str = f"{price:,.0f} VND" if price else "N/A"
+
+        if decision == _SELL_DECISION:
+            verdict = "🔴 <b>BÁN (SELL)</b>"
+        elif decision == 2:
+            verdict = "🟢 <b>GIỮ (HOLD - xu hướng tăng)</b>"
+        else:
+            verdict = "🟡 <b>GIỮ (HOLD - đi ngang)</b>"
+
+        source_urls = (sentiment.get("source_urls", []) or [])[:3]
+        if source_urls:
+            url_lines = "\n".join(f"  - {html.escape(u)}" for u in source_urls)
+        else:
+            url_lines = "  Không có tin tức đáng kể"
+
+        block = (
+            f"📌 <b>{html.escape(ticker)}</b> @ {html.escape(price_str)}\n"
+            f"• <b>Khuyến nghị:</b> {verdict}\n"
+            f"• <b>Quant 5d UP confidence:</b> {confidence_5d}%\n"
+            f"• <b>Tâm lý:</b> {html.escape(sentiment_status)} "
+            f"(score={sentiment_score:+.2f})\n"
+            f"• <b>Phân tích tin tức:</b> {html.escape(reasoning)}\n"
+            f"• <b>Nguồn:</b>\n{url_lines}"
+        )
+        parts.append(block)
+
+    header = (
+        f"💼 <b>[HỆ THỐNG] BÁN/GIỮ DANH MỤC</b>\n"
+        f"📅 <b>Ngày:</b> {datetime.now().strftime('%d/%m/%Y')}\n"
+        f"══════════════════════════════"
+    )
+
+    if not parts:
+        body = "<i>Không có ticker nào trong danh mục được mô hình đánh giá.</i>"
+    else:
+        body = _REPORT_SEPARATOR.join(parts)
+
+    footer = ""
+    if missing_tickers:
+        escaped_missing = html.escape(", ".join(missing_tickers))
+        footer = (
+            f"\n\n⚠️ <i>Không có dữ liệu live cho:</i> "
+            f"<code>{escaped_missing}</code>"
+        )
+
+    return f"{header}\n\n{body}{footer}"
+
+
+def inference_for_holdings(
+    holding_tickers: list[str],
+    window_rows: int = 120,
+) -> str:
+    """Run dual-horizon Stacking GBDT + arbitrator on the user's holdings only.
+
+    Skips the liquidity gate and the Top-6/Top-3 funnel — every holding gets
+    a recommendation. Used by the /suggest_sell bot command.
+
+    Args:
+        holding_tickers: tickers from the `portfolio` DuckDB table.
+        window_rows: per-ticker rows for live Alpha360 features.
+
+    Returns:
+        HTML report (HTML-escaped) suitable for `parse_mode=HTML`. Empty
+        string if no live features or no overlap with the live universe.
+    """
+    if not holding_tickers:
+        return ""
+
+    holding_tickers = sorted({t.upper().strip() for t in holding_tickers if t})
+    LOGGER.info("Holdings inference for %s tickers: %s", len(holding_tickers), holding_tickers)
+    total_start = time.perf_counter()
+
+    with timed_step(f"Building live Alpha360 features ({window_rows} rows/ticker) for /suggest_sell"):
+        generator = Alpha360Generator()
+        live_pl = generator.build_live_features(window_rows=window_rows)
+        latest_df = live_pl.to_pandas()
+
+    if latest_df.empty:
+        LOGGER.warning("[/suggest_sell] live feature frame is empty.")
+        return ""
+
+    universe = set(latest_df["ticker"].astype(str).tolist())
+    present = [t for t in holding_tickers if t in universe]
+    missing = [t for t in holding_tickers if t not in universe]
+    if missing:
+        LOGGER.warning("[/suggest_sell] holdings absent from live universe: %s", missing)
+
+    if not present:
+        # Build an "empty" report that still warns about missing tickers.
+        return _build_sell_hold_report(
+            holding_tickers=[],
+            final_decisions={},
+            all_sentiments={},
+            stacking_predictions={},
+            live_exec_prices={},
+            missing_tickers=missing,
+        )
+
+    latest_df = latest_df[latest_df["ticker"].astype(str).isin(present)].reset_index(drop=True)
+
+    stacking_predictions_5d, _, _, _ = predict_stacking_horizon(latest_df, 5)
+    stacking_predictions_20d, _, _, _ = predict_stacking_horizon(latest_df, 20)
+    horizon_predictions = {"5d": stacking_predictions_5d, "20d": stacking_predictions_20d}
+
+    with timed_step("Holdings arbitrator + sentiment scoring"):
+        final_decisions, all_sentiments = evaluate_trades_batch(horizon_predictions, present)
+
+    live_exec_prices = _get_live_exec_prices(latest_df, present)
+
+    LOGGER.info("[/suggest_sell] completed in %.2fs.", time.perf_counter() - total_start)
+    return _build_sell_hold_report(
+        holding_tickers=present,
+        final_decisions=final_decisions,
+        all_sentiments=all_sentiments,
+        stacking_predictions=horizon_predictions,
+        live_exec_prices=live_exec_prices,
+        missing_tickers=missing,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /verify — single-ticker ad-hoc analysis (rumor / news verification)
+# ---------------------------------------------------------------------------
+
+# Class-label → display text mappings for the verify report.
+_VERIFY_5D_PRED_LABELS: dict[int, str] = {
+    0: "🔴 Giảm (DOWN)",
+    1: "🟡 Đi ngang (SIDE)",
+    2: "🟢 Tăng (UP)",
+}
+_VERIFY_20D_PRED_LABELS: dict[int, str] = {
+    0: "Giảm",
+    1: "Đi ngang",
+    2: "Tăng",
+}
+_VERIFY_VERDICT_LABELS: dict[int, str] = {
+    0: "🔴 <b>BÁN (SELL)</b>",
+    1: "🟡 <b>GIỮ (HOLD)</b>",
+    2: "🟢 <b>MUA / GIỮ (BUY/HOLD)</b>",
+}
+
+
+def _build_verify_report(
+    ticker: str,
+    decision: int | None,
+    sentiment: dict,
+    stacking_5d: list[float],
+    stacking_20d: list[float],
+    live_exec_price: float | None,
+) -> str:
+    """Build the HTML verification report for /verify.
+
+    Every dynamic field is `html.escape`d. Structural tags (<b>, <code>, <i>)
+    are constants. Output is safe to send with parse_mode=HTML.
+    """
+    # 5d distribution
+    p_down, p_side, p_up = stacking_5d[0], stacking_5d[1], stacking_5d[2]
+    pred_5d_idx = max(range(3), key=lambda i: stacking_5d[i])
+    pred_5d_label = _VERIFY_5D_PRED_LABELS.get(pred_5d_idx, str(pred_5d_idx))
+    confidence_5d = round(stacking_5d[pred_5d_idx] * 100, 2)
+
+    # 20d distribution (compact)
+    pred_20d_idx = max(range(3), key=lambda i: stacking_20d[i])
+    pred_20d_label = _VERIFY_20D_PRED_LABELS.get(pred_20d_idx, str(pred_20d_idx))
+    confidence_20d = round(stacking_20d[pred_20d_idx] * 100, 2)
+
+    # Sentiment
+    sent_score = float(sentiment.get("sentiment_score", 0.0) or 0.0)
+    sent_status = _format_sentiment_status(sentiment)
+    sent_reasoning = str(sentiment.get("reasoning_vi", "Không có tin tức đáng kể."))
+
+    # Final arbitrator verdict (decision integer 0/1/2)
+    verdict_html = _VERIFY_VERDICT_LABELS.get(decision, "<i>(chưa có verdict)</i>")
+
+    # Price (VN price normalization already applied by `_get_live_exec_prices`)
+    price_str = f"{live_exec_price:,.0f} VND" if live_exec_price else "N/A"
+
+    # Source URLs (already populated from ground-truth tracker in arbitrator)
+    source_urls = (sentiment.get("source_urls", []) or [])[:3]
+    if source_urls:
+        url_lines = "\n".join(f"  - {html.escape(u)}" for u in source_urls)
+    else:
+        url_lines = "  Không có tin tức đáng kể"
+
+    return (
+        f"🔍 <b>[KIỂM ĐỊNH] {html.escape(ticker)}</b>\n"
+        f"📅 <b>Ngày:</b> {datetime.now().strftime('%d/%m/%Y')}\n"
+        f"══════════════════════════════\n\n"
+        f"💵 <b>Giá hiện tại:</b> {html.escape(price_str)}\n\n"
+        f"📊 <b>[1] Định lượng (Stacking GBDT)</b>\n"
+        f"• <b>Dự báo 5d:</b> {pred_5d_label}\n"
+        f"• <b>Độ tin cậy 5d:</b> {confidence_5d}% "
+        f"(UP={p_up * 100:.1f}%, SIDE={p_side * 100:.1f}%, DOWN={p_down * 100:.1f}%)\n"
+        f"• <b>Dự báo 20d:</b> {pred_20d_label} ({confidence_20d}%)\n\n"
+        f"📰 <b>[2] Sentiment (LLM)</b>\n"
+        f"• <b>Tâm lý:</b> {html.escape(sent_status)} "
+        f"(score={sent_score:+.2f})\n"
+        f"• <b>Phân tích:</b> {html.escape(sent_reasoning)}\n\n"
+        f"🎯 <b>[3] Verdict tổng hợp:</b> {verdict_html}\n\n"
+        f"🔗 <b>Nguồn tham khảo:</b>\n{url_lines}"
+    )
+
+
+def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
+    """Run ad-hoc 5d + 20d quant + LLM-sentiment verification for one ticker.
+
+    Used by the /verify Telegram command for rumor / news fact-checks before
+    a manual trade decision (e.g., "HPG announced dividends — should I buy?").
+
+    Args:
+        ticker: VN equity symbol (case-insensitive; coerced to upper).
+        window_rows: per-ticker rows to load for live Alpha360 features.
+
+    Returns:
+        HTML report (HTML-escaped) suitable for `parse_mode=HTML`. Empty
+        string only if the ticker name is itself empty. Liquidity / data-
+        availability failures return a Vietnamese warning HTML message.
+    """
+    ticker = (ticker or "").upper().strip()
+    if not ticker:
+        return ""
+
+    LOGGER.info("[/verify] Single-ticker analysis: %s", ticker)
+    total_start = time.perf_counter()
+
+    # --- Step 1: Liquidity / data availability check ---
+    # `Alpha360Generator.build_live_features(tickers=[ticker])` filters the
+    # parquet glob down to a single file — efficient single-ticker read.
+    # If the parquet doesn't exist → FileNotFoundError → warning to user.
+    try:
+        with timed_step(f"Building live features for /verify {ticker}"):
+            generator = Alpha360Generator()
+            live_pl = generator.build_live_features(tickers=[ticker], window_rows=window_rows)
+            latest_df = live_pl.to_pandas()
+    except FileNotFoundError:
+        LOGGER.warning("[/verify] No OHLCV parquet for %s.", ticker)
+        return (
+            f"⚠️ Mã <b>{html.escape(ticker)}</b> không đủ thanh khoản hoặc "
+            f"không có dữ liệu để phân tích.\n"
+            f"<i>(Không tìm thấy <code>data/ohlcv_{html.escape(ticker)}.parquet</code> — "
+            f"có thể chưa được crawl hoặc đã hủy niêm yết.)</i>"
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("[/verify] Live feature build failed for %s.", ticker)
+        return (
+            f"⚠️ Lỗi khi xây feature cho <b>{html.escape(ticker)}</b>: "
+            f"<code>{html.escape(str(exc))}</code>"
+        )
+
+    if latest_df.empty or ticker not in set(latest_df["ticker"].astype(str)):
+        return (
+            f"⚠️ Mã <b>{html.escape(ticker)}</b> không đủ thanh khoản hoặc "
+            f"không có dữ liệu để phân tích."
+        )
+
+    # Defensive filter (build_live_features should already have filtered).
+    latest_df = latest_df[latest_df["ticker"].astype(str) == ticker].reset_index(drop=True)
+
+    # --- Step 2: Stacking GBDT inference (5d primary + 20d for arbitrator) ---
+    try:
+        stacking_5d, _, _, _ = predict_stacking_horizon(latest_df, 5)
+        stacking_20d, _, _, _ = predict_stacking_horizon(latest_df, 20)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("[/verify] Stacking inference failed for %s.", ticker)
+        return (
+            f"⚠️ Lỗi mô hình Stacking GBDT cho <b>{html.escape(ticker)}</b>: "
+            f"<code>{html.escape(str(exc))}</code>"
+        )
+
+    if ticker not in stacking_5d:
+        return (
+            f"⚠️ Mô hình không thể dự đoán cho <b>{html.escape(ticker)}</b> "
+            f"(thiếu feature hoặc lịch sử quá ngắn)."
+        )
+
+    horizon_predictions = {"5d": stacking_5d, "20d": stacking_20d}
+
+    # --- Step 3: Arbitrator (news scrape + Gemini sentiment + decision) ---
+    # `evaluate_trades_batch` accepts a candidate ticker list — passing a
+    # singleton scopes the whole pipeline (GNews queries, LLM batch, decision)
+    # to this one symbol. ~3-5s of news scrape + 1 Gemini call.
+    try:
+        with timed_step(f"Arbitrator + sentiment for /verify {ticker}"):
+            final_decisions, all_sentiments = evaluate_trades_batch(horizon_predictions, [ticker])
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("[/verify] Arbitrator failed for %s.", ticker)
+        # Fall through with empty sentiment so the user still sees the quant view.
+        final_decisions, all_sentiments = {}, {}
+
+    # --- Step 4: Live execution price (VN scaling already applied) ---
+    live_exec_prices = _get_live_exec_prices(latest_df, [ticker])
+
+    LOGGER.info("[/verify] %s completed in %.2fs.", ticker, time.perf_counter() - total_start)
+    return _build_verify_report(
+        ticker=ticker,
+        decision=final_decisions.get(ticker),
+        sentiment=all_sentiments.get(ticker, {}),
+        stacking_5d=list(stacking_5d.get(ticker, [0.33, 0.34, 0.33])),
+        stacking_20d=list(stacking_20d.get(ticker, [0.33, 0.34, 0.33])),
+        live_exec_price=live_exec_prices.get(ticker),
+    )
 
 
 def full_pipeline(force_crawl: bool = False) -> None:
@@ -709,14 +1216,22 @@ def full_pipeline(force_crawl: bool = False) -> None:
 
             for idx, ticker in enumerate(hose_tickers, start=1):
                 LOGGER.info("Ingesting HOSE %s/%s ticker=%s", idx, len(hose_tickers), ticker)
-                stock_df = stock_crawler.fetch_ohlcv(
-                    ticker,
-                    start_date=start_date,
-                    file_path=f"data/ohlcv_{ticker}.parquet",
-                    sleep_before_request=True,
-                )
+                # TD-12 circuit breaker: 45s hard cap per ticker.
+                try:
+                    stock_df = stock_crawler._fetch_ohlcv_with_timeout(
+                        ticker=ticker,
+                        start_date=start_date,
+                        file_path=f"data/ohlcv_{ticker}.parquet",
+                        sleep_before_request=True,
+                    )
+                except Exception as ticker_exc:  # noqa: BLE001
+                    LOGGER.error("Per-ticker fetch wrapper crashed for %s: %s", ticker, ticker_exc)
+                    continue
                 if not stock_df.empty:
-                    db_engine.upsert_dataframe(stock_df, "stock_ohlcv")
+                    try:
+                        db_engine.upsert_dataframe(stock_df, "stock_ohlcv")
+                    except Exception as upsert_exc:  # noqa: BLE001
+                        LOGGER.error("DuckDB upsert failed for %s: %s — continuing.", ticker, upsert_exc)
 
             LOGGER.info("Final Verification of DuckDB State...")
             macro_count = db_engine.query("SELECT COUNT(*) FROM macro_daily").iloc[0, 0]
@@ -764,27 +1279,111 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def _send_crash_alert(task_name: str, exc: BaseException, tb_text: str) -> None:
+    """Best-effort Telegram crash notification. Never raises.
 
-    if args.task == "crawl_hose":
-        crawl_hose(
-            start_date=args.start_date,
-            end_date=args.end_date,
-            data_dir=args.data_dir,
-            force_crawl=args.force_crawl,
+    Used by the top-level `main()` wrapper so a single unhandled exception
+    surfaces as a Telegram message before the process exits, instead of
+    silently dying in a cron log.
+
+    Args:
+        task_name: the --task value (or whatever the operator passed).
+        exc: the caught exception instance.
+        tb_text: a pre-formatted traceback string (already captured from
+            the except block — re-running `format_exc()` after another
+            exception would corrupt it).
+    """
+    try:
+        # Telegram caps at 4096 chars per message; reserve ~500 chars for
+        # the header, headline, and HTML overhead. Keep the LAST 1500 chars
+        # of the traceback because the deepest frame is usually the cause.
+        tb_snippet = tb_text[-1500:] if tb_text else ""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        exc_type = type(exc).__name__
+        exc_msg = str(exc)[:300]
+
+        # TD-31: include the running code version so we can correlate a
+        # crash to a specific deploy without timestamp archaeology.
+        from src.utils.version import get_version  # noqa: PLC0415
+        version = get_version()
+
+        msg = (
+            "🚨 <b>[SYSTEM CRASH] Pipeline Failed!</b>\n"
+            f"📅 <b>Time:</b> {html.escape(ts)}\n"
+            f"🔖 <b>Version:</b> <code>{html.escape(version)}</code>\n"
+            f"⚙️ <b>Task:</b> <code>{html.escape(task_name)}</code>\n"
+            f"❌ <b>Exception:</b> <code>{html.escape(exc_type)}</code>\n"
+            f"📝 <b>Message:</b> <code>{html.escape(exc_msg)}</code>\n\n"
+            f"<b>Traceback (last frames):</b>\n"
+            f"<pre>{html.escape(tb_snippet)}</pre>"
         )
-        return
 
-    if args.task == "build_alpha360":
-        build_alpha360()
-        return
+        bot = TelegramBot()
+        bot.send_text_alert(msg, label=f"crash:{task_name}")
+        LOGGER.info("Crash alert dispatched to Telegram chat IDs.")
+    except Exception as alert_exc:  # noqa: BLE001
+        # The alerter itself failed (token missing, network down, etc.).
+        # Log but do NOT re-raise — we want the original exception to be
+        # the one that propagates.
+        LOGGER.exception("Crash alert dispatch itself failed: %s", alert_exc)
 
-    if args.task == "full_pipeline":
-        full_pipeline(force_crawl=args.force_crawl)
-        return
 
-    daily_inference(window_rows=args.window_rows, max_candidates=args.max_candidates)
+def main() -> None:
+    """Entry point with global crash alerting (TD-09).
+
+    Any unhandled exception inside a task body is caught here, formatted
+    into a Telegram alert, then re-raised so the cron / shell sees a
+    non-zero exit code. KeyboardInterrupt and SystemExit pass through
+    unalerted (those are explicit operator actions / nested sys.exit calls).
+    """
+    # TD-26: install rotating file handler BEFORE anything else logs.
+    # Idempotent — safe even if another import already configured logging.
+    from src.utils.logging_utils import setup_rotating_logging  # noqa: PLC0415
+    setup_rotating_logging()
+
+    # TD-31: capture the running code version (git SHA / VERSION file fallback)
+    # for log correlation. Memoized — first call resolves, the rest are O(1).
+    from src.utils.version import get_version  # noqa: PLC0415
+    version = get_version()
+
+    args = parse_args()
+    task_name = args.task or "unknown"
+
+    LOGGER.info("=" * 70)
+    LOGGER.info("Quant V6 starting | task=%s pid=%s version=%s", task_name, os.getpid(), version)
+    LOGGER.info("=" * 70)
+
+    try:
+        if task_name == "crawl_hose":
+            crawl_hose(
+                start_date=args.start_date,
+                end_date=args.end_date,
+                data_dir=args.data_dir,
+                force_crawl=args.force_crawl,
+            )
+        elif task_name == "build_alpha360":
+            build_alpha360()
+        elif task_name == "full_pipeline":
+            full_pipeline(force_crawl=args.force_crawl)
+        else:
+            daily_inference(window_rows=args.window_rows, max_candidates=args.max_candidates)
+    except (KeyboardInterrupt, SystemExit):
+        # Operator-initiated stop or a nested sys.exit(): no crash alert.
+        LOGGER.warning("Pipeline interrupted (KeyboardInterrupt/SystemExit). No crash alert sent.")
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # Catch ALL pipeline exceptions (API timeout, DuckDB lock, Gemini
+        # failure, file-not-found, etc.) — alert THEN re-raise so cron sees
+        # exit code != 0.
+        tb_text = traceback.format_exc()
+        LOGGER.error("=" * 70)
+        LOGGER.error("Pipeline crashed during task=%s. Dispatching alert before exit.", task_name)
+        LOGGER.error(tb_text)
+        LOGGER.error("=" * 70)
+        _send_crash_alert(task_name, exc, tb_text)
+        raise
+
+    LOGGER.info("Quant V6 task=%s completed cleanly.", task_name)
 
 
 if __name__ == "__main__":

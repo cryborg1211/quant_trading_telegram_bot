@@ -69,6 +69,16 @@ class TelegramBot:
         msg = self._build_message(signal_data)
         self._dispatch(msg, ticker=signal_data.get("ticker", "N/A"))
 
+    def send_text_alert(self, html_text: str, label: str = "alert") -> None:
+        """Broadcast an arbitrary HTML-safe message to every chat ID in env.
+
+        Used for system-level notifications (pipeline crash, manual ops alert)
+        where no structured signal_data exists. The caller MUST ensure
+        `html_text` is already HTML-escaped — this method does no escaping
+        itself, only forwards to `_dispatch` with parse_mode=HTML.
+        """
+        self._dispatch(html_text, ticker=label)
+
     # ------------------------------------------------------------------
     # Message builder
     # ------------------------------------------------------------------

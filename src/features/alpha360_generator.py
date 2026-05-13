@@ -119,7 +119,10 @@ class Alpha360Generator:
                 "Expected full HOSE universe from data/ohlcv_*.parquet."
             )
 
-        conn = duckdb.connect(self.db_path, read_only=True)
+        # No `read_only=True` — DuckDB rejects mixed-config connections to the
+        # same file in one process (see db_engine.py docstring). This is a
+        # read-only query in practice; the SQL itself is `SELECT`-only.
+        conn = duckdb.connect(self.db_path)
         try:
             macro_query = "SELECT * FROM macro_daily ORDER BY date"
             macro_df = pl.from_arrow(conn.execute(macro_query).arrow()).with_columns(pl.col("date").cast(pl.Date))
@@ -196,7 +199,10 @@ class Alpha360Generator:
         return pl.concat(frames, how="diagonal").sort(["ticker", "date"])
 
     def _load_macro_since(self, min_date) -> pl.DataFrame:
-        conn = duckdb.connect(self.db_path, read_only=True)
+        # No `read_only=True` — DuckDB rejects mixed-config connections to the
+        # same file in one process (see db_engine.py docstring). This is a
+        # read-only query in practice; the SQL itself is `SELECT`-only.
+        conn = duckdb.connect(self.db_path)
         try:
             query = "SELECT * FROM macro_daily WHERE date >= ? ORDER BY date"
             return pl.from_arrow(conn.execute(query, [min_date]).arrow()).with_columns(pl.col("date").cast(pl.Date))
@@ -204,7 +210,10 @@ class Alpha360Generator:
             conn.close()
 
     def _load_sentiment_since(self, min_date) -> pl.DataFrame:
-        conn = duckdb.connect(self.db_path, read_only=True)
+        # No `read_only=True` — DuckDB rejects mixed-config connections to the
+        # same file in one process (see db_engine.py docstring). This is a
+        # read-only query in practice; the SQL itself is `SELECT`-only.
+        conn = duckdb.connect(self.db_path)
         try:
             query = """
                 SELECT
@@ -314,14 +323,58 @@ class Alpha360Generator:
         ])
 
     def _integrate_macro(self, alpha_df, macro_df):
-        """Joins shifted macro data to prevent look-ahead bias."""
+        """Join shifted macro data to alpha features without leakage or NaN bombs.
+
+        FREQUENCY MISMATCH HANDLING (the critical concern for monthly CPI):
+        ───────────────────────────────────────────────────────────────────
+        Daily series   (DXY, S&P 500, USD/VND, interbank_on_rate, vnibor):
+            Already have ~1 row per business day. Forward-fill patches
+            US/global holidays that don't coincide with VN trading days.
+
+        Monthly series (inflation_yoy from VN CPI release):
+            Has ~12 rows/year — one per release date. Forward-fill carries
+            the most recent published reading through every subsequent
+            business day until the next monthly release. This is the
+            standard "as-of" macro feature treatment.
+
+        Two passes of forward-fill are applied:
+          (1) ON THE MACRO FRAME before join — propagates values across the
+              dates that already have macro_daily rows.
+          (2) ON THE JOINED FRAME, per-ticker — patches VN trading days
+              where macro_daily had no row at all (e.g., a VN trading day
+              that was a US market holiday).
+
+        NORMALIZATION DECISION:
+        ───────────────────────
+        Macro features are PASSED THROUGH AS RAW PERCENTAGES — they are NOT
+        Z-score normalized via `_normalize_features`. Reasoning:
+
+          • Interest rates and inflation already live on stable, mean-reverting
+            scales (~0–15% historically for VN). The 60-day rolling Z-score
+            would obscure the actual policy/economic regime — a 4% rate vs
+            10% rate is genuinely different state, not noise to standardize.
+          • 1st-order differences could capture surprises but would lose the
+            level signal that drives risk-on/risk-off rotation.
+
+        LEAK PREVENTION:
+        ────────────────
+        Every macro column is shifted by 1 day before the join, so the
+        feature value seen on date D is the macro reading from D-1.
+        """
+        # 1. Drop columns that are 100% null (defensive — if the crawler
+        # hasn't populated a new column yet, exclude it rather than letting
+        # downstream `drop_nulls` wipe the entire training set).
         macro_df = macro_df.select([
             pl.col(c) for c in macro_df.columns if macro_df[c].null_count() < macro_df.height
         ])
 
+        # 2. PASS 1 forward-fill on the macro frame's own date axis.
+        # This is what propagates the monthly inflation_yoy values from
+        # release date through every subsequent macro_daily row.
         macro_df = macro_df.sort("date").fill_null(strategy="forward")
         macro_cols = [c for c in macro_df.columns if c != "date"]
 
+        # 3. T-1 shift to prevent look-ahead bias.
         shifted_macro = macro_df.select([
             pl.col("date"),
             *[pl.col(c).shift(1).alias(f"macro_{c}") for c in macro_cols]
@@ -330,7 +383,19 @@ class Alpha360Generator:
         alpha_df = alpha_df.with_columns(pl.col("date").cast(pl.Date))
         shifted_macro = shifted_macro.with_columns(pl.col("date").cast(pl.Date))
 
+        # 4. Left-join macro onto (ticker, date) feature rows.
         joined_df = alpha_df.join(shifted_macro, on="date", how="left")
+
+        # 5. PASS 2 forward-fill on the joined frame — per ticker, ordered
+        # by date. This patches VN trading days where macro_daily simply
+        # has no row (US holiday, source outage, etc.) so monthly CPI in
+        # particular never appears as NaN once the first publication has
+        # been observed.
+        macro_feature_cols = [f"macro_{c}" for c in macro_cols]
+        if macro_feature_cols:
+            joined_df = joined_df.sort(["ticker", "date"]).with_columns([
+                pl.col(c).forward_fill().over("ticker") for c in macro_feature_cols
+            ])
 
         target_cols = ["target_class_5d"]
         feature_cols = [c for c in joined_df.columns if c not in target_cols]

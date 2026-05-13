@@ -8,7 +8,10 @@
       "Bash(python -X utf8 main.py --task daily_inference)",
       "Bash(python -X utf8 -c ' *)",
       "Bash(pip show *)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('src/utils/telegram_bot.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('main.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('run_bot.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK: all three files parse cleanly'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('src/utils/telegram_bot.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('main.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('run_bot.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK: all three files parse cleanly'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python -X utf8 src/data/crawlers.py)",
+      "Bash(echo \"EXIT_CODE=$?\")"
     ]
   }
 }

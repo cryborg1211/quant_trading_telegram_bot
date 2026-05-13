@@ -1,4 +1,27 @@
-"""Portfolio manager – parameterized SQL, config-driven thresholds."""
+"""Portfolio manager – parameterized SQL, config-driven thresholds.
+
+TD-33 (May 2026): unified portfolio storage on the `portfolio` table.
+Previously `PortfolioManager` wrote to `live_positions` and the bot's `/add`
+wrote to `portfolio` — two never-synced tables. Now BOTH paths share the
+same `portfolio` table, distinguished by `user_id`:
+
+    • Human users:    user_id = "<telegram_user_id>"  (set by bot handlers)
+    • Automated cron: user_id = "cron"                (default for PortfolioManager)
+
+The bot's `/suggest_sell` query already filters by `user_id`, so users only
+see their own /add holdings — they cannot accidentally sell the cron's
+automated positions.
+
+Schema mapping live_positions → portfolio:
+    telegram_id   → user_id     (VARCHAR)
+    quantity      → volume      (INTEGER)
+    entry_price   → price       (DOUBLE)
+    entry_date    → added_at    (TIMESTAMP — was DATE)
+
+Internally we alias the new columns back to their old names in `_query_positions`
+so the iteration code in `update_live_performance` / `process_daily_trades`
+keeps using the readable `entry_price` / `quantity` names without a deeper rewrite.
+"""
 
 from __future__ import annotations
 
@@ -8,10 +31,14 @@ from datetime import datetime
 
 import pandas as pd
 
-from config.settings import CONFIG
 from src.data.db_engine import DuckDBEngine
+from config.settings import CONFIG
 
 LOGGER = logging.getLogger(__name__)
+
+# Sentinel user_id for automated cron trades — distinguishes them from any
+# real Telegram user_id (always numeric digits).
+CRON_USER_ID: str = "cron"
 
 
 class PortfolioManager:
@@ -21,10 +48,17 @@ class PortfolioManager:
 
     All SQL queries use parameterized placeholders (?) to prevent injection.
     All thresholds are sourced from CONFIG.trading.
+
+    Backwards-compat note: the legacy `live_positions` table is no longer
+    written to. If a deploy is rolling back to pre-TD-33 code, any orphaned
+    rows in `live_positions` remain readable but stale — restore from
+    `data/backups/` to recover historical positions.
     """
 
-    def __init__(self, telegram_id: str | None = None) -> None:
-        self.telegram_id = telegram_id or CONFIG.trading.default_telegram_id
+    def __init__(self, user_id: str | None = None) -> None:
+        # Backwards-compat: accept `telegram_id=` callers via the param name
+        # change. Default to CRON_USER_ID for the automated cron path.
+        self.user_id = user_id or CRON_USER_ID
         self.db = DuckDBEngine()
         self._stop_loss = CONFIG.trading.stop_loss_pct        # -0.07
         self._take_profit = CONFIG.trading.take_profit_pct    # +0.15
@@ -35,11 +69,30 @@ class PortfolioManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _query_positions(self, cols: str = "*") -> pd.DataFrame:
-        """Fetch live positions for this user using a parameterized query."""
+    def _query_positions(self, cols: str | None = None) -> pd.DataFrame:
+        """Fetch this user's portfolio rows from the unified `portfolio` table.
+
+        Columns are aliased to the legacy names (`quantity`, `entry_price`,
+        `entry_date`) so the iteration logic in `update_live_performance` /
+        `process_daily_trades` continues to use the readable column names
+        without per-row renaming.
+
+        The `cols` argument is accepted for back-compat with the old
+        signature but currently ignored — we always project the same alias
+        set since the consumer code references specific column names.
+        """
+        del cols  # legacy parameter, intentionally unused
         return self.db.conn.execute(
-            f"SELECT {cols} FROM live_positions WHERE telegram_id = ?",
-            [self.telegram_id],
+            """
+            SELECT
+                ticker,
+                volume        AS quantity,
+                price         AS entry_price,
+                CAST(added_at AS DATE) AS entry_date
+            FROM portfolio
+            WHERE user_id = ?
+            """,
+            [self.user_id],
         ).df()
 
     def _execute_sell(
@@ -52,16 +105,19 @@ class PortfolioManager:
         reason: str,
         report_lines: list[str],
     ) -> None:
-        """Parameterized SELL: remove from live_positions, log to trade_history."""
+        """Parameterized SELL: remove from `portfolio`, log to `trade_history`."""
         self.db.conn.execute(
-            "DELETE FROM live_positions WHERE telegram_id = ? AND ticker = ?",
-            [self.telegram_id, ticker],
+            "DELETE FROM portfolio WHERE user_id = ? AND ticker = ?",
+            [self.user_id, ticker],
         )
+        # trade_history.telegram_id is a legacy column name (VARCHAR) — we
+        # continue writing the (now-generalized) user_id into it. No schema
+        # change to keep the rollback path simple.
         self.db.conn.execute(
             """INSERT INTO trade_history
                (telegram_id, ticker, action, price, date, pnl_percent)
                VALUES (?, ?, 'SELL', ?, ?, ?)""",
-            [self.telegram_id, ticker, exec_price, date_str, pnl_pct],
+            [self.user_id, ticker, exec_price, date_str, pnl_pct],
         )
         icon = "🟢" if pnl_pct > 0 else "🔴"
         report_lines.append(
@@ -76,24 +132,27 @@ class PortfolioManager:
         date_str: str,
         report_lines: list[str],
     ) -> None:
-        """Parameterized BUY: insert into live_positions and trade_history."""
+        """Parameterized BUY: insert into `portfolio` and `trade_history`."""
         qty = int(self._alloc // exec_price)
         qty = max(100, (qty // 100) * 100)
 
+        # Cron trades land with user_id='cron' by default — invisible to
+        # users' `/suggest_sell` queries which filter by their telegram_id.
         self.db.conn.execute(
-            """INSERT INTO live_positions
-               (telegram_id, ticker, quantity, entry_price, entry_date)
+            """INSERT INTO portfolio
+               (user_id, ticker, volume, price, added_at)
                VALUES (?, ?, ?, ?, ?)""",
-            [self.telegram_id, ticker, qty, exec_price, date_str],
+            [self.user_id, ticker, qty, exec_price, datetime.now()],
         )
         self.db.conn.execute(
             """INSERT INTO trade_history
                (telegram_id, ticker, action, price, date, pnl_percent)
                VALUES (?, ?, 'BUY', ?, ?, 0.0)""",
-            [self.telegram_id, ticker, exec_price, date_str],
+            [self.user_id, ticker, exec_price, date_str],
         )
         report_lines.append(
             f"🔵 SIGNAL EXECUTED: BOUGHT {qty:,} {ticker} @ {exec_price:,.0f} VND"
+            f" [user_id={self.user_id}]"
         )
 
     # ------------------------------------------------------------------

@@ -83,6 +83,22 @@ NEWS_MAX_PER_HOST: int = 1
 NEWS_MAX_ARTICLES_PER_TICKER: int = 3
 NEWS_DAYS_BACK: int = 3
 NEWS_DOMAIN_JITTER_RANGE_SEC: tuple[float, float] = (0.5, 1.5)
+
+# Top VN financial news portals queried per ticker. Order matters only as a
+# tie-breaker — the diversity-preserving selector below picks one article from
+# each distinct domain before allowing repeats. Adding a new portal: append
+# its bare host here; rest of the pipeline auto-handles it.
+NEWS_DOMAINS: tuple[str, ...] = (
+    "cafef.vn",
+    "vietstock.vn",
+    "tinnhanhchungkhoan.vn",
+    "vneconomy.vn",
+    "vietnambiz.vn",
+)
+# Per-domain GNews result cap before global dedup/sort. We over-fetch here
+# (e.g., 10 per domain) so the dedup step has room to drop near-duplicates
+# while still leaving enough material for the 3-article final cap.
+NEWS_GNEWS_RESULTS_PER_DOMAIN: int = 10
 NEWS_BINARY_EXTENSIONS: tuple[str, ...] = (
     ".pdf",
     ".doc",
@@ -340,8 +356,99 @@ class AsyncNewsScraper:
         return results
 
 
+_SITE_PREFIX_RE = re.compile(r"^\s*[A-Za-zÀ-ỹ\d]{2,20}\s*[:\-–—]\s*", flags=re.UNICODE)
+
+
+def _normalize_title_for_dedup(title: str) -> str:
+    """Reduce a headline to a fingerprint for cross-domain duplicate detection.
+
+    Real-world failure mode: same press release shows up as
+        "CafeF: HPG báo lãi quý 1 tăng 30%, đề xuất chia cổ tức"
+        "VnEconomy - HPG báo lãi quý 1 tăng 30%, đề xuất chia cổ tức"
+        "VietStock — HPG báo lãi quý 1 ..."
+    The brand prefix is the leading 1–2 tokens before `:` / `-` / `—` / `–`.
+    We strip that, lowercase, drop punctuation, take the first 80 chars.
+    Catches identical and brand-prefixed near-duplicates; still keeps genuinely
+    different headlines (where the LLM can correctly treat them as separate
+    articles).
+    """
+    s = str(title or "")
+    # Strip a leading "BrandName:" / "BrandName -" / "BrandName —" / "BrandName –".
+    s = _SITE_PREFIX_RE.sub("", s, count=1)
+    s = re.sub(r"[^\w\s]", "", s.lower())
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:80]
+
+
+def _gnews_published_dt(article: dict[str, Any]) -> datetime:
+    """Best-effort published-date parser for GNews entries; returns datetime.min on failure."""
+    raw = article.get("published date") or article.get("publishedAt") or ""
+    if not raw:
+        return datetime.min
+    for fmt in ("%a, %d %b %Y %H:%M:%S %Z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(str(raw), fmt)
+        except ValueError:
+            continue
+    return datetime.min
+
+
+def _select_diverse(articles: list[dict[str, Any]], cap: int) -> list[dict[str, Any]]:
+    """Pick `cap` articles preferring distinct source domains, newest-first.
+
+    Algorithm:
+        1. Sort all input by published date DESC.
+        2. Walk the sorted list; admit an article if its host hasn't been seen.
+        3. After one pass, if we still need more, fill from the remainder
+           (allowing same-domain repeats), preserving date order.
+
+    Result: top-3 always covers up to 3 distinct domains when available; falls
+    back to single-domain only if no other portal had ANY article in window.
+    """
+    sorted_articles = sorted(articles, key=_gnews_published_dt, reverse=True)
+    chosen: list[dict[str, Any]] = []
+    seen_domains: set[str] = set()
+    remainder: list[dict[str, Any]] = []
+    for art in sorted_articles:
+        if len(chosen) >= cap:
+            remainder.append(art)
+            continue
+        host = urlparse(art.get("url", "")).netloc.lower().lstrip("www.")
+        if host and host not in seen_domains:
+            chosen.append(art)
+            seen_domains.add(host)
+        else:
+            remainder.append(art)
+    # Fill remaining slots from leftover (same-domain articles) if we under-filled.
+    while len(chosen) < cap and remainder:
+        chosen.append(remainder.pop(0))
+    return chosen
+
+
+async def _gnews_query_async(google_news: Any, query: str) -> list[dict[str, Any]]:
+    """Run the synchronous GNews.get_news in the default thread pool.
+
+    GNews is sync-only, so wrapping each call in `run_in_executor` is the
+    cheapest way to fan out across multiple domains × tickers concurrently
+    via `asyncio.gather`.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, google_news.get_news, query)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("GNews async query failed (%s): %s", query, exc)
+        return []
+
+
 async def _scrape_news_async(days_back: int = NEWS_DAYS_BACK, target_tickers: list[str] | None = None) -> list[dict[str, Any]]:
-    """Async scraper: GNews discovery + robust AsyncNewsScraper full-text extraction."""
+    """Async scraper: parallel multi-domain GNews discovery + AsyncNewsScraper full-text extraction.
+
+    Domain coverage is defined by the module-level `NEWS_DOMAINS` tuple.
+    Each (ticker × domain) GNews query runs concurrently via `asyncio.gather`;
+    results are aggregated per ticker, deduplicated by URL and by title
+    fingerprint, sorted by published date, and capped at
+    `NEWS_MAX_ARTICLES_PER_TICKER` with a domain-diversity preference.
+    """
     if GNews is None or aiohttp is None:
         LOGGER.error("GNews or aiohttp not installed; returning empty news.")
         return []
@@ -357,40 +464,77 @@ async def _scrape_news_async(days_back: int = NEWS_DAYS_BACK, target_tickers: li
         country="VN",
         start_date=(start_date.year, start_date.month, start_date.day),
         end_date=(end_date.year, end_date.month, end_date.day),
-        max_results=30,
+        max_results=NEWS_GNEWS_RESULTS_PER_DOMAIN,
     )
 
-    # Strictly ticker-specific queries only — no general market queries to avoid noise/rate-limits.
-    # Collect per-ticker article pools so we can cap the pre-fetch queue to 3 URLs/ticker.
     ticker_article_pool: dict[str, list[dict[str, Any]]] = {}
     if target_tickers:
-        queries_built = [(ticker, f'"{ticker}" site:cafef.vn') for ticker in target_tickers] + \
-                        [(ticker, f'"{ticker}" site:vietstock.vn') for ticker in target_tickers]
-        LOGGER.info("[News Fetcher][DEBUG] Ticker-specific queries=%s for tickers=%s", len(queries_built), target_tickers)
-        seen_urls: set[str] = set()
-        for ticker, q in queries_built:
-            try:
-                query_articles = google_news.get_news(q)
-                LOGGER.info("[News Fetcher][DEBUG] query=%r returned=%s", q, len(query_articles))
-                pool = ticker_article_pool.setdefault(ticker, [])
-                for art in query_articles:
-                    u = art.get("url", "")
-                    if not u or u in seen_urls:
-                        continue
-                    if len(pool) >= NEWS_MAX_ARTICLES_PER_TICKER:
-                        break  # pre-fetch cap reached for this ticker
-                    seen_urls.add(u)
-                    pool.append(art)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("GNews query failed (%s): %s", q, exc)
+        # Build the (ticker, domain, query) matrix — every cell becomes one
+        # parallel GNews call. For 1 ticker × 5 domains = 5 concurrent calls
+        # (~1.5s wall-clock); for 6 tickers × 5 domains = 30 concurrent calls.
+        query_matrix: list[tuple[str, str, str]] = [
+            (ticker, domain, f'"{ticker}" site:{domain}')
+            for ticker in target_tickers
+            for domain in NEWS_DOMAINS
+        ]
+        LOGGER.info(
+            "[News Fetcher] Parallel multi-domain query: tickers=%s domains=%s total_queries=%s",
+            len(target_tickers), len(NEWS_DOMAINS), len(query_matrix),
+        )
 
-    # Flatten capped pools into the final pre-fetch queue (max 3/ticker already enforced above)
+        # Fan out all queries concurrently. Order of `results` matches `query_matrix`.
+        results_per_query = await asyncio.gather(
+            *[_gnews_query_async(google_news, q) for _, _, q in query_matrix],
+            return_exceptions=False,
+        )
+
+        # Aggregate per-ticker with URL + title-fingerprint deduplication.
+        per_ticker_seen_urls: dict[str, set[str]] = defaultdict(set)
+        per_ticker_seen_titles: dict[str, set[str]] = defaultdict(set)
+        per_ticker_aggregate: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+        for (ticker, domain, _q), articles in zip(query_matrix, results_per_query, strict=False):
+            kept = 0
+            for art in articles:
+                url = art.get("url", "")
+                if not url:
+                    continue
+                if url in per_ticker_seen_urls[ticker]:
+                    continue
+                title_key = _normalize_title_for_dedup(art.get("title", ""))
+                if title_key and title_key in per_ticker_seen_titles[ticker]:
+                    continue
+                per_ticker_seen_urls[ticker].add(url)
+                if title_key:
+                    per_ticker_seen_titles[ticker].add(title_key)
+                per_ticker_aggregate[ticker].append(art)
+                kept += 1
+            LOGGER.debug("[News Fetcher] ticker=%s domain=%s raw=%s kept=%s",
+                         ticker, domain, len(articles), kept)
+
+        # Diversity-preserving cap: prefer distinct domains in the final 3 slots.
+        for ticker in target_tickers:
+            aggregated = per_ticker_aggregate.get(ticker, [])
+            chosen = _select_diverse(aggregated, NEWS_MAX_ARTICLES_PER_TICKER)
+            ticker_article_pool[ticker] = chosen
+            domains_picked = sorted({
+                urlparse(a.get("url", "")).netloc.lower().lstrip("www.")
+                for a in chosen
+            })
+            LOGGER.info(
+                "[News Fetcher] ticker=%s aggregated=%s -> kept=%s domains=%s",
+                ticker, len(aggregated), len(chosen), domains_picked,
+            )
+
+    # Flatten capped pools into the final pre-fetch queue.
     prefetch_queue: list[dict[str, Any]] = []
     for ticker, pool in ticker_article_pool.items():
-        LOGGER.info("[News Fetcher][DEBUG] ticker=%s pre-fetch queue size=%s (cap=%s)", ticker, len(pool), NEWS_MAX_ARTICLES_PER_TICKER)
         prefetch_queue.extend(pool)
 
-    LOGGER.info("[News Fetcher] Pre-fetch queue total=%s (max %s/ticker across %s tickers)", len(prefetch_queue), NEWS_MAX_ARTICLES_PER_TICKER, len(ticker_article_pool))
+    LOGGER.info(
+        "[News Fetcher] Pre-fetch queue total=%s (cap=%s/ticker across %s tickers, %s domains)",
+        len(prefetch_queue), NEWS_MAX_ARTICLES_PER_TICKER, len(ticker_article_pool), len(NEWS_DOMAINS),
+    )
 
     if not prefetch_queue:
         return []
