@@ -41,3 +41,4 @@ logs/
 # --- Vendored / archived code (not part of source) ---
 old-data/
 TradingAgents-main/
+.claude/ 
