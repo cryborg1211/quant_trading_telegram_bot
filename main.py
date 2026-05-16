@@ -18,7 +18,12 @@ import numpy as np
 from catboost import CatBoostClassifier
 
 from src.features.alpha360_generator import Alpha360Generator
-from src.models.quant_agent_arbitrator import evaluate_trades_batch
+from src.models.quant_agent_arbitrator import (
+    evaluate_trades_batch,
+    get_rebalance_advice,
+    map_tickers_to_news,
+    scrape_centralized_news,
+)
 from src.trading.portfolio_manager import PortfolioManager
 from src.utils.telegram_alerter import TelegramBot
 
@@ -1170,6 +1175,106 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
         stacking_20d=list(stacking_20d.get(ticker, [0.33, 0.34, 0.33])),
         live_exec_price=live_exec_prices.get(ticker),
     )
+
+
+# ---------------------------------------------------------------------------
+# /rebalance — AI portfolio rebalancing advisor
+# ---------------------------------------------------------------------------
+
+_REBALANCE_PRED_LABELS: dict[int, str] = {0: "🔴 Giảm", 1: "🟡 Đi ngang", 2: "🟢 Tăng"}
+
+
+def _build_rebalance_report(holdings_context: list[dict], advice: str) -> str:
+    """Build Telegram-safe HTML for the /rebalance command output.
+
+    Every dynamic field is html.escape'd. Structural tags are constants.
+    """
+    lines = []
+    for h in holdings_context:
+        ticker = html.escape(str(h.get("ticker", "?")))
+        pnl_pct = float(h.get("pnl_pct", 0.0))
+        pred_label = html.escape(str(h.get("pred_label", "N/A")))
+        sign = "+" if pnl_pct >= 0 else ""
+        icon = "🟢" if pnl_pct >= 0 else "🔴"
+        lines.append(f"• {icon} <b>{ticker}</b>: {sign}{pnl_pct:.1f}% | {pred_label}")
+
+    holdings_block = "\n".join(lines) if lines else "• Danh mục trống."
+
+    return (
+        "<b>⚖️ TƯ VẤN CƠ CẤU DANH MỤC</b>\n"
+        "══════════════════════\n"
+        f"<b>• Đang nắm giữ:</b>\n{holdings_block}\n\n"
+        f"<b>📊 Đề xuất AI:</b>\n{html.escape(advice)}"
+    )
+
+
+def rebalance_portfolio(user_id: str, window_rows: int = 120) -> str:
+    """Fetch live positions, run 5d model, scrape news, call Gemini for rebalance advice.
+
+    Reads from the `portfolio` DuckDB table (multi-user, keyed by user_id).
+    Returns an HTML report suitable for parse_mode=HTML, or "" for empty portfolio.
+    """
+    LOGGER.info("[/rebalance] Starting for user_id=%s", user_id)
+
+    try:
+        from src.data.db_engine import DuckDBEngine  # noqa: PLC0415
+        db = DuckDBEngine()
+        rows = db.conn.execute(
+            "SELECT ticker, price FROM portfolio WHERE user_id = ?",
+            [user_id],
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("[/rebalance] DB read failed for user_id=%s", user_id)
+        raise
+
+    if not rows:
+        return ""
+
+    # Deduplicate: if the same ticker was added multiple times, use the most recent price.
+    entry_prices: dict[str, float] = {}
+    for ticker_raw, price_raw in rows:
+        t = str(ticker_raw).upper().strip()
+        entry_prices[t] = float(price_raw or 0)
+    held_tickers = sorted(entry_prices)
+
+    LOGGER.info("[/rebalance] Holdings: %s", held_tickers)
+
+    with timed_step(f"[/rebalance] Building live Alpha360 features for {held_tickers}"):
+        generator = Alpha360Generator()
+        live_pl = generator.build_live_features(tickers=held_tickers, window_rows=window_rows)
+        latest_df = live_pl.to_pandas()
+
+    if latest_df.empty:
+        LOGGER.warning("[/rebalance] live feature frame empty for %s", held_tickers)
+        return ""
+
+    present = [t for t in held_tickers if t in set(latest_df["ticker"].astype(str))]
+    if not present:
+        return ""
+
+    latest_df = latest_df[latest_df["ticker"].astype(str).isin(present)].reset_index(drop=True)
+    stacking_predictions_5d, _, _, _ = predict_stacking_horizon(latest_df, 5)
+    live_prices = _get_live_exec_prices(latest_df, present)
+
+    holdings_context: list[dict] = []
+    for ticker in present:
+        entry = entry_prices.get(ticker, 0.0)
+        current = live_prices.get(ticker, entry)
+        pnl_pct = ((current - entry) / entry * 100.0) if entry > 0 else 0.0
+        probs = stacking_predictions_5d.get(ticker, [0.33, 0.34, 0.33])
+        pred_idx = int(np.argmax(probs))
+        holdings_context.append({
+            "ticker": ticker,
+            "pnl_pct": pnl_pct,
+            "pred_label": _REBALANCE_PRED_LABELS.get(pred_idx, "N/A"),
+            "p_up": float(probs[2]),
+        })
+
+    raw_news = scrape_centralized_news(target_tickers=present)
+    ticker_news_dict, _ = map_tickers_to_news(raw_news, present)
+    advice = get_rebalance_advice(holdings_context, ticker_news_dict)
+
+    return _build_rebalance_report(holdings_context, advice)
 
 
 def full_pipeline(force_crawl: bool = False) -> None:

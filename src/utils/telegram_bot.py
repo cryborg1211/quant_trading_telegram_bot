@@ -34,7 +34,7 @@ from datetime import datetime
 from typing import Any
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -118,6 +118,7 @@ HELP_TEXT = (
     "<b>/suggest_buy</b> - Lấy khuyến nghị MUA "
     "(Dựa trên Top 3 Quant &amp; Sentiment).\n"
     "<b>/suggest_sell</b> - Lấy khuyến nghị BÁN/HOLD cho danh mục cá nhân.\n"
+    "<b>/rebalance</b> - AI tư vấn cơ cấu danh mục hiện tại.\n"
     "<b>/verify</b> <i>[Mã]</i> - Kiểm định nhanh 1 cổ phiếu "
     "(VD: <code>/verify HPG</code>).\n"
     "<b>/add</b> <i>[Mã] [Khối lượng] [Giá]</i> - Thêm cổ phiếu vào danh mục "
@@ -844,6 +845,64 @@ async def audit_monthly_command(update: Update, context: ContextTypes.DEFAULT_TY
     await _run_audit_command(update, command_label="audit_monthly", days=30)
 
 
+async def rebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
+    """Fetch live holdings and reply with an AI portfolio rebalance recommendation."""
+    if update.message is None:
+        return
+    _log_request("/rebalance", update)
+
+    user_id = _extract_user_id(update)
+    if user_id is None:
+        await update.message.reply_text(
+            "❌ <b>Không xác định được user_id.</b> Lệnh này yêu cầu chat 1-1 với bot.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    cooldown_left = _check_and_record_rate_limit(user_id, "rebalance")
+    if cooldown_left is not None:
+        await update.message.reply_text(
+            f"⏳ <b>Quá nhanh!</b> Vui lòng đợi <b>{cooldown_left:.0f}s</b> "
+            f"trước khi gọi lại /rebalance.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await _audit_log_async(user_id=user_id, command="rebalance")
+
+    wait_msg = await update.message.reply_text(
+        "⏳ Đang phân tích danh mục &amp; tư vấn cơ cấu lại... "
+        "Vui lòng đợi khoảng 1 phút!",
+        parse_mode=ParseMode.HTML,
+    )
+
+    try:
+        from main import rebalance_portfolio  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("/rebalance: import failed")
+        await wait_msg.edit_text(
+            f"❌ <b>Lỗi import:</b> <code>{html.escape(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        report_html: str = await asyncio.to_thread(rebalance_portfolio, user_id)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("/rebalance: rebalance_portfolio crashed for user_id=%s", user_id)
+        await wait_msg.edit_text(
+            f"❌ <b>Lỗi khi phân tích danh mục:</b> <code>{html.escape(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not report_html or not report_html.strip():
+        await wait_msg.edit_text(EMPTY_PORTFOLIO_MESSAGE, parse_mode=ParseMode.HTML)
+        return
+
+    await _send_or_reply_chunks(update, wait_msg, [report_html])
+
+
 async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Global error handler — log the exception with the offending update for debugging."""
     LOGGER.exception("Unhandled exception while processing update: %r", update, exc_info=context.error)
@@ -852,6 +911,31 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 # Application bootstrap
 # ---------------------------------------------------------------------------
+
+# The canonical command list pushed to Telegram via set_my_commands on startup.
+# This populates the "/" autocomplete menu in every chat.
+_BOT_COMMANDS: list[BotCommand] = [
+    BotCommand("suggest_buy", "Lấy khuyến nghị MUA (Top 3 Quant & Sentiment)"),
+    BotCommand("suggest_sell", "Lấy khuyến nghị BÁN/HOLD cho danh mục cá nhân"),
+    BotCommand("rebalance", "AI tư vấn cơ cấu danh mục hiện tại"),
+    BotCommand("verify", "Kiểm định nhanh 1 cổ phiếu (VD: /verify HPG)"),
+    BotCommand("add", "Thêm cổ phiếu vào danh mục (VD: /add VNE 1000 32.5)"),
+    BotCommand("remove", "Xóa cổ phiếu khỏi danh mục (VD: /remove VNE)"),
+    BotCommand("audit_weekly", "Hậu kiểm /verify & /add trong 7 ngày qua"),
+    BotCommand("audit_monthly", "Hậu kiểm /verify & /add trong 30 ngày qua"),
+    BotCommand("news", "Tổng hợp tin tức từ 20 nguồn gần nhất"),
+    BotCommand("help", "Hiển thị danh sách lệnh"),
+]
+
+
+async def _set_bot_commands(app: Application) -> None:
+    """Post-init hook: push command list to Telegram so the slash menu is current."""
+    await app.bot.set_my_commands(_BOT_COMMANDS)
+    LOGGER.info(
+        "Telegram bot commands registered: %s",
+        [c.command for c in _BOT_COMMANDS],
+    )
+
 
 def build_application() -> Application:
     """Build the python-telegram-bot Application with every command handler wired up."""
@@ -862,7 +946,7 @@ def build_application() -> Application:
             "Set it in `.env` (see `.env.example`)."
         )
 
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(token).post_init(_set_bot_commands).build()
 
     # --- Phase 1 ---
     app.add_handler(CommandHandler("help", help_command))
@@ -897,6 +981,9 @@ def build_application() -> Application:
     # Post-mortem audit — weekly/monthly review of /verify + /add accuracy.
     app.add_handler(CommandHandler("audit_weekly", audit_weekly_command))
     app.add_handler(CommandHandler("audit_monthly", audit_monthly_command))
+
+    # --- Phase 4 ---
+    app.add_handler(CommandHandler("rebalance", rebalance_command))
 
     app.add_error_handler(_on_error)
     return app

@@ -196,6 +196,77 @@ Rating Scale:
 - Underweight: Reduce exposure, take partial profits
 - Sell: Exit position or avoid entry"""
 
+REBALANCE_SYSTEM_PROMPT = """Bạn là Quant Portfolio Manager chuyên tư vấn cơ cấu lại danh mục đầu tư chứng khoán Việt Nam.
+
+Phân tích danh mục hiện tại của người dùng gồm: % lãi/lỗ, dự báo mô hình, tin tức gần đây cho từng cổ phiếu.
+
+Đề xuất hành động cụ thể: giữ nguyên, chốt lời, cắt lỗ, hoặc chuyển vốn sang cổ phiếu khác.
+
+Trả lời bằng tiếng Việt, ngắn gọn, tối đa 4 câu, không dùng markdown."""
+
+
+def get_rebalance_advice(
+    holdings_context: list[dict[str, Any]],
+    ticker_news_dict: dict[str, list[str]],
+) -> str:
+    """Call Gemini for a portfolio rebalance recommendation.
+
+    holdings_context: list of dicts with keys ticker, pnl_pct, pred_label, p_up.
+    ticker_news_dict: ticker → list of formatted article strings from map_tickers_to_news.
+    Returns a Vietnamese advisory string, or a graceful error fallback.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key or genai is None or genai_types is None:
+        LOGGER.warning("[Rebalance] GEMINI_API_KEY not set or google-genai missing.")
+        return "Không thể tư vấn: thiếu API Key."
+
+    client = genai.Client(api_key=api_key)
+    gemini_model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+    holdings_lines = []
+    for h in holdings_context:
+        ticker = h.get("ticker", "?")
+        pnl_pct = h.get("pnl_pct", 0.0)
+        pred_label = h.get("pred_label", "Không rõ")
+        p_up = h.get("p_up", 0.0)
+        sign = "+" if pnl_pct >= 0 else ""
+        holdings_lines.append(
+            f"- {ticker}: {sign}{pnl_pct:.1f}% PnL, Model dự báo {pred_label} ({p_up * 100:.0f}%)"
+        )
+
+    news_lines = []
+    for ticker, articles in ticker_news_dict.items():
+        if articles:
+            first_line = articles[0].split("\n")[1] if "\n" in articles[0] else articles[0][:120]
+            news_lines.append(f"- {ticker}: {first_line[:120]}")
+
+    holdings_text = "\n".join(holdings_lines) or "Không có cổ phiếu nào."
+    news_text = "\n".join(news_lines[:5]) or "Không có tin tức."
+
+    user_prompt = (
+        f"Người dùng đang nắm giữ:\n{holdings_text}\n\n"
+        f"Tin tức gần đây:\n{news_text}\n\n"
+        "Với vai trò Quant Portfolio Manager, hãy tư vấn người dùng nên giữ, chốt lời, "
+        "cắt lỗ hoặc chuyển vốn từ cổ phiếu nào sang cổ phiếu nào. Tối đa 4 câu. Tiếng Việt."
+    )
+
+    generate_config = genai_types.GenerateContentConfig(
+        system_instruction=REBALANCE_SYSTEM_PROMPT,
+        temperature=0.2,
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=gemini_model_name,
+            contents=user_prompt,
+            config=generate_config,
+        )
+        advice = (response.text or "").strip()
+        return advice if advice else "Không thể tạo tư vấn từ AI."
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("[Rebalance] Gemini call failed: %s", exc)
+        return "Lỗi khi gọi AI. Vui lòng thử lại sau."
+
 
 # ---------------------------------------------------------------------------
 # ASYNC NEWS SCRAPING
