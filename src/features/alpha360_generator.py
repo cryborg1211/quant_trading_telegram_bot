@@ -126,9 +126,39 @@ class Alpha360Generator:
         # read-only query in practice; the SQL itself is `SELECT`-only.
         conn = duckdb.connect(self.db_path)
         try:
-            macro_query = "SELECT * FROM macro_daily ORDER BY date"
-            macro_df = pl.from_arrow(conn.execute(macro_query).arrow()).with_columns(pl.col("date").cast(pl.Date))
-            sentiment_df = self._query_sentiment(conn)
+            existing = {
+                r[0] for r in conn.execute(
+                    "SELECT table_name FROM information_schema.tables"
+                ).fetchall()
+            }
+            # GRACEFUL DEGRADATION: macro_daily / hist_sentiment_llm_labeled
+            # may be absent (fresh DB restored from OHLCV-only backup). Rather
+            # than crash the whole feature build, fall back to empty frames —
+            # _integrate_macro/_integrate_sentiment then zero-fill those
+            # features so the price/volume Alpha360 model still trains on the
+            # full universe. A loud warning makes the degradation auditable.
+            if "macro_daily" in existing:
+                macro_df = pl.from_arrow(
+                    conn.execute("SELECT * FROM macro_daily ORDER BY date").arrow()
+                ).with_columns(pl.col("date").cast(pl.Date))
+            else:
+                LOGGER.warning(
+                    "macro_daily table ABSENT — building Alpha360 WITHOUT macro "
+                    "features (zero-filled). Crawl macro to restore them."
+                )
+                macro_df = pl.DataFrame({"date": []}, schema={"date": pl.Date})
+
+            if "hist_sentiment_llm_labeled" in existing:
+                sentiment_df = self._query_sentiment(conn)
+            else:
+                LOGGER.warning(
+                    "hist_sentiment_llm_labeled table ABSENT — building Alpha360 "
+                    "WITHOUT sentiment features (zero-filled)."
+                )
+                sentiment_df = pl.DataFrame(
+                    {"ticker": [], "date": []},
+                    schema={"ticker": pl.Utf8, "date": pl.Date},
+                )
         finally:
             conn.close()
         LOGGER.info("Macro shape=%s", macro_df.shape)
@@ -401,6 +431,19 @@ class Alpha360Generator:
         Every macro column is shifted by 1 day before the join, so the
         feature value seen on date D is the macro reading from D-1.
         """
+        # 0. GRACEFUL DEGRADATION: macro table absent/empty (see _load_data).
+        # No macro rows or only a `date` column ⇒ skip the macro join entirely
+        # and return alpha features unchanged. The model trains on price/volume
+        # + sentiment only; no macro_* columns are emitted (nothing downstream
+        # hard-requires them — selected_features adapts to whatever exists).
+        non_date_cols = [c for c in macro_df.columns if c != "date"]
+        if macro_df.height == 0 or not non_date_cols:
+            LOGGER.warning(
+                "[Alpha360] macro frame empty — emitting features WITHOUT any "
+                "macro_* columns (graceful degradation)."
+            )
+            return alpha_df.with_columns(pl.col("date").cast(pl.Date))
+
         # 1. Drop columns that are 100% null (defensive — if the crawler
         # hasn't populated a new column yet, exclude it rather than letting
         # downstream `drop_nulls` wipe the entire training set).
