@@ -18,6 +18,11 @@ import numpy as np
 from catboost import CatBoostClassifier
 
 from src.features.alpha360_generator import Alpha360Generator
+from src.models.stacking_model.economic_metrics import (
+    META_LABEL_FEATURE_NAMES,
+    N_CLOSE_LAGS_FOR_META,
+    meta_label_feature_matrix,
+)
 from src.models.quant_agent_arbitrator import (
     evaluate_trades_batch,
     get_rebalance_advice,
@@ -344,7 +349,7 @@ def build_alpha360() -> None:
         generator.run()
 
 
-def load_stacking_artifacts(horizon: int) -> tuple[list[str], dict[str, Any], Any, Any, CatBoostClassifier, Any]:
+def load_stacking_artifacts(horizon: int) -> tuple[list[str], dict[str, Any], Any, Any, CatBoostClassifier, Any, Any]:
     artifact_dir = Path("models/stacking") / f"{horizon}d"
     required_artifacts = {
         "selected_features": artifact_dir / "selected_features.json",
@@ -357,6 +362,11 @@ def load_stacking_artifacts(horizon: int) -> tuple[list[str], dict[str, Any], An
     missing = [str(path) for path in required_artifacts.values() if not path.exists()]
     if missing:
         raise FileNotFoundError(f"Missing {horizon}d stacking artifacts: {missing}. Run train_stacking.py first.")
+
+    # Task 3: the secondary meta-labeler is OPTIONAL. If absent (e.g. a model
+    # trained before Task 3, or a degenerate fold), inference cleanly falls
+    # back to the primary-only cost-aware gate — no crash.
+    meta_labeler_path = artifact_dir / "meta_labeler.joblib"
 
     LOGGER.info("Loading %sd stacking artifacts from %s", horizon, artifact_dir)
     with timed_step("Loading model artifacts"):
@@ -372,9 +382,13 @@ def load_stacking_artifacts(horizon: int) -> tuple[list[str], dict[str, Any], An
         cat_model = CatBoostClassifier()
         cat_model.load_model(str(required_artifacts["catboost"]))
         meta_model = joblib.load(required_artifacts["meta_model"])
+        meta_labeler = joblib.load(meta_labeler_path) if meta_labeler_path.exists() else None
 
-    LOGGER.info("Loaded %sd artifacts. selected_features=%s", horizon, len(selected_features))
-    return selected_features, quantile_thresholds, xgb_model, lgbm_model, cat_model, meta_model
+    LOGGER.info(
+        "Loaded %sd artifacts. selected_features=%s meta_labeler=%s",
+        horizon, len(selected_features), "ON" if meta_labeler is not None else "OFF (primary-only)",
+    )
+    return selected_features, quantile_thresholds, xgb_model, lgbm_model, cat_model, meta_model, meta_labeler
 
 
 def aligned_proba(model, x: np.ndarray) -> np.ndarray:
@@ -389,17 +403,23 @@ def aligned_proba(model, x: np.ndarray) -> np.ndarray:
     return out / np.where(denom == 0.0, 1.0, denom)
 
 
-def predict_stacking_horizon(latest_df, horizon: int) -> tuple[dict[str, list[float]], dict[str, Any], Any, list[str]]:
+def predict_stacking_horizon(latest_df, horizon: int) -> tuple[dict[str, list[float]], dict[str, Any], Any, list[str], dict[str, bool]]:
     """
     Run stacking model inference for a given horizon.
 
     Returns:
         predictions: {ticker: [p_down, p_sideways, p_up]}
-        quantile_thresholds: {q33_return, q66_return}
-        xgb_model: XGBoost base model (for feature importance)
+        thresholds:  cost-aware metadata (pnl_threshold_tau, round_trip_cost…)
+        xgb_model:   XGBoost base model (for feature importance)
         selected_features: list of feature names
+        meta_gate:   {ticker: bool} — Task 3 combined decision. A ticker is
+                     tradeable ONLY if the primary model is bullish
+                     (P(UP) >= τ*) AND the meta-labeler says GO
+                     (P(profit) >= 0.5). Falls back to the primary-only
+                     cost-aware gate (or legacy all-pass) when no τ*/labeler.
     """
-    selected_features, quantile_thresholds, xgb_model, lgbm_model, cat_model, meta_model = load_stacking_artifacts(horizon)
+    (selected_features, quantile_thresholds, xgb_model, lgbm_model,
+     cat_model, meta_model, meta_labeler) = load_stacking_artifacts(horizon)
 
     missing_features = [c for c in selected_features if c not in latest_df.columns]
     if missing_features:
@@ -419,22 +439,67 @@ def predict_stacking_horizon(latest_df, horizon: int) -> tuple[dict[str, list[fl
         ]).astype(np.float32)
 
     with timed_step(f"Running {horizon}d meta-model inference"):
-        meta_probs = np.asarray(meta_model.predict_proba(base_meta), dtype=np.float32)
+        # aligned_proba → guaranteed [P(DOWN), P(SIDE), P(UP)] column order,
+        # identical to training's aligned_predict_proba (zero skew).
+        meta_probs = aligned_proba(meta_model, base_meta)
 
+    tickers = [str(t) for t in latest_df["ticker"].tolist()]
     predictions = {
         ticker: probs.tolist()
-        for ticker, probs in zip(latest_df["ticker"].astype(str).tolist(), meta_probs, strict=False)
+        for ticker, probs in zip(tickers, meta_probs, strict=False)
     }
+
+    # ── TASK 3: combined meta-labeling gate ─────────────────────────────
+    tau_star = float(quantile_thresholds.get("pnl_threshold_tau", 0.5))
+    has_tau = "pnl_threshold_tau" in quantile_thresholds
+    p_up_arr = meta_probs[:, 2]
+
+    if not has_tau:
+        # Legacy artifact (pre-Task-2): preserve old behaviour — no gate.
+        gate_arr = np.ones(len(tickers), dtype=bool)
+        gate_mode = "legacy-all-pass"
+    elif meta_labeler is None:
+        # Task-2 primary-only cost-aware gate.
+        gate_arr = p_up_arr >= tau_star
+        gate_mode = f"primary-only τ*={tau_star:.2f}"
+    else:
+        lag_cols = [f"close_{i}" for i in range(N_CLOSE_LAGS_FOR_META)]
+        miss = [c for c in lag_cols if c not in latest_df.columns]
+        if miss:
+            LOGGER.warning(
+                "[MetaLabeler %sd] missing close lags %s — primary-only fallback.",
+                horizon, miss[:3],
+            )
+            gate_arr = p_up_arr >= tau_star
+            gate_mode = f"primary-only (no lags) τ*={tau_star:.2f}"
+        else:
+            close_lags = (
+                latest_df[lag_cols]
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(0.0)
+                .to_numpy(dtype=np.float64)
+            )
+            x_meta = meta_label_feature_matrix(meta_probs, tau_star, close_lags)
+            p_profit = np.asarray(
+                meta_labeler.predict_proba(x_meta), dtype=np.float64
+            )[:, 1]
+            gate_arr = (p_up_arr >= tau_star) & (p_profit >= 0.5)
+            gate_mode = f"meta-labeled τ*={tau_star:.2f} ∧ P(profit)≥0.5"
+
+    meta_gate = {t: bool(g) for t, g in zip(tickers, gate_arr, strict=False)}
+
     sorted_preds = sorted(predictions.items(), key=lambda x: x[1][2], reverse=True)
-    top_10_str = " | ".join([f"{t}: {p[2] * 100:.2f}%" for t, p in sorted_preds[:10]])
-    LOGGER.info("[StackingGBDT %sd] TOP 10 UP PROBS: %s", horizon, top_10_str)
-    LOGGER.info(
-        "[StackingGBDT %sd] Quantile thresholds: q33=%.6f, q66=%.6f",
-        horizon,
-        quantile_thresholds["q33_return"],
-        quantile_thresholds["q66_return"],
+    top_10_str = " | ".join(
+        f"{t}:{p[2]*100:.1f}%{'✓' if meta_gate.get(t) else '✗'}"
+        for t, p in sorted_preds[:10]
     )
-    return predictions, quantile_thresholds, xgb_model, selected_features
+    LOGGER.info("[StackingGBDT %sd] TOP 10 UP (✓=gate open): %s", horizon, top_10_str)
+    LOGGER.info(
+        "[StackingGBDT %sd] gate=%s | %s/%s tickers tradeable | round_trip_cost=%.4f",
+        horizon, gate_mode, sum(meta_gate.values()), len(meta_gate),
+        float(quantile_thresholds.get("round_trip_cost", 0.0)),
+    )
+    return predictions, quantile_thresholds, xgb_model, selected_features, meta_gate
 
 
 _REPORT_SEPARATOR = "\n\n══════════════════════════════\n\n"
@@ -627,8 +692,8 @@ def daily_inference(
     if latest_df.empty:
         raise ValueError("Live feature frame is empty.")
 
-    stacking_predictions_5d, _, xgb_model_5d, selected_features_5d = predict_stacking_horizon(latest_df, 5)
-    stacking_predictions_20d, _, _, _ = predict_stacking_horizon(latest_df, 20)
+    stacking_predictions_5d, _, xgb_model_5d, selected_features_5d, meta_gate_5d = predict_stacking_horizon(latest_df, 5)
+    stacking_predictions_20d, _, _, _, _ = predict_stacking_horizon(latest_df, 20)
 
     sorted_preds = sorted(stacking_predictions_5d.items(), key=lambda x: x[1][2], reverse=True)
     top_10_str = " | ".join([f"{t}: {p[2] * 100:.2f}%" for t, p in sorted_preds[:10]])
@@ -664,7 +729,17 @@ def daily_inference(
 
     # Send Top-6 liquid tickers to arbitrator/sentiment layer.
     # 6 candidates → full LLM sentiment evaluation → final Top-3 selected by sentiment+quant score.
+    #
+    # TASK 3 GATE: a ticker only reaches the arbitrator/dispatch if BOTH the
+    # primary model is bullish (P(UP) >= τ*) AND the meta-labeler predicts the
+    # trade is profitable net of the 0.8% friction (P(profit) >= 0.5). This is
+    # the single execution choke point — nothing un-approved can be traded.
     _ARBITRATOR_POOL = 6
+    _gated_out = [
+        t for t, _p in sorted(stacking_predictions_5d.items(),
+                               key=lambda i: i[1][2], reverse=True)
+        if t in liquid_tickers and not meta_gate_5d.get(t, True)
+    ]
     candidate_tickers = [
         ticker
         for ticker, _probs in sorted(
@@ -672,9 +747,13 @@ def daily_inference(
             key=lambda item: item[1][2],
             reverse=True,
         )
-        if ticker in liquid_tickers
+        if ticker in liquid_tickers and meta_gate_5d.get(ticker, True)
     ][: min(max_candidates, _ARBITRATOR_POOL)]
-    LOGGER.info("[Brain] Top-%s liquid candidates → arbitrator pool: %s", len(candidate_tickers), candidate_tickers)
+    LOGGER.info(
+        "[Brain] Meta-labeler gate: %s liquid tickers rejected (e.g. %s). "
+        "Top-%s survivors → arbitrator pool: %s",
+        len(_gated_out), _gated_out[:5], len(candidate_tickers), candidate_tickers,
+    )
 
     horizon_predictions = {"5d": stacking_predictions_5d, "20d": stacking_predictions_20d}
     with timed_step("Evaluating candidates with dual-horizon arbitrator/sentiment layer"):
@@ -975,8 +1054,8 @@ def inference_for_holdings(
 
     latest_df = latest_df[latest_df["ticker"].astype(str).isin(present)].reset_index(drop=True)
 
-    stacking_predictions_5d, _, _, _ = predict_stacking_horizon(latest_df, 5)
-    stacking_predictions_20d, _, _, _ = predict_stacking_horizon(latest_df, 20)
+    stacking_predictions_5d, _, _, _, _ = predict_stacking_horizon(latest_df, 5)
+    stacking_predictions_20d, _, _, _, _ = predict_stacking_horizon(latest_df, 20)
     horizon_predictions = {"5d": stacking_predictions_5d, "20d": stacking_predictions_20d}
 
     with timed_step("Holdings arbitrator + sentiment scoring"):
@@ -1135,8 +1214,8 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
 
     # --- Step 2: Stacking GBDT inference (5d primary + 20d for arbitrator) ---
     try:
-        stacking_5d, _, _, _ = predict_stacking_horizon(latest_df, 5)
-        stacking_20d, _, _, _ = predict_stacking_horizon(latest_df, 20)
+        stacking_5d, _, _, _, _ = predict_stacking_horizon(latest_df, 5)
+        stacking_20d, _, _, _, _ = predict_stacking_horizon(latest_df, 20)
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("[/verify] Stacking inference failed for %s.", ticker)
         return (
@@ -1254,7 +1333,7 @@ def rebalance_portfolio(user_id: str, window_rows: int = 120) -> str:
         return ""
 
     latest_df = latest_df[latest_df["ticker"].astype(str).isin(present)].reset_index(drop=True)
-    stacking_predictions_5d, _, _, _ = predict_stacking_horizon(latest_df, 5)
+    stacking_predictions_5d, _, _, _, _ = predict_stacking_horizon(latest_df, 5)
     live_prices = _get_live_exec_prices(latest_df, present)
 
     holdings_context: list[dict] = []

@@ -46,6 +46,59 @@ import numpy as np
 UP_CLASS = 2
 TRADING_DAYS = 252
 
+# ── Meta-labeler (Task 3) feature contract ──────────────────────────────────
+# These are the EXACT features the secondary classifier sees, in this order,
+# at BOTH training and live inference. Every input is derivable from a single
+# row (the primary stacking probabilities + the Alpha360 normalized-close lag
+# columns close_0..close_19), so there is zero train/serve skew and no
+# trailing-history requirement at inference.
+META_LABEL_FEATURE_NAMES = [
+    "p_down",      # primary stacking P(DOWN)
+    "p_side",      # primary stacking P(SIDEWAYS)
+    "p_up",        # primary stacking P(UP)
+    "conviction",  # p_up - tau*  (distance above the long-entry threshold)
+    "spread",      # p_up - p_down (directional asymmetry of the primary)
+    "trend",       # close_0 - close_19 (recent vs ~1-month normalized drift)
+    "vol",         # std(close_0..close_19) (recent normalized-price volatility)
+]
+N_CLOSE_LAGS_FOR_META = 20  # close_0 .. close_19
+
+
+def meta_label_feature_matrix(
+    meta_proba: np.ndarray,
+    tau_star: float,
+    close_lags: np.ndarray,
+) -> np.ndarray:
+    """Build the meta-labeler feature matrix — identical at train and serve.
+
+    Parameters
+    ----------
+    meta_proba : (n, 3) float
+        Primary stacking probabilities [P(DOWN), P(SIDE), P(UP)].
+    tau_star : float
+        The cost-aware long-entry threshold selected in Task 2.
+    close_lags : (n, >=20) float
+        Alpha360 normalized-close lag columns close_0..close_19 (more
+        columns tolerated; only the first 20 are used).
+
+    Returns
+    -------
+    (n, 7) float32 — columns in ``META_LABEL_FEATURE_NAMES`` order.
+    """
+    p = np.asarray(meta_proba, dtype=np.float64)
+    cl = np.asarray(close_lags, dtype=np.float64)[:, :N_CLOSE_LAGS_FOR_META]
+    cl = np.nan_to_num(cl, nan=0.0, posinf=0.0, neginf=0.0)
+
+    p_down, p_side, p_up = p[:, 0], p[:, 1], p[:, 2]
+    conviction = p_up - float(tau_star)
+    spread = p_up - p_down
+    trend = cl[:, 0] - cl[:, 19]
+    vol = cl.std(axis=1)
+
+    return np.column_stack(
+        [p_down, p_side, p_up, conviction, spread, trend, vol]
+    ).astype(np.float32)
+
 # Aggressive VN-market defaults. Override per call if needed.
 DEFAULT_FEE_RATE = 0.002          # per side
 DEFAULT_SLIPPAGE_PER_SIDE = 0.002  # per side — aggressive gap penalty

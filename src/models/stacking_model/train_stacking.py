@@ -24,7 +24,10 @@ from config.settings import CONFIG
 from src.models.stacking_model.economic_metrics import (
     DEFAULT_FEE_RATE,
     DEFAULT_SLIPPAGE_PER_SIDE,
+    META_LABEL_FEATURE_NAMES,
+    N_CLOSE_LAGS_FOR_META,
     economic_report,
+    meta_label_feature_matrix,
     round_trip_cost,
     select_pnl_threshold,
 )
@@ -101,6 +104,7 @@ def artifact_paths(horizon: int) -> dict[str, Path]:
         "lightgbm": artifact_dir / "lightgbm_model.joblib",
         "catboost": artifact_dir / "catboost_model.cbm",
         "meta_model": artifact_dir / "meta_model.joblib",
+        "meta_labeler": artifact_dir / "meta_labeler.joblib",
         "report": artifact_dir / "classification_report.json",
         "confusion_matrix": artifact_dir / "confusion_matrix.json",
         "thresholds": artifact_dir / "quantile_thresholds.json",
@@ -179,6 +183,25 @@ def to_clean_numpy(df: pl.DataFrame, columns: list[str]) -> np.ndarray:
     r, c = np.where(np.isnan(x))
     x[r, c] = med[c]
     return x
+
+
+def close_lag_matrix(df: pl.DataFrame) -> np.ndarray:
+    """Return the (n, N_CLOSE_LAGS_FOR_META) Alpha360 normalized-close lag
+    block ``close_0..close_{k-1}`` used by the Task-3 meta-labeler.
+
+    These columns are produced by ``alpha360_generator._generate_lags`` and
+    are present BOTH in the training parquet and the live inference frame —
+    guaranteeing zero train/serve skew for the meta-labeler features.
+    """
+    cols = [f"close_{i}" for i in range(N_CLOSE_LAGS_FOR_META)]
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Meta-labeler needs Alpha360 close lags; missing {missing[:5]} "
+            f"(+{max(0, len(missing) - 5)} more). Regenerate Alpha360 features."
+        )
+    x = df.select(cols).to_numpy().astype(np.float64)
+    return np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def purged_feature_selection(
@@ -410,6 +433,7 @@ def save_artifacts(
     selected_features: list[str],
     fitted_models: dict[str, Any],
     meta_model: LGBMClassifier,
+    meta_labeler: LGBMClassifier | None,
     report: dict,
     cm: np.ndarray,
     thresholds: dict[str, Any],
@@ -422,6 +446,13 @@ def save_artifacts(
     joblib.dump(fitted_models["lightgbm"], paths["lightgbm"])
     fitted_models["catboost"].save_model(str(paths["catboost"]))
     joblib.dump(meta_model, paths["meta_model"])
+    # Task 3: persist the secondary meta-labeler when trained. If it was
+    # skipped (degenerate fold) remove any stale artifact so inference
+    # cleanly falls back to the primary-only gate.
+    if meta_labeler is not None:
+        joblib.dump(meta_labeler, paths["meta_labeler"])
+    elif paths["meta_labeler"].exists():
+        paths["meta_labeler"].unlink()
     with paths["selected_features"].open("w", encoding="utf-8") as f:
         json.dump(selected_features, f, indent=2)
     with paths["report"].open("w", encoding="utf-8") as f:
@@ -551,6 +582,65 @@ def train_horizon(
     test_econ = economic_report(long_decisions, test_ret, horizon)
     net_sharpe = float(test_econ["net_sharpe"])
 
+    # ── TASK 3: META-LABELING (de Prado AFML 3.6) ───────────────────────
+    # Primary model decides the SIDE (long iff P(UP) >= τ*). The secondary
+    # binary classifier decides whether to ACT — it predicts P(this primary
+    # bet is profitable NET of the 0.8% round-trip friction). It is trained
+    # ONLY on the events the primary actually triggered (bull mask), on
+    # LEAK-FREE purged-OOF probabilities, with the realized barrier return
+    # as ground truth. A trade fires only if BOTH agree.
+    rt_cost = round_trip_cost()
+    bull_oof = p_up_oof >= tau_star
+    y_meta = ((train_ret - rt_cost) > 0.0).astype(np.int64)
+    close_lags_train = close_lag_matrix(train_df)
+    x_meta_oof = meta_label_feature_matrix(meta_oof_proba, tau_star, close_lags_train)
+
+    n_bull = int(bull_oof.sum())
+    classes_present = np.unique(y_meta[bull_oof]) if n_bull else np.array([])
+    meta_labeler: Any = None
+    meta_econ: dict[str, Any] = {"enabled": False, "reason": "untrained"}
+
+    if n_bull >= 100 and classes_present.size == 2:
+        meta_labeler = LGBMClassifier(
+            objective="binary",
+            max_depth=3,
+            num_leaves=7,
+            learning_rate=0.05,
+            n_estimators=150,
+            reg_alpha=0.1,
+            reg_lambda=2.0,
+            class_weight="balanced",
+            random_state=SEED,
+            n_jobs=-1,
+            verbose=-1,
+        )
+        with timed_step(f"Training {horizon}d meta-LABELER (n_bull={n_bull})"):
+            meta_labeler.fit(x_meta_oof[bull_oof], y_meta[bull_oof])
+
+        # Combined gate on TEST: primary bullish AND meta-labeler says GO.
+        close_lags_test = close_lag_matrix(test_df)
+        test_meta_proba = aligned_predict_proba(meta_model, test_meta)
+        x_meta_test = meta_label_feature_matrix(test_meta_proba, tau_star, close_lags_test)
+        p_profit_test = meta_labeler.predict_proba(x_meta_test)[:, 1]
+        gate = long_decisions & (p_profit_test >= 0.5)
+        meta_econ = economic_report(gate, test_ret, horizon)
+        meta_econ["enabled"] = True
+        meta_econ["gate_trades"] = int(gate.sum())
+        meta_econ["primary_only_trades"] = int(long_decisions.sum())
+        LOGGER.info(
+            "%sd META-LABELER | primary-only: sharpe=%.3f trades=%s  →  "
+            "+meta: sharpe=%.3f trades=%s pnl=%.4f hit=%.1f%%",
+            horizon, net_sharpe, int(long_decisions.sum()),
+            meta_econ["net_sharpe"], meta_econ["n_trades"],
+            meta_econ["net_pnl"], 100.0 * meta_econ["hit_rate"],
+        )
+    else:
+        LOGGER.warning(
+            "%sd META-LABELER skipped (n_bull=%s, classes=%s). "
+            "Inference falls back to primary-only gate.",
+            horizon, n_bull, classes_present.tolist(),
+        )
+
     macro_f1 = f1_score(y_test, y_pred, average="macro", labels=CLASSES, zero_division=0)
     report = cast(
         dict[str, Any],
@@ -580,6 +670,16 @@ def train_horizon(
     }
     report["economics_test"] = test_econ
     report["economics_oof"] = oof_econ
+    # Task 3 — meta-labeling economics (combined gate vs primary-only).
+    report["meta_labeler_enabled"] = bool(meta_labeler is not None)
+    report["economics_test_meta_labeled"] = meta_econ
+    # Inference contract: τ*, cost model and the meta-labeler feature order
+    # are persisted into the thresholds artifact so main.py reproduces the
+    # EXACT train-time gate with zero skew.
+    thresholds["pnl_threshold_tau"] = float(tau_star)
+    thresholds["round_trip_cost"] = float(rt_cost)
+    thresholds["meta_labeler_enabled"] = bool(meta_labeler is not None)
+    thresholds["meta_label_features"] = list(META_LABEL_FEATURE_NAMES)
     # macro-F1 retained as a SECONDARY diagnostic only.
     report["macro_f1"] = float(macro_f1)
     report["baseline_macro_f1"] = float(BASELINE_MACRO_F1)
@@ -598,7 +698,7 @@ def train_horizon(
         100.0 * test_econ["hit_rate"], macro_f1,
     )
     LOGGER.info("%sd Confusion Matrix\n%s", horizon, cm)
-    save_artifacts(horizon, selected_features, fitted_models, meta_model, report, cm, thresholds)
+    save_artifacts(horizon, selected_features, fitted_models, meta_model, meta_labeler, report, cm, thresholds)
     LOGGER.info("%sd artifacts saved: %s", horizon, artifact_paths(horizon)["dir"])
 
 
