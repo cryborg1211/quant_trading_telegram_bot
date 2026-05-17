@@ -46,7 +46,8 @@ FEATURE_HUMAN_NAMES: dict[str, str] = {
     "open": "Giá mở cửa",
     "high": "Mức đỉnh giá",
     "low": "Mức đáy giá",
-    "vwap": "Giá trung bình gia quyền (VWAP)",
+    "vwap": "Giá trung bình gia quyền (VWAP)",  # kept for backward compat with old artifacts
+    "hlc3": "Giá HLC3 (Trung bình Cao-Thấp-Đóng)",
     "volume": "Khối lượng giao dịch",
     # RSI variants
     "rsi_14": "RSI 14 ngày",
@@ -343,11 +344,10 @@ def build_alpha360() -> None:
         generator.run()
 
 
-def load_stacking_artifacts(horizon: int) -> tuple[list[str], dict[str, Any], Any, Any, Any, CatBoostClassifier, Any]:
+def load_stacking_artifacts(horizon: int) -> tuple[list[str], dict[str, Any], Any, Any, CatBoostClassifier, Any]:
     artifact_dir = Path("models/stacking") / f"{horizon}d"
     required_artifacts = {
         "selected_features": artifact_dir / "selected_features.json",
-        "scaler": artifact_dir / "scaler.joblib",
         "xgboost": artifact_dir / "xgboost_model.joblib",
         "lightgbm": artifact_dir / "lightgbm_model.joblib",
         "catboost": artifact_dir / "catboost_model.cbm",
@@ -365,7 +365,8 @@ def load_stacking_artifacts(horizon: int) -> tuple[list[str], dict[str, Any], An
         with required_artifacts["thresholds"].open("r", encoding="utf-8") as f:
             quantile_thresholds = json.load(f)
 
-        scaler = joblib.load(required_artifacts["scaler"])
+        # StandardScaler removed from pipeline (train_stacking.py Flaw 3 fix).
+        # Alpha360 features are already rolling Z-scores; no secondary scaling needed.
         xgb_model = joblib.load(required_artifacts["xgboost"])
         lgbm_model = joblib.load(required_artifacts["lightgbm"])
         cat_model = CatBoostClassifier()
@@ -373,7 +374,7 @@ def load_stacking_artifacts(horizon: int) -> tuple[list[str], dict[str, Any], An
         meta_model = joblib.load(required_artifacts["meta_model"])
 
     LOGGER.info("Loaded %sd artifacts. selected_features=%s", horizon, len(selected_features))
-    return selected_features, quantile_thresholds, scaler, xgb_model, lgbm_model, cat_model, meta_model
+    return selected_features, quantile_thresholds, xgb_model, lgbm_model, cat_model, meta_model
 
 
 def aligned_proba(model, x: np.ndarray) -> np.ndarray:
@@ -391,30 +392,30 @@ def aligned_proba(model, x: np.ndarray) -> np.ndarray:
 def predict_stacking_horizon(latest_df, horizon: int) -> tuple[dict[str, list[float]], dict[str, Any], Any, list[str]]:
     """
     Run stacking model inference for a given horizon.
-    
+
     Returns:
         predictions: {ticker: [p_down, p_sideways, p_up]}
         quantile_thresholds: {q33_return, q66_return}
         xgb_model: XGBoost base model (for feature importance)
         selected_features: list of feature names
     """
-    selected_features, quantile_thresholds, scaler, xgb_model, lgbm_model, cat_model, meta_model = load_stacking_artifacts(horizon)
+    selected_features, quantile_thresholds, xgb_model, lgbm_model, cat_model, meta_model = load_stacking_artifacts(horizon)
 
     missing_features = [c for c in selected_features if c not in latest_df.columns]
     if missing_features:
         raise ValueError(f"Missing selected features in live Alpha360 data for {horizon}d: {missing_features[:10]}")
 
     with timed_step(f"Preparing {horizon}d model input matrix"):
+        # No StandardScaler transform — features are already rolling Z-scores from Alpha360.
         x_raw = latest_df[selected_features].replace([np.inf, -np.inf], np.nan)
-        x_raw = x_raw.fillna(x_raw.median(numeric_only=True)).fillna(0.0).to_numpy(dtype=np.float32)
-        x_scaled = scaler.transform(x_raw).astype(np.float32)
-    LOGGER.info("%sd model input shape=%s", horizon, x_scaled.shape)
+        x_input = x_raw.fillna(x_raw.median(numeric_only=True)).fillna(0.0).to_numpy(dtype=np.float32)
+    LOGGER.info("%sd model input shape=%s", horizon, x_input.shape)
 
     with timed_step(f"Running {horizon}d XGBoost/LightGBM/CatBoost base model inference"):
         base_meta = np.hstack([
-            aligned_proba(xgb_model, x_scaled),
-            aligned_proba(lgbm_model, x_scaled),
-            aligned_proba(cat_model, x_scaled),
+            aligned_proba(xgb_model, x_input),
+            aligned_proba(lgbm_model, x_input),
+            aligned_proba(cat_model, x_input),
         ]).astype(np.float32)
 
     with timed_step(f"Running {horizon}d meta-model inference"):

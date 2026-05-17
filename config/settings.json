@@ -49,7 +49,7 @@
     "request_backoff_factor": 1.5
   },
   "sentiment": {
-    "gemini_model": "models/gemini-2.5-flash",
+    "gemini_model": "models/gemini-3.5-flash",
     "rss_lookback_weekday_days": 1,
     "rss_lookback_monday_days": 3,
     "max_tickers": 30,

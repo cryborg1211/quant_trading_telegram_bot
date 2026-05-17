@@ -15,14 +15,20 @@ import polars as pl
 from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
 from sklearn.base import clone
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import TimeSeriesSplit, cross_val_predict
-from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import cross_val_predict
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
 from config.settings import CONFIG
+from src.models.stacking_model.economic_metrics import (
+    DEFAULT_FEE_RATE,
+    DEFAULT_SLIPPAGE_PER_SIDE,
+    economic_report,
+    round_trip_cost,
+    select_pnl_threshold,
+)
+from src.models.stacking_model.purged_kfold import PurgedKFold
 
 warnings.filterwarnings("ignore")
 
@@ -55,6 +61,8 @@ DATA_PATH = Path("data/alpha360_features.parquet")
 ARTIFACT_ROOT = Path("models/stacking")
 DATE_COL = "date"
 TICKER_COL = "ticker"
+# Flaw 8 fix: increased from 3 → 5 for more stable OOF meta-feature estimates.
+N_SPLITS = 5
 HORIZONS = [5, 20]
 RETURN_COLS = {5: "target_return_5d", 20: "target_return_20d"}
 TARGET_COLS = {5: "target_class_5d", 20: "target_class_20d"}
@@ -65,11 +73,22 @@ LEAKAGE_COLS = {
     "target_return_20d",
     "target_class_5d",
     "target_class_20d",
+    # Triple-barrier additions (de Prado). target_bin_* are Int8 → numeric,
+    # so they MUST be excluded or they leak the label. t1_* are Date dtype
+    # (auto-excluded by infer_feature_columns' numeric filter) but listed
+    # here defensively.
+    "target_bin_5d",
+    "target_bin_20d",
+    "t1_5d",
+    "t1_20d",
 }
 TOP_K_FEATURES = 70
 FEATURE_SELECTION_MAX_ROWS = 150_000
-N_SPLITS = 3
+# macro-F1 kept ONLY as a secondary diagnostic. The model-selection GATE is
+# now economic (Task 2): a strategy must clear a positive cost-adjusted,
+# risk-adjusted return or it is not deployable, no matter its F1.
 BASELINE_MACRO_F1 = 0.20
+BASELINE_NET_SHARPE = 0.0  # after VN fees + aggressive slippage
 CLASSES = np.array([0, 1, 2], dtype=np.int64)
 
 
@@ -78,7 +97,6 @@ def artifact_paths(horizon: int) -> dict[str, Path]:
     return {
         "dir": artifact_dir,
         "selected_features": artifact_dir / "selected_features.json",
-        "scaler": artifact_dir / "scaler.joblib",
         "xgboost": artifact_dir / "xgboost_model.joblib",
         "lightgbm": artifact_dir / "lightgbm_model.joblib",
         "catboost": artifact_dir / "catboost_model.cbm",
@@ -130,38 +148,6 @@ def chronological_split(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
     return train_df, test_df
 
 
-def compute_quantile_thresholds(train_df: pl.DataFrame, return_col: str, horizon: int) -> dict[str, Any]:
-    q33 = float(train_df.select(pl.col(return_col).quantile(0.3333333333, interpolation="nearest")).item())
-    q66 = float(train_df.select(pl.col(return_col).quantile(0.6666666667, interpolation="nearest")).item())
-    if not np.isfinite(q33) or not np.isfinite(q66) or q33 >= q66:
-        raise ValueError(f"Invalid {horizon}d quantile thresholds: q33={q33}, q66={q66}")
-    limit = 0.08 if horizon == 5 else 0.25
-    if q33 < -limit or q66 > limit:
-        raise ValueError(f"Unrealistic {horizon}d thresholds: q33={q33}, q66={q66}")
-    return {
-        "horizon_days": horizon,
-        "return_col": return_col,
-        "q33_return": q33,
-        "q66_return": q66,
-        "q33_percent": q33 * 100.0,
-        "q66_percent": q66 * 100.0,
-    }
-
-
-def apply_quantile_labels(df: pl.DataFrame, thresholds: dict[str, Any], target_col: str) -> pl.DataFrame:
-    q33 = thresholds["q33_return"]
-    q66 = thresholds["q66_return"]
-    return df.with_columns(
-        pl.when(pl.col(thresholds["return_col"]) <= q33)
-        .then(0)
-        .when(pl.col(thresholds["return_col"]) <= q66)
-        .then(1)
-        .otherwise(2)
-        .cast(pl.Int64)
-        .alias(target_col)
-    )
-
-
 def infer_feature_columns(df: pl.DataFrame) -> list[str]:
     excluded = {DATE_COL, TICKER_COL, *LEAKAGE_COLS}
     numeric_types = {
@@ -195,35 +181,71 @@ def to_clean_numpy(df: pl.DataFrame, columns: list[str]) -> np.ndarray:
     return x
 
 
-def select_features(train_df: pl.DataFrame, feature_cols: list[str], target_col: str) -> list[str]:
-    LOGGER.info("Feature selection input rows=%s candidate_features=%s target=%s", train_df.height, len(feature_cols), target_col)
+def purged_feature_selection(
+    train_df: pl.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    t1_col: str,
+    horizon: int,
+) -> list[str]:
+    """Select top-K features using purged cross-validation to avoid optimistic selection.
+
+    Flaw 2 fix: instead of fitting a feature selector on the entire training set
+    (which leaks future labels into the selection), we run feature selection
+    independently on each purged fold's training split and average importances
+    across folds. No fold's feature selector ever sees that fold's validation labels.
+
+    Also fixes Flaw 2's second issue: this function is called per-horizon so 5d
+    and 20d get independently selected feature sets.
+    """
     x = to_clean_numpy(train_df, feature_cols)
     y = train_df[target_col].to_numpy().astype(np.int64)
 
-    if x.shape[0] > FEATURE_SELECTION_MAX_ROWS:
-        rng = np.random.default_rng(SEED)
-        sample_idx = rng.choice(x.shape[0], size=FEATURE_SELECTION_MAX_ROWS, replace=False)
-        x_selector = x[sample_idx]
-        y_selector = y[sample_idx]
-        LOGGER.info("Feature selection downsampled rows from %s to %s.", x.shape[0], FEATURE_SELECTION_MAX_ROWS)
-    else:
-        x_selector = x
-        y_selector = y
-
-    selector_model = XGBClassifier(
-        n_estimators=100,
-        max_depth=6,
-        tree_method="hist",
-        device="cuda",
-        objective="multi:softprob",
-        num_class=3,
-        n_jobs=-1,
-        random_state=42,
+    purged_cv = PurgedKFold(
+        n_splits=N_SPLITS,
+        start_times=train_df[DATE_COL].to_numpy(),
+        end_times=train_df[t1_col].to_numpy(),
+        embargo_bars=horizon,
     )
-    with timed_step("GPU XGBoost feature selection"):
-        selector_model.fit(x_selector, y_selector)
-    importances = selector_model.feature_importances_
-    return [feature_cols[i] for i in np.argsort(importances)[::-1][:TOP_K_FEATURES]]
+
+    importance_sum = np.zeros(len(feature_cols), dtype=np.float64)
+    n_valid_folds = 0
+
+    for fold_idx, (tr, _va) in enumerate(purged_cv.split(x), start=1):
+        x_fold = x[tr]
+        y_fold = y[tr]
+
+        if x_fold.shape[0] > FEATURE_SELECTION_MAX_ROWS:
+            rng = np.random.default_rng(SEED + fold_idx)
+            sample_idx = rng.choice(x_fold.shape[0], size=FEATURE_SELECTION_MAX_ROWS, replace=False)
+            x_fold = x_fold[sample_idx]
+            y_fold = y_fold[sample_idx]
+
+        selector = XGBClassifier(
+            n_estimators=100,
+            max_depth=6,
+            tree_method="hist",
+            device="cuda",
+            objective="multi:softprob",
+            num_class=3,
+            n_jobs=-1,
+            random_state=SEED + fold_idx,
+        )
+        with timed_step(f"  Feature selection fold {fold_idx}/{N_SPLITS} (horizon={horizon}d)"):
+            selector.fit(x_fold, y_fold)
+        importance_sum += selector.feature_importances_
+        n_valid_folds += 1
+
+    if n_valid_folds == 0:
+        raise RuntimeError("All feature selection folds were empty — check PurgedKFold config.")
+
+    avg_importances = importance_sum / n_valid_folds
+    selected = [feature_cols[i] for i in np.argsort(avg_importances)[::-1][:TOP_K_FEATURES]]
+    LOGGER.info(
+        "Purged feature selection (%sd): %s folds averaged → top %s features selected.",
+        horizon, n_valid_folds, len(selected),
+    )
+    return selected
 
 
 def build_base_models() -> dict[str, Any]:
@@ -292,8 +314,14 @@ def fit_with_weight(model: Any, x: np.ndarray, y: np.ndarray, sample_weight: np.
     return model
 
 
-def manual_oof(model: Any, x: np.ndarray, y: np.ndarray, sample_weight: np.ndarray) -> np.ndarray:
-    cv = TimeSeriesSplit(n_splits=N_SPLITS)
+def manual_oof(
+    model: Any,
+    x: np.ndarray,
+    y: np.ndarray,
+    sample_weight: np.ndarray,
+    cv: PurgedKFold,
+) -> np.ndarray:
+    """Out-of-fold probabilities under an injected, purged CV splitter."""
     oof = np.zeros((x.shape[0], 3), dtype=np.float32)
     covered = np.zeros(x.shape[0], dtype=bool)
     for fold_idx, (tr, va) in enumerate(cv.split(x), start=1):
@@ -311,8 +339,14 @@ def manual_oof(model: Any, x: np.ndarray, y: np.ndarray, sample_weight: np.ndarr
     return oof
 
 
-def safe_cross_val_predict(model: Any, x: np.ndarray, y: np.ndarray, sample_weight: np.ndarray) -> np.ndarray:
-    cv = TimeSeriesSplit(n_splits=N_SPLITS)
+def safe_cross_val_predict(
+    model: Any,
+    x: np.ndarray,
+    y: np.ndarray,
+    sample_weight: np.ndarray,
+    cv: PurgedKFold,
+) -> np.ndarray:
+    """OOF probabilities via sklearn cross_val_predict with PurgedKFold."""
     try:
         p = cross_val_predict(
             model,
@@ -328,15 +362,21 @@ def safe_cross_val_predict(model: Any, x: np.ndarray, y: np.ndarray, sample_weig
             return p
     except Exception as exc:
         LOGGER.warning("cross_val_predict failed (%s). Falling back to manual OOF.", exc)
-    return manual_oof(model, x, y, sample_weight)
+    return manual_oof(model, x, y, sample_weight, cv)
 
 
-def build_oof_meta_features(models: dict[str, Any], x: np.ndarray, y: np.ndarray, sample_weight: np.ndarray) -> tuple[np.ndarray, list[str]]:
+def build_oof_meta_features(
+    models: dict[str, Any],
+    x: np.ndarray,
+    y: np.ndarray,
+    sample_weight: np.ndarray,
+    cv: PurgedKFold,
+) -> tuple[np.ndarray, list[str]]:
     chunks = []
     names = []
     for name, model in models.items():
         with timed_step(f"Generating OOF probabilities: {name}"):
-            chunks.append(safe_cross_val_predict(model, x, y, sample_weight))
+            chunks.append(safe_cross_val_predict(model, x, y, sample_weight, cv))
         names.extend([f"{name}_p0", f"{name}_p1", f"{name}_p2"])
     return np.hstack(chunks).astype(np.float32), names
 
@@ -355,12 +395,13 @@ def make_meta_features(models: dict[str, Any], x: np.ndarray) -> np.ndarray:
     return np.hstack([aligned_predict_proba(m, x) for m in models.values()]).astype(np.float32)
 
 
-def print_contribution_importance(meta_model: LogisticRegression, model_names: list[str]) -> dict[str, float]:
-    coef = np.abs(meta_model.coef_)
-    raw = {name: float(coef[:, i * 3 : (i + 1) * 3].sum()) for i, name in enumerate(model_names)}
+def print_contribution_importance(meta_model: LGBMClassifier, model_names: list[str]) -> dict[str, float]:
+    """Log per-base-model contribution from the LightGBM meta-learner's feature importances."""
+    importances = meta_model.feature_importances_  # shape: (9,) — 3 probs × 3 base models
+    raw = {name: float(importances[i * 3 : (i + 1) * 3].sum()) for i, name in enumerate(model_names)}
     total = sum(raw.values()) or 1.0
     out = {k: v / total for k, v in raw.items()}
-    LOGGER.info("Contribution Importance: %s", out)
+    LOGGER.info("Contribution Importance (meta LightGBM): %s", out)
     return out
 
 
@@ -368,19 +409,19 @@ def save_artifacts(
     horizon: int,
     selected_features: list[str],
     fitted_models: dict[str, Any],
-    meta_model: LogisticRegression,
-    scaler: StandardScaler,
+    meta_model: LGBMClassifier,
     report: dict,
     cm: np.ndarray,
     thresholds: dict[str, Any],
 ) -> None:
+    # Flaw 3 fix: StandardScaler removed — Alpha360 features are already rolling
+    # Z-scores; double-scaling added imputation bias and was a near-identity op.
     paths = artifact_paths(horizon)
     paths["dir"].mkdir(parents=True, exist_ok=True)
     joblib.dump(fitted_models["xgboost"], paths["xgboost"])
     joblib.dump(fitted_models["lightgbm"], paths["lightgbm"])
     fitted_models["catboost"].save_model(str(paths["catboost"]))
     joblib.dump(meta_model, paths["meta_model"])
-    joblib.dump(scaler, paths["scaler"])
     with paths["selected_features"].open("w", encoding="utf-8") as f:
         json.dump(selected_features, f, indent=2)
     with paths["report"].open("w", encoding="utf-8") as f:
@@ -395,45 +436,120 @@ def train_horizon(
     horizon: int,
     train_raw: pl.DataFrame,
     test_raw: pl.DataFrame,
-    selected_features: list[str],
+    feature_cols: list[str],
 ) -> None:
     return_col = RETURN_COLS[horizon]
     target_col = TARGET_COLS[horizon]
+    t1_col = f"t1_{horizon}d"
     LOGGER.info("========== Training %sd horizon ==========", horizon)
 
-    thresholds = compute_quantile_thresholds(train_raw, return_col, horizon)
-    train_df = apply_quantile_labels(train_raw, thresholds, target_col)
-    test_df = apply_quantile_labels(test_raw, thresholds, target_col)
+    train_df = train_raw.drop_nulls([target_col, t1_col])
+    test_df = test_raw.drop_nulls([target_col, t1_col])
+
+    # Pure triple-barrier metadata. The legacy q33/q66 return terciles were
+    # removed: labels are now decided by volatility-scaled barriers, NOT by
+    # global return quantiles, so persisting tercile cut-points was misleading.
+    thresholds = {
+        "horizon_days": horizon,
+        "return_col": return_col,
+        "method": "triple_barrier",
+        "pt_mult": 2.0,
+        "sl_mult": 2.0,
+        "vol_span": 20,
+        "use_intrabar_extremes": True,
+    }
 
     LOGGER.info("Rows | train=%s test=%s", train_df.height, test_df.height)
     LOGGER.info("Label Dist | train=%s test=%s", dict(Counter(train_df[target_col].to_list())), dict(Counter(test_df[target_col].to_list())))
 
-    x_train_raw = to_clean_numpy(train_df, selected_features)
-    x_test_raw = to_clean_numpy(test_df, selected_features)
+    # Flaw 2 fix: feature selection runs per-horizon inside purged CV folds,
+    # so the selector never sees the validation labels it will be evaluated on.
+    with timed_step(f"Purged feature selection for {horizon}d horizon"):
+        selected_features = purged_feature_selection(train_df, feature_cols, target_col, t1_col, horizon)
+    LOGGER.info("Selected %s features for %sd: %s", len(selected_features), horizon, selected_features[:10])
+
+    # Flaw 3 fix: StandardScaler removed. Alpha360 features are rolling Z-scores
+    # (already ~N(0,1)); a second StandardScaler was a near-identity transform
+    # that introduced imputation-bias into the scaler's mean/std estimates.
+    x_train = to_clean_numpy(train_df, selected_features)
+    x_test = to_clean_numpy(test_df, selected_features)
     y_train = train_df[target_col].to_numpy().astype(np.int64)
     y_test = test_df[target_col].to_numpy().astype(np.int64)
 
-    scaler = StandardScaler()
-    x_train = scaler.fit_transform(x_train_raw).astype(np.float32)
-    x_test = scaler.transform(x_test_raw).astype(np.float32)
-
     sample_weight = compute_sample_weight(class_weight="balanced", y=y_train).astype(np.float32)
     base_models = build_base_models()
-    oof_meta, meta_feature_names = build_oof_meta_features(base_models, x_train, y_train, sample_weight)
 
-    meta_model = LogisticRegression(
-        penalty="l2",
-        C=1.0,
-        class_weight="balanced",
-        solver="lbfgs",
-        max_iter=2000,
-        random_state=SEED,
+    # Embargo is ENFORCED: embargo_bars == horizon means the `horizon`
+    # positional samples immediately after every test block are dropped from
+    # training (de Prado Snippet 7.4), on top of the [start,t1] purge. With an
+    # H-day label this guarantees no train sample's outcome window can touch
+    # the validation window — zero autocorrelation leakage.
+    assert horizon > 0, "embargo_bars (=horizon) must be > 0 to enforce embargo"
+    purged_cv = PurgedKFold(
+        n_splits=N_SPLITS,
+        start_times=train_df[DATE_COL].to_numpy(),
+        end_times=train_df[t1_col].to_numpy(),
+        embargo_bars=horizon,
     )
-    with timed_step(f"Training {horizon}d meta LogisticRegression"):
+    LOGGER.info(
+        "PurgedKFold ACTIVE | n_splits=%s purge=[start,t1]-overlap embargo_bars=%s",
+        N_SPLITS, horizon,
+    )
+    oof_meta, meta_feature_names = build_oof_meta_features(
+        base_models, x_train, y_train, sample_weight, purged_cv
+    )
+
+    # Flaw 7 fix: replace LogisticRegression (linear, cannot capture nonlinear
+    # base-model disagreements) with a shallow LightGBM meta-learner.
+    # max_depth=3, num_leaves=4 keeps the meta-model simple enough to avoid
+    # overfitting the 9 OOF probability columns while capturing interactions
+    # like "when XGB and LGB disagree, prefer CatBoost".
+    meta_model = LGBMClassifier(
+        objective="multiclass",
+        num_class=3,
+        max_depth=3,
+        num_leaves=4,
+        learning_rate=0.05,
+        n_estimators=100,
+        reg_alpha=0.1,
+        reg_lambda=2.0,
+        class_weight="balanced",
+        random_state=SEED,
+        n_jobs=-1,
+        verbose=-1,
+    )
+    with timed_step(f"Training {horizon}d meta LightGBM"):
         meta_model.fit(oof_meta, y_train)
 
+    # ── COST-AWARE SELECTION (Task 2) ───────────────────────────────────
+    # Pick the long-entry P(UP) threshold τ* that maximises NET SHARPE on
+    # LEAK-FREE meta out-of-fold predictions (the meta-model re-run through
+    # the SAME purged+embargoed CV). The selection objective is economic,
+    # not statistical — argmax/F1 never enter the decision.
+    train_ret = train_df[return_col].to_numpy().astype(np.float64)
+    test_ret = test_df[return_col].to_numpy().astype(np.float64)
+    with timed_step(f"Meta OOF (purged) for {horizon}d cost-aware threshold"):
+        meta_oof_proba = safe_cross_val_predict(
+            meta_model, oof_meta, y_train, sample_weight, purged_cv
+        )
+    p_up_oof = meta_oof_proba[:, 2]
+    tau_star, oof_econ = select_pnl_threshold(p_up_oof, train_ret, horizon)
+    LOGGER.info(
+        "%sd cost-aware tau*=%.2f | OOF net_sharpe=%.3f net_pnl=%.4f trades=%s",
+        horizon, tau_star, oof_econ["net_sharpe"], oof_econ["net_pnl"],
+        oof_econ["n_trades"],
+    )
+
     fitted_models = fit_final_base_models(base_models, x_train, y_train, sample_weight)
-    y_pred = meta_model.predict(make_meta_features(fitted_models, x_test))
+    test_meta = make_meta_features(fitted_models, x_test)
+    p_up_test = meta_model.predict_proba(test_meta)[:, 2]
+    y_pred = meta_model.predict(test_meta)  # argmax — DIAGNOSTIC ONLY
+
+    # Economic truth: long iff P(UP) >= τ*, exit at t1, pay round-trip
+    # fee + aggressive VN slippage. THIS drives beats_baseline.
+    long_decisions = p_up_test >= tau_star
+    test_econ = economic_report(long_decisions, test_ret, horizon)
+    net_sharpe = float(test_econ["net_sharpe"])
 
     macro_f1 = f1_score(y_test, y_pred, average="macro", labels=CLASSES, zero_division=0)
     report = cast(
@@ -451,19 +567,38 @@ def train_horizon(
     contribution = print_contribution_importance(meta_model, list(fitted_models.keys()))
 
     report["horizon_days"] = horizon
+    # PRIMARY economic metrics (Task 2) — these gate deployment.
+    report["net_sharpe"] = net_sharpe
+    report["baseline_net_sharpe"] = float(BASELINE_NET_SHARPE)
+    report["beats_baseline"] = bool(net_sharpe > BASELINE_NET_SHARPE)
+    report["selection_metric"] = "net_sharpe"
+    report["pnl_threshold_tau"] = float(tau_star)
+    report["cost_model"] = {
+        "fee_rate_per_side": float(DEFAULT_FEE_RATE),
+        "slippage_per_side": float(DEFAULT_SLIPPAGE_PER_SIDE),
+        "round_trip_cost": float(round_trip_cost()),
+    }
+    report["economics_test"] = test_econ
+    report["economics_oof"] = oof_econ
+    # macro-F1 retained as a SECONDARY diagnostic only.
     report["macro_f1"] = float(macro_f1)
     report["baseline_macro_f1"] = float(BASELINE_MACRO_F1)
-    report["beats_baseline"] = bool(macro_f1 > BASELINE_MACRO_F1)
+    report["macro_f1_beats_baseline"] = bool(macro_f1 > BASELINE_MACRO_F1)
     report["selected_features"] = selected_features
     report["meta_features"] = meta_feature_names
     report["contribution_importance"] = contribution
-    report["quantile_threshold_info"] = thresholds
+    report["triple_barrier_info"] = thresholds
     report["train_label_distribution"] = {str(k): int(v) for k, v in Counter(y_train.tolist()).items()}
     report["test_label_distribution"] = {str(k): int(v) for k, v in Counter(y_test.tolist()).items()}
 
-    LOGGER.info("%sd Macro F1: %.6f", horizon, macro_f1)
+    LOGGER.info(
+        "%sd ECONOMIC (gate) | net_sharpe=%.3f net_pnl=%.4f trades=%s hit=%.1f%% "
+        "| macro_f1=%.4f (diagnostic)",
+        horizon, net_sharpe, test_econ["net_pnl"], test_econ["n_trades"],
+        100.0 * test_econ["hit_rate"], macro_f1,
+    )
     LOGGER.info("%sd Confusion Matrix\n%s", horizon, cm)
-    save_artifacts(horizon, selected_features, fitted_models, meta_model, scaler, report, cm, thresholds)
+    save_artifacts(horizon, selected_features, fitted_models, meta_model, report, cm, thresholds)
     LOGGER.info("%sd artifacts saved: %s", horizon, artifact_paths(horizon)["dir"])
 
 
@@ -475,18 +610,16 @@ def main() -> None:
     raw_df = load_raw_returns()
     train_raw, test_raw = chronological_split(raw_df)
 
-    train_5d = apply_quantile_labels(
-        train_raw,
-        compute_quantile_thresholds(train_raw, RETURN_COLS[5], 5),
-        TARGET_COLS[5],
-    )
+    # Infer candidate feature columns from the 5d-labeled training subset.
+    # Feature SELECTION (top-K) now happens per-horizon inside train_horizon
+    # via purged CV folds — not here on the full training set.
+    train_5d = train_raw.drop_nulls([TARGET_COLS[5], "t1_5d"])
     feature_cols = infer_feature_columns(train_5d)
     LOGGER.info("Leakage guard active. Excluded columns: %s", sorted(LEAKAGE_COLS))
-    selected_features = select_features(train_5d, feature_cols, TARGET_COLS[5])
-    LOGGER.info("Selected %s shared features: %s", len(selected_features), selected_features)
+    LOGGER.info("Candidate feature pool: %s columns. Per-horizon selection runs inside train_horizon.", len(feature_cols))
 
     for horizon in HORIZONS:
-        train_horizon(horizon, train_raw, test_raw, selected_features)
+        train_horizon(horizon, train_raw, test_raw, feature_cols)
 
     LOGGER.info("Dual-horizon stacking training completed in %.2fs.", time.perf_counter() - total_start)
 

@@ -7,6 +7,8 @@ from typing import Iterable
 import duckdb
 import polars as pl
 
+from src.features.triple_barrier import add_triple_barrier_labels
+
 
 def setup_logging() -> logging.Logger:
     logging.basicConfig(
@@ -156,6 +158,9 @@ class Alpha360Generator:
             stock_df = self._preprocess_stock(stock_df)
             norm_df = self._normalize_features(stock_df)
             alpha_df = self._generate_lags(norm_df)
+            # _generate_targets (which drops the transient high/low) is NOT run
+            # on the live path, so drop them here to mirror the training schema.
+            alpha_df = alpha_df.drop([c for c in ("high", "low") if c in alpha_df.columns])
             alpha_df = self._clean_infinite(alpha_df)
             joined_df = self._integrate_macro(alpha_df, macro_df)
             joined_df = self._integrate_sentiment(joined_df, sentiment_df)
@@ -215,8 +220,10 @@ class Alpha360Generator:
         # read-only query in practice; the SQL itself is `SELECT`-only.
         conn = duckdb.connect(self.db_path)
         try:
+            # Per-ticker aggregation: each ticker gets its own sentiment signal.
             query = """
                 SELECT
+                    ticker,
                     CAST(date AS DATE) AS date,
                     AVG(sentiment_score) AS sentiment_score_mean,
                     AVG(magnitude) AS sentiment_magnitude_mean,
@@ -226,16 +233,19 @@ class Alpha360Generator:
                     SUM(CASE WHEN is_market_wide THEN 1 ELSE 0 END) AS sentiment_market_wide_count
                 FROM hist_sentiment_llm_labeled
                 WHERE CAST(date AS DATE) >= ?
-                GROUP BY CAST(date AS DATE)
-                ORDER BY date
+                GROUP BY ticker, CAST(date AS DATE)
+                ORDER BY ticker, date
             """
             return pl.from_arrow(conn.execute(query, [min_date]).arrow()).with_columns(pl.col("date").cast(pl.Date))
         finally:
             conn.close()
 
     def _query_sentiment(self, conn: duckdb.DuckDBPyConnection) -> pl.DataFrame:
+        # Per-ticker aggregation so each stock gets its own sentiment signal rather
+        # than a market-wide average that is identical for every ticker on a given day.
         query = """
             SELECT
+                ticker,
                 CAST(date AS DATE) AS date,
                 AVG(sentiment_score) AS sentiment_score_mean,
                 AVG(magnitude) AS sentiment_magnitude_mean,
@@ -244,20 +254,24 @@ class Alpha360Generator:
                 COUNT(*) AS sentiment_news_count,
                 SUM(CASE WHEN is_market_wide THEN 1 ELSE 0 END) AS sentiment_market_wide_count
             FROM hist_sentiment_llm_labeled
-            GROUP BY CAST(date AS DATE)
-            ORDER BY date
+            GROUP BY ticker, CAST(date AS DATE)
+            ORDER BY ticker, date
         """
         return pl.from_arrow(conn.execute(query).arrow()).with_columns(pl.col("date").cast(pl.Date))
 
     def _preprocess_stock(self, df):
-        """Calculates VWAP approximation and ensures proper types."""
+        """Calculates HLC3 (typical price = (H+L+C)/3) and ensures proper types.
+
+        NOTE: This is NOT VWAP. True VWAP requires transaction-level volume data.
+        HLC3 is a valid price-action feature but is named accurately here.
+        """
         return df.with_columns([
-            ((pl.col("high") + pl.col("low") + pl.col("close")) / 3).alias("vwap")
+            ((pl.col("high") + pl.col("low") + pl.col("close")) / 3).alias("hlc3")
         ]).sort(["ticker", "date"])
 
     def _normalize_features(self, df):
         """Vectorized normalization partitioned by ticker."""
-        price_cols = ["open", "high", "low", "close", "vwap"]
+        price_cols = ["open", "high", "low", "close", "hlc3"]
 
         expressions = []
         for col in price_cols:
@@ -275,7 +289,7 @@ class Alpha360Generator:
 
     def _generate_lags(self, df):
         """Dynamically generates 60 lagged columns for each normalized feature."""
-        norm_cols = ["norm_open", "norm_high", "norm_low", "norm_close", "norm_volume", "norm_vwap"]
+        norm_cols = ["norm_open", "norm_high", "norm_low", "norm_close", "norm_volume", "norm_hlc3"]
 
         lag_exprs = []
         for col in norm_cols:
@@ -283,38 +297,64 @@ class Alpha360Generator:
             for i in range(self.lookback):
                 lag_exprs.append(pl.col(col).shift(i).over("ticker").alias(f"{base_name}_{i}"))
 
-        # Preserve raw close and volume for live inference (liquidity filter + portfolio/alerts need unscaled values)
+        # Preserve raw close/volume for live inference (liquidity filter +
+        # portfolio/alerts need unscaled values). high/low are preserved ONLY
+        # so triple-barrier can detect intrabar PT/SL touches in
+        # _generate_targets; they are dropped there before the feature matrix
+        # is built so raw price levels never leak in as model features.
         base_cols = ["ticker", "date"]
-        for _raw_col in ("close", "volume"):
+        for _raw_col in ("close", "volume", "high", "low"):
             if _raw_col in df.columns:
                 base_cols.append(_raw_col)
-        
+
         return df.select(base_cols + lag_exprs)
 
     def _generate_targets(self, alpha_df, stock_df):
-        """Calculates 5-day classification targets (UP, SIDEWAY, DOWN)."""
-        df = alpha_df.join(
-            stock_df.select(["ticker", "date", "close"]),
-            on=["ticker", "date"],
-            how="left"
+        """Volatility-scaled Triple-Barrier labels (Lopez de Prado, AFML Ch. 3).
+
+        Replaces the legacy fixed ±3% thresholds. For each horizon emits:
+            target_class_{h}  {0:DOWN, 1:SIDE, 2:UP}   (de Prado bin + 1)
+            target_bin_{h}    {-1, 0, 1}                (raw de Prado label)
+            target_return_{h} realized close-to-close return at the touched barrier
+            t1_{h}            event-end date  ← REQUIRED by PurgedKFold (purging)
+
+        `alpha_df` already carries the raw, unscaled `close` (preserved by
+        `_generate_lags`), so triple-barrier runs directly on it — no join is
+        needed, which also removes the legacy `close`/`close_right` join
+        collision. `stock_df` is intentionally unused now (close-path
+        barriers); kept in the signature for call-site compatibility.
+        """
+        del stock_df  # legacy arg; raw close lives on alpha_df
+
+        # use_intrabar_extremes=True: full OHLCV (high/low) is now loaded into
+        # data/ohlcv_*.parquet, so barrier touches are detected intraday — a 2σ
+        # profit-take is realistically hit on the bar's high, not at its close.
+        # The close-only path systematically under-counts PT/SL hits and inflates
+        # the SIDEWAYS class.
+        df = add_triple_barrier_labels(
+            alpha_df,
+            horizon=5,
+            pt_mult=2.0,
+            sl_mult=2.0,
+            suffix="5d",
+            vol_span=20,
+            use_intrabar_extremes=True,
+        )
+        df = add_triple_barrier_labels(
+            df,
+            horizon=20,
+            pt_mult=2.0,
+            sl_mult=2.0,
+            suffix="20d",
+            vol_span=20,
+            use_intrabar_extremes=True,
         )
 
-        df = df.with_columns([
-            ((pl.col("close").shift(-5).over("ticker") / pl.col("close")) - 1)
-            .clip(-0.25, 0.25)
-            .alias("target_return_5d"),
-            ((pl.col("close").shift(-20).over("ticker") / pl.col("close")) - 1)
-            .clip(-0.40, 0.40)
-            .alias("target_return_20d"),
-            pl.col("close").alias("raw_close"),
-        ])
-
-        return df.with_columns([
-            pl.when(pl.col("target_return_5d") > 0.03).then(2)
-            .when(pl.col("target_return_5d") < -0.03).then(0)
-            .otherwise(1)
-            .alias("target_class_5d")
-        ]).drop(["close"])
+        # raw close → raw_close (kept for liquidity/portfolio); drop close and
+        # the transient high/low (only needed above for intrabar barrier touch)
+        # so non-stationary raw price levels never enter the feature matrix.
+        drop_cols = [c for c in ("close", "high", "low") if c in df.columns]
+        return df.with_columns(pl.col("close").alias("raw_close")).drop(drop_cols)
 
     def _clean_infinite(self, df: pl.DataFrame) -> pl.DataFrame:
         return df.with_columns([
@@ -372,9 +412,30 @@ class Alpha360Generator:
         # This is what propagates the monthly inflation_yoy values from
         # release date through every subsequent macro_daily row.
         macro_df = macro_df.sort("date").fill_null(strategy="forward")
+
+        # 3. Convert non-stationary price-level series to log-returns to eliminate
+        # covariate shift. S&P 500 (2200→5200), DXY (89→115), and USD/VND have
+        # long-term trends that put inference data OOD vs. training splits.
+        # log().diff() = log(p_t/p_{t-1}) = log-return (stationary).
+        # The first row becomes NaN → fill with 0.0 (no change at start of history).
+        # Rate series (interbank_on_rate, vnibor, inflation_yoy) are already on
+        # stationary scales (0–15%) and are kept as raw levels.
+        _PRICE_LEVEL_COLS = {"sp500_close", "dxy_close", "usd_vnd"}
+        _LOGRET_RENAME = {
+            "sp500_close": "sp500_logret",
+            "dxy_close": "dxy_logret",
+            "usd_vnd": "usd_vnd_logret",
+        }
+        level_cols_present = [c for c in _PRICE_LEVEL_COLS if c in macro_df.columns]
+        if level_cols_present:
+            macro_df = macro_df.with_columns([
+                pl.col(c).log().diff().fill_null(0.0).alias(_LOGRET_RENAME[c])
+                for c in level_cols_present
+            ]).drop(level_cols_present)
+
         macro_cols = [c for c in macro_df.columns if c != "date"]
 
-        # 3. T-1 shift to prevent look-ahead bias.
+        # 4. T-1 shift to prevent look-ahead bias.
         shifted_macro = macro_df.select([
             pl.col("date"),
             *[pl.col(c).shift(1).alias(f"macro_{c}") for c in macro_cols]
@@ -383,10 +444,10 @@ class Alpha360Generator:
         alpha_df = alpha_df.with_columns(pl.col("date").cast(pl.Date))
         shifted_macro = shifted_macro.with_columns(pl.col("date").cast(pl.Date))
 
-        # 4. Left-join macro onto (ticker, date) feature rows.
+        # 5. Left-join macro onto (ticker, date) feature rows.
         joined_df = alpha_df.join(shifted_macro, on="date", how="left")
 
-        # 5. PASS 2 forward-fill on the joined frame — per ticker, ordered
+        # 6. PASS 2 forward-fill on the joined frame — per ticker, ordered
         # by date. This patches VN trading days where macro_daily simply
         # has no row (US holiday, source outage, etc.) so monthly CPI in
         # particular never appears as NaN once the first publication has
@@ -403,28 +464,42 @@ class Alpha360Generator:
         return joined_df.drop_nulls(subset=feature_cols)
 
     def _integrate_sentiment(self, alpha_df: pl.DataFrame, sentiment_df: pl.DataFrame) -> pl.DataFrame:
-        """Joins T-1 shifted daily sentiment aggregates to prevent look-ahead bias."""
+        """Joins T-1 shifted per-ticker sentiment aggregates to prevent look-ahead bias.
+
+        Sentiment is now joined on (ticker, date) so each stock receives its own
+        sentiment signal instead of a market-wide daily average. The T-1 shift is
+        applied within each ticker's time series via `.over("ticker")`.
+        """
+        _SENTIMENT_ZERO_COLS = [
+            "sentiment_score_mean_lag1",
+            "sentiment_magnitude_mean_lag1",
+            "sentiment_nlp_mean_lag1",
+            "sentiment_impact_force_mean_lag1",
+            "sentiment_news_count_lag1",
+            "sentiment_market_wide_count_lag1",
+        ]
         if sentiment_df.is_empty():
             LOGGER.warning("Sentiment table empty. Filling sentiment features with zeros.")
-            return alpha_df.with_columns([
-                pl.lit(0.0).alias("sentiment_score_mean_lag1"),
-                pl.lit(0.0).alias("sentiment_magnitude_mean_lag1"),
-                pl.lit(0.0).alias("sentiment_nlp_mean_lag1"),
-                pl.lit(0.0).alias("sentiment_impact_force_mean_lag1"),
-                pl.lit(0.0).alias("sentiment_news_count_lag1"),
-                pl.lit(0.0).alias("sentiment_market_wide_count_lag1"),
-            ])
+            return alpha_df.with_columns([pl.lit(0.0).alias(c) for c in _SENTIMENT_ZERO_COLS])
 
-        sentiment_df = sentiment_df.sort("date").fill_null(0)
-        sentiment_cols = [c for c in sentiment_df.columns if c != "date"]
+        sentiment_cols = [c for c in sentiment_df.columns if c not in ("ticker", "date")]
+        # Sort per ticker so shift(1).over("ticker") gives correct T-1 values.
+        sentiment_df = sentiment_df.sort(["ticker", "date"]).with_columns([
+            pl.col(c).fill_null(0) for c in sentiment_cols
+        ])
         shifted_sentiment = sentiment_df.select([
+            pl.col("ticker"),
             pl.col("date"),
-            *[pl.col(c).shift(1).fill_null(0).cast(pl.Float32).alias(f"{c}_lag1") for c in sentiment_cols],
+            *[
+                pl.col(c).shift(1).over("ticker").fill_null(0).cast(pl.Float32).alias(f"{c}_lag1")
+                for c in sentiment_cols
+            ],
         ])
 
         alpha_df = alpha_df.with_columns(pl.col("date").cast(pl.Date))
         shifted_sentiment = shifted_sentiment.with_columns(pl.col("date").cast(pl.Date))
-        joined_df = alpha_df.join(shifted_sentiment, on="date", how="left")
+        # Join on (ticker, date): each ticker gets its own sentiment row.
+        joined_df = alpha_df.join(shifted_sentiment, on=["ticker", "date"], how="left")
 
         sentiment_feature_cols = [c for c in joined_df.columns if c.startswith("sentiment_") and c.endswith("_lag1")]
         return joined_df.with_columns([pl.col(c).fill_null(0).cast(pl.Float32).alias(c) for c in sentiment_feature_cols])

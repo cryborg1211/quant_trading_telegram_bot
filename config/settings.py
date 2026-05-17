@@ -81,7 +81,7 @@ class CrawlerConfig:
 
 @dataclass
 class SentimentConfig:
-    gemini_model: str = "models/gemini-2.5-flash"
+    gemini_model: str = "models/gemini-3.5-flash"
     rss_lookback_weekday_days: int = 1
     rss_lookback_monday_days: int = 3
     max_tickers: int = 30
