@@ -221,7 +221,7 @@ def get_rebalance_advice(
         return "Không thể tư vấn: thiếu API Key."
 
     client = genai.Client(api_key=api_key)
-    gemini_model_name = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+    gemini_model_name = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 
     holdings_lines = []
     for h in holdings_context:
@@ -708,7 +708,7 @@ def get_batch_sentiment_scores(ticker_news_dict: dict[str, list[str]]) -> dict[s
 
     # New SDK: stateless Client; model name does not need the "models/" prefix.
     client = genai.Client(api_key=api_key)
-    gemini_model_name = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+    gemini_model_name = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
     LOGGER.info("[News Analyst][DEBUG] Initializing Gemini (google-genai) model=%s", gemini_model_name)
 
     user_prompt = (

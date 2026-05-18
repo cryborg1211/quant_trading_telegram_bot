@@ -12,7 +12,7 @@ It deliberately REUSES existing infra (no divergent schemas):
   • Macro     -> src.data.crawlers.MacroCrawler.fetch_macro  (yfinance live)
   • DB upsert -> src.data.db_engine.DuckDBEngine.upsert_dataframe
                 (INSERT OR REPLACE BY NAME, resolves on PRIMARY KEY)
-  • Sentiment -> google-genai Client, gemini-3.5-flash, EXACT call pattern
+  • Sentiment -> google-genai Client, gemini-flash-latest, EXACT call pattern
                 copied from src.models.quant_agent_arbitrator
 
 SCHEMA NOTES (important - read before editing)
@@ -230,7 +230,7 @@ def _fetch_and_score_real_news(
 
     Delegates entirely to the production ``SentimentCrawler`` so the news
     discovery (GNews per-ticker + RSS market-wide) and the LLM scoring
-    (gemini-3.5-flash with its tuned DEFAULT_PROMPT) are identical to the
+    (gemini-flash-latest with its tuned DEFAULT_PROMPT) are identical to the
     live daily pipeline. We only attach the ``ticker`` column the legacy
     DDL omitted, and constrain to the [sent_start, end] window.
 

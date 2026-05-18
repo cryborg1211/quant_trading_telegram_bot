@@ -200,7 +200,7 @@ TELEGRAM_CHAT_ID=123456789,987654321
 
 # Google Gemini (https://aistudio.google.com/apikey)
 GEMINI_API_KEY=AIza...
-GEMINI_MODEL=gemini-3.5-flash         # optional override
+GEMINI_MODEL=gemini-flash-latest      # optional override
 ```
 
 A template lives in [`.env.example`](.env.example).

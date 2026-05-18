@@ -251,7 +251,7 @@ def _explain_move(ticker: str, days: int, pct: float) -> str:
     if not api_key:
         return "(GEMINI_API_KEY chưa set — bỏ qua phân tích AI.)"
 
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash").removeprefix("models/")
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-flash-latest").removeprefix("models/")
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model=model_name,
