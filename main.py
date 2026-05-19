@@ -863,19 +863,23 @@ def daily_inference(
             if t in universe_tickers
         ]
         candidate_tickers = _ranked[:3]
+        _floor_pct = _tau5 * 100.0
         for t in candidate_tickers:
-            _pu = stacking_predictions_5d[t][2]
-            if _pu < _tau5:
+            _pu = stacking_predictions_5d[t][2] * 100.0
+            if _pu < _floor_pct:
                 fallback_reasons[t] = (
-                    f"Bị loại: P(UP) {_pu * 100:.1f}% < tau={_tau5:.2f}"
+                    f"Cửa tăng chỉ {_pu:.0f}% (dưới ngưỡng an toàn "
+                    f"{_floor_pct:.0f}%) — không bõ công đánh đổi với rủi ro "
+                    f"thị trường chung đang yếu."
                 )
             elif not meta_gate_5d.get(t, True):
                 fallback_reasons[t] = (
-                    "Bị loại: Meta-Labeler P(lợi nhuận) < 50%"
+                    "Cửa tăng tạm ổn nhưng kỳ vọng lợi nhuận không đủ bù "
+                    "chi phí và rủi ro — bộ lọc an toàn loại bỏ."
                 )
             else:
                 fallback_reasons[t] = (
-                    f"Theo dõi (thị trường yếu, P(UP) {_pu * 100:.1f}%)"
+                    f"Chỉ để theo dõi: thị trường yếu, cửa tăng {_pu:.0f}%."
                 )
         LOGGER.warning(
             "[FallbackObservability] No gated candidates — MONITORING-ONLY "
@@ -974,10 +978,9 @@ def _build_fallback_observability_report_vi(
     flag make it impossible to mistake these for actionable BUYs.
     """
     out = [
-        "<b>[⚠️ THỊ TRƯỜNG YẾU - KHÔNG CÓ TÍN HIỆU ĐẠT CHUẨN. "
-        "HIỂN THỊ TOP 3 MÃ ĐỂ THEO DÕI]</b>",
-        "<i>⛔ KHÔNG GIAO DỊCH các mã dưới đây — chỉ dùng để quan sát thị "
-        "trường. Không mã nào vượt qua bộ lọc τ* + Meta-Labeler hôm nay.</i>",
+        "<b>[⚠️ CẢNH BÁO: THỊ TRƯỜNG XẤU - KHÔNG CÓ ĐIỂM MUA AN TOÀN]</b>",
+        "<i>⛔ KHÔNG GIAO DỊCH — danh sách dưới đây chỉ để theo dõi thị "
+        "trường. Hôm nay không mã nào đủ tốt để vào lệnh.</i>",
         "",
     ]
     for i, t in enumerate(fallback_tickers, 1):
@@ -991,21 +994,24 @@ def _build_fallback_observability_report_vi(
         reason_vi = (
             s.get("reasoning_vi")
             or s.get("reasoning")
-            or "Không có phân tích sentiment khả dụng (tin tức trống/timeout)."
+            or "Chưa có tin tức đáng chú ý."
         )
-        gate = fallback_reasons.get(t, "Bị loại: không đạt chuẩn")
+        why = fallback_reasons.get(
+            t, "Cửa tăng quá thấp so với rủi ro thị trường chung."
+        )
         out += [
             f"<b>{i}. {html.escape(t)}</b>",
-            f"   • Xác suất 5d: <code>P(TĂNG)={p_up:.1f}% | "
-            f"P(ĐI NGANG)={p_sd:.1f}% | P(GIẢM)={p_dn:.1f}%</code>",
-            f"   • Lý do bị loại: <code>{html.escape(gate)}</code>",
-            f"   • Sentiment (LLM Gemini): <b>{score:+.2f}</b> — "
-            f"{html.escape(str(reason_vi))[:600]}",
+            f"   • <b>Đánh giá xu hướng (5 ngày tới):</b> "
+            f"Cửa Tăng <b>{p_up:.1f}%</b> | Đi Ngang {p_sd:.1f}% | "
+            f"Cửa Giảm {p_dn:.1f}%",
+            f"   • <b>Trạng thái:</b> ❌ HỦY BỎ TÍN HIỆU",
+            f"   • <b>Lý do:</b> {html.escape(why)}",
+            f"   • <b>Tin tức &amp; Tâm lý:</b> {html.escape(str(reason_vi))[:500]}",
             "",
         ]
     out.append(
-        "<i>Nguồn: Mô hình 5d (Stacking + Meta-Labeler, τ*=0.48) + Gemini "
-        "sentiment. Chế độ Quan sát Dự phòng — KHÔNG phải khuyến nghị MUA.</i>"
+        "<i>Đây là chế độ theo dõi khi thị trường yếu — KHÔNG phải khuyến "
+        "nghị MUA. Hệ thống sẽ tự động báo khi có điểm mua an toàn.</i>"
     )
     return "\n".join(out)
 
@@ -1091,7 +1097,8 @@ def run_trade_execution(
             sentiment_data = all_sentiments.get(ticker, {})
             # Cap raw URL list at 3; pass as list so Telegram formatter loops explicitly
             source_urls: list[str] = (sentiment_data.get("source_urls", []) or [])[:3]
-            confidence_5d = round(stacking_predictions.get("5d", {}).get(ticker, [0, 0, 0])[2] * 100, 2)
+            _p5 = stacking_predictions.get("5d", {}).get(ticker, [0, 0, 0])
+            confidence_5d = round(_p5[2] * 100, 2)
             LOGGER.info("[Alert] %s source_urls=%s", ticker, source_urls)
 
             signal_data = {
@@ -1099,11 +1106,23 @@ def run_trade_execution(
                 "ticker": ticker,
                 "price": f"{exec_price:,.0f} VND",
                 "horizon": "5 ngày (5d)",
+                # Plain-VN trend split for the new card
+                "prob_up": round(_p5[2] * 100, 1),
+                "prob_side": round(_p5[1] * 100, 1),
+                "prob_down": round(_p5[0] * 100, 1),
+                "status_label": "CHẤP NHẬN TÍN HIỆU",
+                # News & sentiment bullets (degrade gracefully if arbitrator
+                # returned neutral — Điểm cộng/trừ/Kết luận stay readable).
+                "plus_points": sentiment_data.get(
+                    "catalyst", "Không có yếu tố tích cực nổi bật."),
+                "minus_points": sentiment_data.get(
+                    "risk", "Không có rủi ro nổi bật."),
+                "conclusion": sentiment_data.get(
+                    "reasoning_vi", "Chưa có dữ liệu tin tức đáng kể."),
                 "sentiment_score": sentiment_data.get("sentiment_score", 0.0),
                 "sentiment_status": _format_sentiment_status(sentiment_data),
                 "gemini_summary": sentiment_data.get("reasoning_vi", "Không có tin tức đáng kể."),
                 "article_urls": source_urls,          # raw list → Telegram formatter loops this
-                "model_class": "Stacking GBDT 5d: Tăng (UP)",
                 "confidence": confidence_5d,
                 "top_pos_features": top_pos_features,
                 "top_neg_features": top_neg_features,
@@ -1160,26 +1179,37 @@ def _build_sell_hold_report(
         price_str = f"{price:,.0f} VND" if price else "N/A"
 
         if decision == _SELL_DECISION:
-            verdict = "🔴 <b>BÁN (SELL)</b>"
+            verdict = "🔴 <b>NÊN BÁN</b>"
         elif decision == 2:
-            verdict = "🟢 <b>GIỮ (HOLD - xu hướng tăng)</b>"
+            verdict = "🟢 <b>GIỮ TIẾP (xu hướng còn tăng)</b>"
         else:
-            verdict = "🟡 <b>GIỮ (HOLD - đi ngang)</b>"
+            verdict = "🟡 <b>GIỮ THẬN TRỌNG (đang đi ngang)</b>"
+
+        # Plain-language target / trailing-stop from the standing risk rules.
+        tp = CONFIG.trading.take_profit_pct   # e.g. +0.15
+        sl = CONFIG.trading.stop_loss_pct     # e.g. -0.07
+        if price:
+            target_str = f"{price * (1.0 + tp):,.0f} VND (+{tp * 100:.0f}%)"
+            stop_str = f"{price * (1.0 + sl):,.0f} VND ({sl * 100:.0f}%)"
+        else:
+            target_str = stop_str = "N/A"
 
         source_urls = (sentiment.get("source_urls", []) or [])[:3]
         if source_urls:
-            url_lines = "\n".join(f"  - {html.escape(u)}" for u in source_urls)
+            url_lines = "\n".join(f"  • {html.escape(u)}" for u in source_urls)
         else:
-            url_lines = "  Không có tin tức đáng kể"
+            url_lines = "  • Không có tin tức đáng kể."
 
         block = (
-            f"📌 <b>{html.escape(ticker)}</b> @ {html.escape(price_str)}\n"
+            f"📌 <b>{html.escape(ticker)}</b> — giá hiện tại {html.escape(price_str)}\n"
             f"• <b>Khuyến nghị:</b> {verdict}\n"
-            f"• <b>Quant 5d UP confidence:</b> {confidence_5d}%\n"
-            f"• <b>Tâm lý:</b> {html.escape(sentiment_status)} "
-            f"(score={sentiment_score:+.2f})\n"
-            f"• <b>Phân tích tin tức:</b> {html.escape(reasoning)}\n"
-            f"• <b>Nguồn:</b>\n{url_lines}"
+            f"• <b>Đánh giá xu hướng (5 ngày tới):</b> Cửa Tăng "
+            f"<b>{confidence_5d}%</b>\n"
+            f"• 🎯 <b>Mục tiêu chốt lời:</b> {target_str}\n"
+            f"• 🛡️ <b>Ngưỡng cắt lỗ:</b> {stop_str}\n"
+            f"• <b>Tin tức &amp; Tâm lý:</b> {html.escape(sentiment_status)} — "
+            f"{html.escape(reasoning)}\n"
+            f"• <b>Nguồn tham khảo:</b>\n{url_lines}"
         )
         parts.append(block)
 

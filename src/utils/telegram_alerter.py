@@ -85,48 +85,71 @@ class TelegramBot:
 
     @staticmethod
     def _build_message(signal_data: dict) -> str:
+        """Plain-Vietnamese trade card. NO technical jargon — a reader
+        understands the trend odds and the news view instantly without
+        knowing the model internals.
+        """
         date_str = datetime.now().strftime("%d/%m/%Y")
 
-        def esc(key: str, default: str = "N/A") -> str:
+        def esc(key: str, default: str = "") -> str:
             return html.escape(str(signal_data.get(key, default)))
 
-        action = esc("action")
-        ticker = esc("ticker")
-        price = esc("price")
-        horizon = esc("horizon", "N/A")
-        sentiment_status = esc("sentiment_status", "Không rõ")
-        gemini_summary = esc("gemini_summary", "Không có tin tức đáng kể.")
-        model_class = esc("model_class")
-        confidence = esc("confidence", "0.0")
-        top_pos_features = esc("top_pos_features", "N/A")
-        top_neg_features = esc("top_neg_features", "N/A")
+        def pct(key: str) -> float:
+            try:
+                return float(signal_data.get(key))
+            except (TypeError, ValueError):
+                return float("nan")
 
-        # Build source URL block: loop through raw list (cap 3), with domain label per link
+        ticker = esc("ticker", "N/A")
+        price = esc("price", "N/A")
+        status_label = esc("status_label", "CHẤP NHẬN TÍN HIỆU")
+
+        # Trend odds (5 trading days). Prefer the full 3-class split; fall
+        # back to a single "Cửa Tăng" line if only confidence is available.
+        p_up, p_side, p_dn = pct("prob_up"), pct("prob_side"), pct("prob_down")
+        if p_up != p_up:  # NaN → no triple, use legacy single confidence
+            try:
+                p_up = float(signal_data.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                p_up = 0.0
+        trend_lines = [f"• Cửa Tăng:&nbsp;&nbsp;<b>{p_up:.1f}%</b>"]
+        if p_side == p_side:
+            trend_lines.append(f"• Đi Ngang:&nbsp;&nbsp;{p_side:.1f}%")
+        if p_dn == p_dn:
+            trend_lines.append(f"• Cửa Giảm:&nbsp;&nbsp;{p_dn:.1f}%")
+
+        plus = esc("plus_points", "Không có yếu tố tích cực nổi bật.")
+        minus = esc("minus_points", "Không có rủi ro nổi bật.")
+        conclusion = esc(
+            "conclusion",
+            signal_data.get("gemini_summary", "Chưa có dữ liệu tin tức."),
+        )
+
         article_urls: list[str] = signal_data.get("article_urls", []) or []
         if article_urls:
             url_lines = "\n".join(
-                f"  - [{html.escape(_domain_label(u))}] {html.escape(u)}"
+                f"  • [{html.escape(_domain_label(u))}] {html.escape(u)}"
                 for u in article_urls[:3]
             )
         else:
-            url_lines = "  Không có tin tức đáng kể"
+            url_lines = "  • Không có tin tức đáng kể."
 
+        trend_block = "\n".join(trend_lines)
         return (
-            f"🚨 <b>[HỆ THỐNG] BÁO CÁO GIAO DỊCH</b>\n"
-            f"📅 <b>Ngày:</b> {date_str}\n"
-            f"══════════════════════════════\n\n"
-            f"📌 <b>[1] TÍN HIỆU GIAO DỊCH</b>\n"
-            f"• <b>Lệnh:</b> {action} <b>{ticker}</b>\n"
-            f"• <b>Vùng giá vào:</b> {price}\n"
-            f"• <b>Chân trời dự báo:</b> {horizon}\n\n"
-            f"📰 <b>[2] PHÂN TÍCH TIN TỨC</b>\n"
-            f"• <b>Tâm lý thị trường:</b> {sentiment_status}\n"
-            f"• <b>Đánh giá:</b> {gemini_summary}\n"
-            f"• <b>Nguồn trích dẫn:</b>\n{url_lines}\n\n"
-            f"📈 <b>[3] PHÂN TÍCH ĐỊNH LƯỢNG</b>\n"
-            f"• <b>Dự báo:</b> {model_class} (Độ tin cậy: <b>{confidence}%</b>)\n"
-            f"• <b>Động lực tăng giá:</b> {top_pos_features}\n"
-            f"• <b>Yếu tố rủi ro:</b> {top_neg_features}\n"
+            f"🟢 <b>KHUYẾN NGHỊ MUA — {ticker}</b>\n"
+            f"📅 {date_str}  •  Vùng giá: <b>{price}</b>\n"
+            f"\n"
+            f"📊 <b>Đánh giá xu hướng (5 ngày tới)</b>\n"
+            f"{trend_block}\n"
+            f"\n"
+            f"✅ <b>Trạng thái: {status_label}</b>\n"
+            f"\n"
+            f"📰 <b>Điểm tin tức &amp; Tâm lý</b>\n"
+            f"• 👍 <b>Điểm cộng:</b> {plus}\n"
+            f"• 👎 <b>Điểm trừ:</b> {minus}\n"
+            f"• 📌 <b>Kết luận:</b> {conclusion}\n"
+            f"\n"
+            f"🔗 <b>Nguồn tham khảo:</b>\n{url_lines}\n"
         )
 
     # ------------------------------------------------------------------

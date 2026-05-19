@@ -113,22 +113,21 @@ EMPTY_PORTFOLIO_MESSAGE = (
 # <code>, <pre>, <blockquote>, <tg-spoiler>. The ampersand in "Quant & Sentiment"
 # is escaped as &amp;. Square brackets do NOT need escaping (only <, >, & do).
 HELP_TEXT = (
-    "🤖 <b>Quant Trading V6 - Command Menu</b>\n"
+    "🤖 <b>TRỢ LÝ ĐẦU TƯ — DANH SÁCH LỆNH</b>\n"
     "\n"
-    "<b>/suggest_buy</b> - Lấy khuyến nghị MUA "
-    "(Dựa trên Top 3 Quant &amp; Sentiment).\n"
-    "<b>/suggest_sell</b> - Lấy khuyến nghị BÁN/HOLD cho danh mục cá nhân.\n"
-    "<b>/rebalance</b> - AI tư vấn cơ cấu danh mục hiện tại.\n"
-    "<b>/verify</b> <i>[Mã]</i> - Kiểm định nhanh 1 cổ phiếu "
+    "🟢 <b>/suggest_buy</b> — Gợi ý cổ phiếu nên MUA hôm nay.\n"
+    "🔴 <b>/suggest_sell</b> — Đánh giá NÊN BÁN hay GIỮ danh mục của bạn.\n"
+    "⚖️ <b>/rebalance</b> — Tư vấn cơ cấu lại danh mục hiện tại.\n"
+    "🔍 <b>/verify</b> <i>[Mã]</i> — Soi nhanh 1 cổ phiếu "
     "(VD: <code>/verify HPG</code>).\n"
-    "<b>/add</b> <i>[Mã] [Khối lượng] [Giá]</i> - Thêm cổ phiếu vào danh mục "
+    "➕ <b>/add</b> <i>[Mã] [Số lượng] [Giá]</i> — Thêm cổ phiếu vào danh mục "
     "(VD: <code>/add VNE 1000 32.5</code>).\n"
-    "<b>/remove</b> <i>[Mã]</i> - Xóa cổ phiếu khỏi danh mục "
+    "➖ <b>/remove</b> <i>[Mã]</i> — Xóa cổ phiếu khỏi danh mục "
     "(VD: <code>/remove VNE</code>).\n"
-    "<b>/audit_weekly</b> - Hậu kiểm các lệnh /verify, /add trong 7 ngày qua.\n"
-    "<b>/audit_monthly</b> - Hậu kiểm các lệnh /verify, /add trong 30 ngày qua.\n"
-    "<b>/news</b> - Tổng hợp tin tức từ 20 nguồn gần nhất.\n"
-    "<b>/help</b> - Hiển thị menu này."
+    "📅 <b>/audit_weekly</b> — Xem lại hiệu quả các quyết định 7 ngày qua.\n"
+    "🗓️ <b>/audit_monthly</b> — Xem lại hiệu quả các quyết định 30 ngày qua.\n"
+    "📰 <b>/news</b> — Tổng hợp tin tức thị trường mới nhất.\n"
+    "ℹ️ <b>/help</b> — Hiển thị menu này."
 )
 
 
