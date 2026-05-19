@@ -1091,6 +1091,58 @@ async def feedback_command(
     )
 
 
+async def msg_id2_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Admin (ID1) → User (ID2) one-way announcement.
+
+    STRICT AUTH: only ID1 may use this. Any other sender — including ID2 —
+    is SILENTLY ignored (no reply, no error), per spec. Deliberately NOT
+    added to the public command menu / /help so the monitored user never
+    sees it advertised.
+    """
+    if update.message is None:
+        return
+    if _role_for(update) != "admin":          # silent ignore for non-admin
+        return
+    _log_request("/msg_id2", update)
+
+    msg = " ".join(context.args).strip() if context.args else ""
+    if not msg:
+        await update.message.reply_text(
+            "Vui lòng nhập nội dung. Ví dụ: /msg_id2 Hệ thống vừa cập nhật "
+            "tính năng báo cáo mới!"
+        )
+        return
+
+    if not USER_CHAT_ID:
+        await update.message.reply_text(
+            "⚠️ Chưa cấu hình TELEGRAM_CHAT_ID_2 — không thể gửi thông báo."
+        )
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=USER_CHAT_ID,
+            text=f"📢 <b>[THÔNG BÁO TỪ ADMIN]:</b> {html.escape(msg)}",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Never falsely confirm delivery — report the real failure to Admin.
+        LOGGER.warning("[msg_id2] delivery to ID2 failed: %s", exc)
+        await update.message.reply_text(
+            f"❌ Gửi thất bại: <code>{html.escape(str(exc))[:200]}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    LOGGER.info("[msg_id2] Admin announcement delivered to ID2 (%s chars).", len(msg))
+    await update.message.reply_text(
+        "✅ Đã gửi thông báo cho ID 2 thành công!"
+    )
+
+
 # The canonical command list pushed to Telegram via set_my_commands on startup.
 # This populates the "/" autocomplete menu in every chat.
 _BOT_COMMANDS: list[BotCommand] = [
@@ -1163,6 +1215,9 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("verify", verify_command))
     app.add_handler(CommandHandler("feedback", feedback_command))
+    # Admin-only announcement channel — intentionally NOT in _BOT_COMMANDS
+    # / /help so it stays hidden from the monitored user.
+    app.add_handler(CommandHandler("msg_id2", msg_id2_command))
 
     # Post-mortem audit — weekly/monthly review of /verify + /add accuracy.
     app.add_handler(CommandHandler("audit_weekly", audit_weekly_command))
