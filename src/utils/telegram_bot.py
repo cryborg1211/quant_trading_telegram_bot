@@ -129,7 +129,11 @@ HELP_TEXT = (
     "📅 <b>/audit_weekly</b> — Xem lại hiệu quả các quyết định 7 ngày qua.\n"
     "🗓️ <b>/audit_monthly</b> — Xem lại hiệu quả các quyết định 30 ngày qua.\n"
     "📰 <b>/news</b> — Tổng hợp tin tức thị trường mới nhất.\n"
-    "ℹ️ <b>/help</b> — Hiển thị menu này."
+    "💬 <b>/feedback</b> <i>[Nội dung]</i> — Gửi góp ý trực tiếp đến Admin.\n"
+    "ℹ️ <b>/help</b> — Hiển thị menu này.\n"
+    "\n"
+    "💡 Lưu ý: Để hỗ trợ và cải thiện hệ thống, các truy vấn của bạn "
+    "có thể được Admin ghi nhận."
 )
 
 
@@ -1055,6 +1059,38 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Application bootstrap
 # ---------------------------------------------------------------------------
 
+async def feedback_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Direct User → Admin feedback channel.
+
+    `/feedback <message>` forwards the verbatim message to ADMIN_CHAT_ID.
+    Bare `/feedback` returns usage help. The oversight gate (group=-1)
+    already denies unknown ids, so only ID1/ID2 reach this handler.
+    """
+    if update.message is None:
+        return
+    _log_request("/feedback", update)
+
+    msg = " ".join(context.args).strip() if context.args else ""
+    if not msg:
+        await update.message.reply_text(
+            "Vui lòng nhập nội dung. Ví dụ: /feedback Bot dạo này lag quá!"
+        )
+        return
+
+    uid = _extract_user_id(update) or "?"
+    LOGGER.info("[Feedback] from user_id=%s: %s", uid, msg)
+    await _notify_admin(
+        context,
+        f"📩 <b>[FEEDBACK TỪ USER]</b> "
+        f"(<code>{html.escape(uid)}</code>): {html.escape(msg)}",
+    )
+    await update.message.reply_text(
+        "✅ Cảm ơn bạn! Feedback đã được gửi trực tiếp đến Admin."
+    )
+
+
 # The canonical command list pushed to Telegram via set_my_commands on startup.
 # This populates the "/" autocomplete menu in every chat.
 _BOT_COMMANDS: list[BotCommand] = [
@@ -1067,6 +1103,7 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("audit_weekly", "Hậu kiểm /verify & /add trong 7 ngày qua"),
     BotCommand("audit_monthly", "Hậu kiểm /verify & /add trong 30 ngày qua"),
     BotCommand("news", "Tổng hợp tin tức từ 20 nguồn gần nhất"),
+    BotCommand("feedback", "Gửi góp ý trực tiếp đến Admin (VD: /feedback ...)"),
     BotCommand("help", "Hiển thị danh sách lệnh"),
 ]
 
@@ -1125,6 +1162,7 @@ def build_application() -> Application:
     )
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("verify", verify_command))
+    app.add_handler(CommandHandler("feedback", feedback_command))
 
     # Post-mortem audit — weekly/monthly review of /verify + /add accuracy.
     app.add_handler(CommandHandler("audit_weekly", audit_weekly_command))
