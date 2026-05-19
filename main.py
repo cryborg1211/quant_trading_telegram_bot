@@ -736,7 +736,7 @@ def daily_inference(
     if latest_df.empty:
         raise ValueError("Live feature frame is empty.")
 
-    stacking_predictions_5d, _, xgb_model_5d, selected_features_5d, meta_gate_5d = predict_stacking_horizon(latest_df, 5)
+    stacking_predictions_5d, thr_5d, xgb_model_5d, selected_features_5d, meta_gate_5d = predict_stacking_horizon(latest_df, 5)
     stacking_predictions_20d, _, _, _, _ = predict_stacking_horizon(latest_df, 20)
 
     sorted_preds = sorted(stacking_predictions_5d.items(), key=lambda x: x[1][2], reverse=True)
@@ -843,9 +843,73 @@ def daily_inference(
         len(_gated_out), _gated_out[:5], len(candidate_tickers), candidate_tickers,
     )
 
+    # --- FALLBACK OBSERVABILITY MODE ------------------------------------
+    # If NO ticker cleared the τ*/meta-labeler gates, the bot would return an
+    # empty message — useless for monitoring. Instead, fall back to the Top-3
+    # liquid-universe tickers by P(UP) PURELY FOR OBSERVABILITY. These are
+    # NOT trade signals: run_trade_execution is bypassed entirely below, so
+    # there is zero portfolio / RL / dispatch side effect. The Telegram
+    # report is explicitly flagged (Vietnamese) as "do not trade".
+    fallback_mode = False
+    fallback_reasons: dict[str, str] = {}
+    if not candidate_tickers:
+        fallback_mode = True
+        _tau5 = float(thr_5d.get("pnl_threshold_tau", 0.5))
+        _ranked = [
+            t for t, _p in sorted(
+                stacking_predictions_5d.items(),
+                key=lambda kv: kv[1][2], reverse=True,
+            )
+            if t in universe_tickers
+        ]
+        candidate_tickers = _ranked[:3]
+        for t in candidate_tickers:
+            _pu = stacking_predictions_5d[t][2]
+            if _pu < _tau5:
+                fallback_reasons[t] = (
+                    f"Bị loại: P(UP) {_pu * 100:.1f}% < tau={_tau5:.2f}"
+                )
+            elif not meta_gate_5d.get(t, True):
+                fallback_reasons[t] = (
+                    "Bị loại: Meta-Labeler P(lợi nhuận) < 50%"
+                )
+            else:
+                fallback_reasons[t] = (
+                    f"Theo dõi (thị trường yếu, P(UP) {_pu * 100:.1f}%)"
+                )
+        LOGGER.warning(
+            "[FallbackObservability] No gated candidates — MONITORING-ONLY "
+            "Top-3 by P(UP): %s (tau*=%.2f). These will NOT be traded.",
+            candidate_tickers, _tau5,
+        )
+
     horizon_predictions = {"5d": stacking_predictions_5d, "20d": stacking_predictions_20d}
     with timed_step("Evaluating candidates with dual-horizon arbitrator/sentiment layer"):
         final_decisions, all_sentiments = evaluate_trades_batch(horizon_predictions, candidate_tickers)
+
+    # Fallback returns the flagged Vietnamese observability report and
+    # BYPASSES run_trade_execution — guaranteeing no trades are executed.
+    if fallback_mode:
+        if not candidate_tickers:
+            return (
+                "<b>[⚠️ THỊ TRƯỜNG YẾU]</b>\n<i>Không có mã nào trong vũ trụ "
+                "giao dịch sau bộ lọc thanh khoản/Universe hôm nay.</i>"
+            )
+        report_html = _build_fallback_observability_report_vi(
+            candidate_tickers,
+            stacking_predictions_5d,
+            all_sentiments,
+            fallback_reasons,
+        )
+        LOGGER.warning(
+            "[FallbackObservability] Returning monitoring-only report for %s "
+            "— run_trade_execution SKIPPED (no trades).", candidate_tickers,
+        )
+        LOGGER.info(
+            "Dual-horizon daily inference completed in %.2fs.",
+            time.perf_counter() - total_start,
+        )
+        return report_html
 
     # --- Top-6 → Top-3 Sentiment Filter ---
     # Scope strictly to candidate_tickers (the 6 evaluated by arbitrator+LLM).
@@ -893,6 +957,57 @@ def daily_inference(
     )
     LOGGER.info("Dual-horizon daily inference completed in %.2fs.", time.perf_counter() - total_start)
     return report_html
+
+
+def _build_fallback_observability_report_vi(
+    fallback_tickers: list[str],
+    stacking_predictions_5d: dict,
+    all_sentiments: dict,
+    fallback_reasons: dict,
+) -> str:
+    """Vietnamese 'weak-market' observability report (HTML, the bot's
+    Telegram parse mode).
+
+    These tickers are MONITORING ONLY — not trade signals. The caller
+    (`daily_inference`) returns this BEFORE `run_trade_execution`, so there
+    is no portfolio / RL / dispatch side effect. The header and per-ticker
+    flag make it impossible to mistake these for actionable BUYs.
+    """
+    out = [
+        "<b>[⚠️ THỊ TRƯỜNG YẾU - KHÔNG CÓ TÍN HIỆU ĐẠT CHUẨN. "
+        "HIỂN THỊ TOP 3 MÃ ĐỂ THEO DÕI]</b>",
+        "<i>⛔ KHÔNG GIAO DỊCH các mã dưới đây — chỉ dùng để quan sát thị "
+        "trường. Không mã nào vượt qua bộ lọc τ* + Meta-Labeler hôm nay.</i>",
+        "",
+    ]
+    for i, t in enumerate(fallback_tickers, 1):
+        p = stacking_predictions_5d.get(t, [0.0, 0.0, 0.0])
+        p_dn, p_sd, p_up = p[0] * 100.0, p[1] * 100.0, p[2] * 100.0
+        s = all_sentiments.get(t, {}) or {}
+        try:
+            score = float(s.get("sentiment_score", 0.0))
+        except (TypeError, ValueError):
+            score = 0.0
+        reason_vi = (
+            s.get("reasoning_vi")
+            or s.get("reasoning")
+            or "Không có phân tích sentiment khả dụng (tin tức trống/timeout)."
+        )
+        gate = fallback_reasons.get(t, "Bị loại: không đạt chuẩn")
+        out += [
+            f"<b>{i}. {html.escape(t)}</b>",
+            f"   • Xác suất 5d: <code>P(TĂNG)={p_up:.1f}% | "
+            f"P(ĐI NGANG)={p_sd:.1f}% | P(GIẢM)={p_dn:.1f}%</code>",
+            f"   • Lý do bị loại: <code>{html.escape(gate)}</code>",
+            f"   • Sentiment (LLM Gemini): <b>{score:+.2f}</b> — "
+            f"{html.escape(str(reason_vi))[:600]}",
+            "",
+        ]
+    out.append(
+        "<i>Nguồn: Mô hình 5d (Stacking + Meta-Labeler, τ*=0.48) + Gemini "
+        "sentiment. Chế độ Quan sát Dự phòng — KHÔNG phải khuyến nghị MUA.</i>"
+    )
+    return "\n".join(out)
 
 
 def run_trade_execution(
