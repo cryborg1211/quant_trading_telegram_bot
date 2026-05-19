@@ -17,6 +17,7 @@ import joblib
 import numpy as np
 from catboost import CatBoostClassifier
 
+from config.settings import CONFIG
 from src.features.alpha360_generator import Alpha360Generator
 from src.models.stacking_model.economic_metrics import (
     META_LABEL_FEATURE_NAMES,
@@ -770,6 +771,50 @@ def daily_inference(
         LOGGER.warning("[LiquidityFilter] close/volume/ticker columns missing — skipping liquidity filter.")
         liquid_tickers = set(stacking_predictions_5d.keys())
 
+    # --- Universe Filter -------------------------------------------------
+    # Segment exclusions applied AFTER liquidity, BEFORE the meta-labeler /
+    # arbitrator. Knobs live in CONFIG.universe_filter (config/settings.json)
+    # and default to a NO-OP, so live behaviour is unchanged until opted in.
+    #
+    # CAVEAT (no market-cap data in the pipeline): "penny / ultra-smallcap"
+    # is approximated by a RAW-PRICE FLOOR (`min_price_vnd`), not a true
+    # market cap. VN30 exclusion uses the published constituent list (exact).
+    _uf = CONFIG.universe_filter
+    universe_tickers: set[str] = set(liquid_tickers)
+    if _uf.enabled and liquid_tickers:
+        _vn30 = {t.upper() for t in _uf.vn30_tickers}
+        _manual = {t.upper() for t in _uf.exclude_tickers}
+        # Latest real-VND close per ticker (reuse the liquidity block's
+        # thousands-scaling rule: price < 1000 ⇒ stored in thousands).
+        _last_px: dict[str, float] = {}
+        if {"close", "ticker"}.issubset(latest_df.columns):
+            for _t, _g in latest_df.groupby("ticker"):
+                _c = float(_g["close"].iloc[-1])
+                _last_px[str(_t)] = _c * (1000.0 if _c < 1000.0 else 1.0)
+        _excluded: dict[str, str] = {}
+        for _t in liquid_tickers:
+            tu = str(_t).upper()
+            if _uf.exclude_vn30 and tu in _vn30:
+                _excluded[_t] = "VN30"
+            elif tu in _manual:
+                _excluded[_t] = "manual-blacklist"
+            elif (_uf.min_price_vnd > 0
+                  and _last_px.get(_t, float("inf")) < _uf.min_price_vnd):
+                _excluded[_t] = f"price<{_uf.min_price_vnd:.0f}VND(penny-proxy)"
+        universe_tickers -= set(_excluded)
+        LOGGER.info(
+            "[UniverseFilter] excluded %s/%s (exclude_vn30=%s min_price_vnd=%.0f "
+            "manual=%s). %s liquid→universe. e.g. %s",
+            len(_excluded), len(liquid_tickers), _uf.exclude_vn30,
+            _uf.min_price_vnd, len(_manual), len(universe_tickers),
+            dict(list(_excluded.items())[:6]),
+        )
+    else:
+        LOGGER.info(
+            "[UniverseFilter] disabled — passing all %s liquid tickers through.",
+            len(liquid_tickers),
+        )
+
     # Send Top-6 liquid tickers to arbitrator/sentiment layer.
     # 6 candidates → full LLM sentiment evaluation → final Top-3 selected by sentiment+quant score.
     #
@@ -781,7 +826,7 @@ def daily_inference(
     _gated_out = [
         t for t, _p in sorted(stacking_predictions_5d.items(),
                                key=lambda i: i[1][2], reverse=True)
-        if t in liquid_tickers and not meta_gate_5d.get(t, True)
+        if t in universe_tickers and not meta_gate_5d.get(t, True)
     ]
     candidate_tickers = [
         ticker
@@ -790,7 +835,7 @@ def daily_inference(
             key=lambda item: item[1][2],
             reverse=True,
         )
-        if ticker in liquid_tickers and meta_gate_5d.get(ticker, True)
+        if ticker in universe_tickers and meta_gate_5d.get(ticker, True)
     ][: min(max_candidates, _ARBITRATOR_POOL)]
     LOGGER.info(
         "[Brain] Meta-labeler gate: %s liquid tickers rejected (e.g. %s). "

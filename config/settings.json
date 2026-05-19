@@ -17,7 +17,10 @@
     "stacking_top_k_features": 70,
     "stacking_feature_selection_max_rows": 150000,
     "stacking_n_splits": 3,
-    "stacking_horizons": [5, 20],
+    "stacking_horizons": [
+      5,
+      20
+    ],
     "stacking_baseline_macro_f1": 0.2,
     "alpha360_lookback": 60
   },
@@ -56,5 +59,11 @@
     "gnews_max_results": 8,
     "gnews_sleep_seconds": 1.25,
     "article_char_limit": 4000
+  },
+  "universe_filter": {
+    "enabled": true,
+    "exclude_vn30": false,
+    "min_price_vnd": 20000.0,
+    "exclude_tickers": []
   }
 }
