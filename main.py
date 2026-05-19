@@ -15,10 +15,12 @@ from zoneinfo import ZoneInfo
 
 import joblib
 import numpy as np
+import pandas as pd
 from catboost import CatBoostClassifier
 
 from config.settings import CONFIG
 from src.features.alpha360_generator import Alpha360Generator
+from src.features.mr_features import MR_FEATURE_COLUMNS, build_mr_features
 from src.models.stacking_model.economic_metrics import (
     META_LABEL_FEATURE_NAMES,
     N_CLOSE_LAGS_FOR_META,
@@ -348,6 +350,72 @@ def build_alpha360() -> None:
     with timed_step("Alpha360 full rebuild"):
         generator = Alpha360Generator()
         generator.run()
+
+
+# ─── Mean-Reversion (knife-catch) sub-model — shared live scorer ──────────
+# Loaded once and cached (module-level) so /verify, /suggest_sell and
+# /suggest_buy all reuse one in-memory model. Returns, per ticker:
+#   {"prob": float, "fired": bool, "tau": float}
+# `fired` == panic alert (prob >= the strict τ* from training).
+_MR_MODEL: Any = None
+_MR_TAU: float | None = None
+_MR_ART = Path("models/mr")
+
+
+def _load_mr() -> tuple[Any, float]:
+    global _MR_MODEL, _MR_TAU
+    if _MR_MODEL is None:
+        _MR_MODEL = joblib.load(_MR_ART / "mr_lgbm.joblib")
+        with (_MR_ART / "mr_threshold.json").open("r", encoding="utf-8") as fh:
+            _MR_TAU = float(json.load(fh)["tau"])
+        LOGGER.info("[MR] sub-model loaded | strict τ*=%.2f", _MR_TAU)
+    return _MR_MODEL, float(_MR_TAU)
+
+
+def mr_score_tickers(tickers: list[str]) -> dict[str, dict[str, Any]]:
+    """Live MR panic score per ticker (leak-free oversold features).
+
+    Loads an 80-bar OHLCV tail (≥ SMA50 history), runs build_mr_features,
+    takes the LATEST row per ticker, and scores it with mr_lgbm. Any
+    failure degrades to {} so the caller's primary flow is never broken.
+    """
+    tickers = sorted({t.upper().strip() for t in tickers if t})
+    if not tickers:
+        return {}
+    try:
+        model, tau = _load_mr()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("[MR] model unavailable (%s) — MR features skipped.", exc)
+        return {}
+    try:
+        win = Alpha360Generator()._load_live_stock_window(
+            tickers=tickers, window_rows=80
+        )
+        pdf = win.to_pandas() if hasattr(win, "to_pandas") else win
+        feat = build_mr_features(pdf)
+        latest = (
+            feat.sort_values(["ticker", "date"])
+            .groupby("ticker", sort=False)
+            .tail(1)
+        )
+        x = (
+            latest[MR_FEATURE_COLUMNS]
+            .apply(pd.to_numeric, errors="coerce")
+            .to_numpy(np.float64)
+        )
+        proba = model.predict_proba(x)[:, 1]
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("[MR] scoring failed (%s) — MR features skipped.", exc)
+        return {}
+
+    out: dict[str, dict[str, Any]] = {}
+    for tk, p in zip(latest["ticker"].astype(str), proba, strict=False):
+        out[tk.upper()] = {
+            "prob": float(p),
+            "fired": bool(p >= tau),
+            "tau": float(tau),
+        }
+    return out
 
 
 def load_stacking_artifacts(horizon: int) -> tuple[list[str], dict[str, Any], Any, Any, CatBoostClassifier, Any, Any]:
@@ -899,11 +967,14 @@ def daily_inference(
                 "<b>[⚠️ THỊ TRƯỜNG YẾU]</b>\n<i>Không có mã nào trong vũ trụ "
                 "giao dịch sau bộ lọc thanh khoản/Universe hôm nay.</i>"
             )
+        # MR knife-catch scores for the monitored names → [🔪 BẮT ĐÁY] tag.
+        mr_scores = mr_score_tickers(candidate_tickers)
         report_html = _build_fallback_observability_report_vi(
             candidate_tickers,
             stacking_predictions_5d,
             all_sentiments,
             fallback_reasons,
+            mr_scores,
         )
         LOGGER.warning(
             "[FallbackObservability] Returning monitoring-only report for %s "
@@ -968,6 +1039,7 @@ def _build_fallback_observability_report_vi(
     stacking_predictions_5d: dict,
     all_sentiments: dict,
     fallback_reasons: dict,
+    mr_scores: dict | None = None,
 ) -> str:
     """Vietnamese 'weak-market' observability report (HTML, the bot's
     Telegram parse mode).
@@ -999,12 +1071,19 @@ def _build_fallback_observability_report_vi(
         why = fallback_reasons.get(
             t, "Cửa tăng quá thấp so với rủi ro thị trường chung."
         )
+        # Trend gate rejected ALL of these (that's why we're in fallback),
+        # so the only actionable tag here is whether the knife-catch
+        # sub-model fired on extreme panic.
+        mr = (mr_scores or {}).get(t) or {}
+        tag = " [🔪 BẮT ĐÁY]" if mr.get("fired") else ""
         out += [
-            f"<b>{i}. {html.escape(t)}</b>",
+            f"<b>{i}. {html.escape(t)}{tag}</b>",
             f"   • <b>Đánh giá xu hướng (5 ngày tới):</b> "
             f"Cửa Tăng <b>{p_up:.1f}%</b> | Đi Ngang {p_sd:.1f}% | "
             f"Cửa Giảm {p_dn:.1f}%",
-            f"   • <b>Trạng thái:</b> ❌ HỦY BỎ TÍN HIỆU",
+            f"   • <b>Trạng thái:</b> ❌ HỦY BỎ TÍN HIỆU"
+            + ("  →  🔪 <b>nhưng MR phát hiện vùng bắt đáy!</b>"
+               if mr.get("fired") else ""),
             f"   • <b>Lý do:</b> {html.escape(why)}",
             f"   • <b>Tin tức &amp; Tâm lý:</b> {html.escape(str(reason_vi))[:500]}",
             "",
@@ -1148,6 +1227,13 @@ def run_trade_execution(
 _SELL_DECISION = 0  # arbitrator class label for DOWN / SELL
 
 
+_MR_SELL_VETO = (
+    "⚠️ <b>[CẢNH BÁO BÁN ĐÚNG ĐÁY: Mã này đang rơi vào vùng hoảng loạn "
+    "tột độ, xác suất cao sẽ có nhịp hồi chữ V. Hạn chế bán tháo lúc "
+    "này!]</b>"
+)
+
+
 def _build_sell_hold_report(
     holding_tickers: list[str],
     final_decisions: dict,
@@ -1155,6 +1241,7 @@ def _build_sell_hold_report(
     stacking_predictions: dict,
     live_exec_prices: dict,
     missing_tickers: list[str] | None = None,
+    mr_scores: dict | None = None,
 ) -> str:
     """Build the HTML BÁN/GIỮ digest for /suggest_sell.
 
@@ -1185,6 +1272,15 @@ def _build_sell_hold_report(
         else:
             verdict = "🟡 <b>GIỮ THẬN TRỌNG (đang đi ngang)</b>"
 
+        # ── MR VETO ──────────────────────────────────────────────────
+        # The trend model says SELL, but the knife-catch model fired:
+        # the stock is in extreme capitulation with a high V-bounce
+        # probability. Explicitly warn the user NOT to dump into the low.
+        mr = (mr_scores or {}).get(ticker) or {}
+        veto_line = ""
+        if decision == _SELL_DECISION and mr.get("fired"):
+            veto_line = f"{_MR_SELL_VETO}\n"
+
         # Plain-language target / trailing-stop from the standing risk rules.
         tp = CONFIG.trading.take_profit_pct   # e.g. +0.15
         sl = CONFIG.trading.stop_loss_pct     # e.g. -0.07
@@ -1202,6 +1298,7 @@ def _build_sell_hold_report(
 
         block = (
             f"📌 <b>{html.escape(ticker)}</b> — giá hiện tại {html.escape(price_str)}\n"
+            f"{veto_line}"
             f"• <b>Khuyến nghị:</b> {verdict}\n"
             f"• <b>Đánh giá xu hướng (5 ngày tới):</b> Cửa Tăng "
             f"<b>{confidence_5d}%</b>\n"
@@ -1296,6 +1393,10 @@ def inference_for_holdings(
 
     live_exec_prices = _get_live_exec_prices(latest_df, present)
 
+    # MR knife-catch scores → drives the "don't sell into the bottom" veto.
+    with timed_step("Holdings MR (knife-catch) scoring"):
+        mr_scores = mr_score_tickers(present)
+
     LOGGER.info("[/suggest_sell] completed in %.2fs.", time.perf_counter() - total_start)
     return _build_sell_hold_report(
         holding_tickers=present,
@@ -1304,6 +1405,7 @@ def inference_for_holdings(
         stacking_predictions=horizon_predictions,
         live_exec_prices=live_exec_prices,
         missing_tickers=missing,
+        mr_scores=mr_scores,
     )
 
 
@@ -1329,6 +1431,22 @@ _VERIFY_VERDICT_LABELS: dict[int, str] = {
 }
 
 
+def _mr_state_line(mr_state: dict | None) -> str:
+    """Plain-VN MR bottom-catch state for the /verify dual output."""
+    if not mr_state:
+        return "🔪 <b>Trạng thái Bắt đáy:</b> Không khả dụng"
+    if mr_state.get("fired"):
+        return (
+            "🔪 <b>Trạng thái Bắt đáy:</b> "
+            "🚨 <b>CẢNH BÁO HOẢNG LOẠN</b> — cổ phiếu đang ở vùng bán tháo "
+            "cực đoan, xác suất cao có nhịp hồi chữ V."
+        )
+    return (
+        "🔪 <b>Trạng thái Bắt đáy:</b> Chưa đạt "
+        "(chưa rơi vào vùng hoảng loạn tột độ)"
+    )
+
+
 def _build_verify_report(
     ticker: str,
     decision: int | None,
@@ -1336,6 +1454,7 @@ def _build_verify_report(
     stacking_5d: list[float],
     stacking_20d: list[float],
     live_exec_price: float | None,
+    mr_state: dict | None = None,
 ) -> str:
     """Build the HTML verification report for /verify.
 
@@ -1376,16 +1495,16 @@ def _build_verify_report(
         f"📅 <b>Ngày:</b> {datetime.now().strftime('%d/%m/%Y')}\n"
         f"══════════════════════════════\n\n"
         f"💵 <b>Giá hiện tại:</b> {html.escape(price_str)}\n\n"
-        f"📊 <b>[1] Định lượng (Stacking GBDT)</b>\n"
-        f"• <b>Dự báo 5d:</b> {pred_5d_label}\n"
-        f"• <b>Độ tin cậy 5d:</b> {confidence_5d}% "
-        f"(UP={p_up * 100:.1f}%, SIDE={p_side * 100:.1f}%, DOWN={p_down * 100:.1f}%)\n"
-        f"• <b>Dự báo 20d:</b> {pred_20d_label} ({confidence_20d}%)\n\n"
-        f"📰 <b>[2] Sentiment (LLM)</b>\n"
-        f"• <b>Tâm lý:</b> {html.escape(sent_status)} "
-        f"(score={sent_score:+.2f})\n"
-        f"• <b>Phân tích:</b> {html.escape(sent_reasoning)}\n\n"
-        f"🎯 <b>[3] Verdict tổng hợp:</b> {verdict_html}\n\n"
+        f"📊 <b>Đánh giá Xu hướng (5 ngày tới)</b>\n"
+        f"• Cửa Tăng: <b>{p_up * 100:.1f}%</b> | Đi Ngang: {p_side * 100:.1f}% "
+        f"| Cửa Giảm: {p_down * 100:.1f}%\n"
+        f"• Nhận định 5 ngày: {pred_5d_label}\n"
+        f"• Nhận định 20 ngày: {pred_20d_label} ({confidence_20d}%)\n\n"
+        f"{_mr_state_line(mr_state)}\n\n"
+        f"📰 <b>Tin tức &amp; Tâm lý</b>\n"
+        f"• Đánh giá: {html.escape(sent_status)} (điểm {sent_score:+.2f})\n"
+        f"• Phân tích: {html.escape(sent_reasoning)}\n\n"
+        f"🎯 <b>Kết luận tổng hợp:</b> {verdict_html}\n\n"
         f"🔗 <b>Nguồn tham khảo:</b>\n{url_lines}"
     )
 
@@ -1479,6 +1598,9 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
     # --- Step 4: Live execution price (VN scaling already applied) ---
     live_exec_prices = _get_live_exec_prices(latest_df, [ticker])
 
+    # --- Step 5: Mean-Reversion (knife-catch) state — parallel sub-model ---
+    mr_state = mr_score_tickers([ticker]).get(ticker)
+
     LOGGER.info("[/verify] %s completed in %.2fs.", ticker, time.perf_counter() - total_start)
     return _build_verify_report(
         ticker=ticker,
@@ -1487,6 +1609,7 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
         stacking_5d=list(stacking_5d.get(ticker, [0.33, 0.34, 0.33])),
         stacking_20d=list(stacking_20d.get(ticker, [0.33, 0.34, 0.33])),
         live_exec_price=live_exec_prices.get(ticker),
+        mr_state=mr_state,
     )
 
 
