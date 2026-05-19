@@ -692,6 +692,92 @@ def map_tickers_to_news(
 # GEMINI SENTIMENT
 # ---------------------------------------------------------------------------
 
+# Polite, jargon-free fallback shown to users when sentiment is unavailable
+# after all retries (replaces the old raw "Lỗi gọi API").
+_POLITE_NEWS_FALLBACK_VI = (
+    "⚠️ Không thể tải tin tức lúc này (hệ thống nguồn đang bận). "
+    "Vui lòng thử lại sau."
+)
+
+# HTTP-ish status codes worth retrying (transient). 401/403/404 are NOT here
+# (bad key / not-found are permanent — retrying wastes time and budget).
+_TRANSIENT_HTTP = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _exc_http_status(exc: Exception) -> Any:
+    """Best-effort extract an HTTP status/code from google-genai / requests /
+    httpx style exceptions, so we can log the EXACT cause and decide retry."""
+    for attr in ("code", "status_code", "status"):
+        v = getattr(exc, attr, None)
+        if isinstance(v, int):
+            return v
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        return getattr(resp, "status_code", None) or getattr(resp, "status", None)
+    return None
+
+
+def _is_transient(exc: Exception, status: Any) -> bool:
+    """True ⇒ worth an exponential-backoff retry (rate-limit / 5xx / network
+    timeout). False ⇒ permanent (bad key, schema bug) — don't burn retries."""
+    if isinstance(status, int) and status in _TRANSIENT_HTTP:
+        return True
+    name = type(exc).__name__.lower()
+    return any(
+        k in name
+        for k in ("timeout", "connection", "unavailable", "deadline",
+                  "resourceexhausted", "servererror", "503", "502")
+    )
+
+
+def _normalize_news_json(
+    parsed: Any, tickers: list[str]
+) -> dict[str, dict[str, Any]]:
+    """Coerce Gemini's JSON into the canonical ``{TICKER: {...}}`` dict.
+
+    THE ACTUAL BUG FIX: the model intermittently returns a JSON **array**
+    (or a wrapper object) instead of a dict keyed by ticker, so the old
+    ``for t in result_json: result_json[t]`` raised
+    ``list indices must be integers or slices, not dict`` — which the 3
+    retries could never fix (deterministic shape). Accept dict-keyed,
+    list-of-objects, wrapped, and single-object shapes.
+    """
+    if isinstance(parsed, dict):
+        for wrap in ("results", "data", "items", "tickers", "sentiments", "result"):
+            inner = parsed.get(wrap)
+            if isinstance(inner, (list, dict)):
+                parsed = inner
+                break
+
+    out: dict[str, dict[str, Any]] = {}
+    up = [t.upper() for t in tickers]
+
+    if isinstance(parsed, dict):
+        # Single flat object for one ticker?  e.g. {"ticker":"HPG","sentiment_score":..}
+        if {"sentiment_score", "reasoning_vi", "catalyst"} & set(parsed):
+            tk = str(parsed.get("ticker") or parsed.get("symbol") or "").upper()
+            if not tk and len(up) == 1:
+                tk = up[0]
+            if tk:
+                out[tk] = parsed
+        else:  # {TICKER: {...}}
+            for k, v in parsed.items():
+                if isinstance(v, dict):
+                    out[str(k).upper()] = v
+    elif isinstance(parsed, list):
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            tk = str(
+                item.get("ticker") or item.get("symbol") or item.get("ma") or ""
+            ).upper()
+            if tk:
+                out[tk] = item
+        if not out and len(parsed) == 1 and len(up) == 1 and isinstance(parsed[0], dict):
+            out[up[0]] = parsed[0]
+    return out
+
+
 def get_batch_sentiment_scores(ticker_news_dict: dict[str, list[str]]) -> dict[str, dict[str, Any]]:
     """Call Gemini API for batch sentiment; fault-tolerant with retries.
 
@@ -730,29 +816,58 @@ def get_batch_sentiment_scores(ticker_news_dict: dict[str, list[str]]) -> dict[s
     )
 
     max_retries = 3
-    delays = [2, 5, 10]
 
     for attempt in range(max_retries):
         try:
-            response = client.models.generate_content(
-                model=gemini_model_name,
-                contents=user_prompt,
-                config=generate_config,
-            )
-            raw_response = (response.text or "") if hasattr(response, "text") else ""
-            LOGGER.info("[News Analyst][DEBUG] Gemini raw response:\n%s", raw_response)
+            # ── External API call (isolated so HTTP errors get an EXACT
+            #    status log and transient-only exponential backoff) ──────
             try:
-                result_json: dict[str, Any] = json.loads(raw_response)
+                response = client.models.generate_content(
+                    model=gemini_model_name,
+                    contents=user_prompt,
+                    config=generate_config,
+                )
+            except Exception as api_exc:  # noqa: BLE001
+                status = _exc_http_status(api_exc)
+                transient = _is_transient(api_exc, status)
+                LOGGER.error(
+                    "[News Analyst] Gemini API ERROR attempt %s/%s | "
+                    "type=%s status=%s transient=%s | %s",
+                    attempt + 1, max_retries, type(api_exc).__name__,
+                    status, transient, str(api_exc)[:300],
+                )
+                if transient and attempt < max_retries - 1:
+                    backoff = 2 ** attempt + 1  # 2s, 3s, 5s
+                    LOGGER.warning("[News Analyst] transient — backoff %ss", backoff)
+                    time.sleep(backoff)
+                    continue
+                raise  # permanent (bad key / quota-exhausted) → stop early
+
+            raw_response = (response.text or "") if hasattr(response, "text") else ""
+
+            # Parse — tolerant of code fences AND object-or-array shapes.
+            try:
+                parsed = json.loads(raw_response)
             except json.JSONDecodeError:
-                LOGGER.exception("[News Analyst][DEBUG] JSON parse failed. raw_response=%r", raw_response)
-                cleaned = raw_response.strip()
-                cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+                cleaned = re.sub(
+                    r"^```(?:json)?\s*", "", raw_response.strip(), flags=re.IGNORECASE
+                )
                 cleaned = re.sub(r"\s*```$", "", cleaned)
-                match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-                if not match:
+                m = re.search(r"(\{.*\}|\[.*\])", cleaned, flags=re.DOTALL)
+                if not m:
                     raise
-                LOGGER.info("[News Analyst][DEBUG] Retrying JSON parse after markdown/code-fence cleanup.")
-                result_json = json.loads(match.group(0))
+                parsed = json.loads(m.group(0))
+
+            # THE FIX: normalize dict / list / wrapped shapes → {TICKER:{}}.
+            result_json = _normalize_news_json(parsed, list(ticker_news_dict))
+            if not result_json:
+                LOGGER.error(
+                    "[News Analyst] Unparseable sentiment SCHEMA (parsed "
+                    "type=%s) — not an API failure. raw=%.300s",
+                    type(parsed).__name__, raw_response,
+                )
+                raise ValueError("normalized sentiment JSON empty")
+
             for t in result_json:
                 score = float(result_json[t].get("sentiment_score", 0.0))
                 result_json[t]["sentiment_score"] = max(-1.0, min(1.0, score))
@@ -767,14 +882,25 @@ def get_batch_sentiment_scores(ticker_news_dict: dict[str, list[str]]) -> dict[s
             LOGGER.info("[News Analyst] Batch evaluated %s tickers.", len(result_json))
             time.sleep(2.5)
             return result_json
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("[News Analyst] Gemini attempt %s failed: %s", attempt + 1, exc)
-            if attempt < max_retries - 1:
-                time.sleep(delays[attempt])
 
-    LOGGER.error("[News Analyst] All retries exhausted. Defaulting to Neutral.")
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error(
+                "[News Analyst] attempt %s/%s FAILED | %s: %s",
+                attempt + 1, max_retries, type(exc).__name__, str(exc)[:300],
+            )
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt + 1)
+
+    LOGGER.error(
+        "[News Analyst] All %s retries exhausted — graceful polite fallback.",
+        max_retries,
+    )
     return {
-        t: {"sentiment_score": 0.0, "reasoning_vi": "Lỗi gọi API", "source_urls": []}
+        t: {
+            "sentiment_score": 0.0,
+            "reasoning_vi": _POLITE_NEWS_FALLBACK_VI,
+            "source_urls": [],
+        }
         for t in ticker_news_dict
     }
 
