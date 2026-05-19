@@ -1,381 +1,198 @@
-# Quant V6 — Vietnamese Equity Trading Platform
+# Quant V6 — Dual-Model Vietnamese Equity Trading Assistant
 
-Automated quantitative trading system for the **VN100 / HOSE** universe. Combines a
-**dual-horizon Stacking GBDT** model (XGBoost + LightGBM + CatBoost → logistic meta)
-with **Gemini-driven news sentiment** to generate daily 5-day and 20-day directional
-signals, executed via an **interactive Telegram bot** with multi-user portfolios.
+A production Telegram trading assistant for the HOSE/VN universe, built on a
+**dual-model architecture**: a trend-following stacking ensemble and a
+specialized mean-reversion "knife-catcher", arbitrated by an LLM sentiment
+engine and delivered through a multi-tenant Telegram bot with role-based
+access control and admin oversight.
 
-> **Status:** production · multi-user · runs unattended overnight on a single VPS
-> **Stack:** Python 3.11 · DuckDB · Polars · XGBoost/LightGBM/CatBoost · Gemini 2.5 Flash · python-telegram-bot v20+
-
----
-
-## What this does
-
-- **Ingests** daily OHLCV for ~355 HOSE tickers via `vnstock` 4.x, plus US macro (DXY, S&P 500, USD/VND) via `yfinance`.
-- **Engineers** Alpha360-style features — 6 raw fields × 60 rolling-Z-score lags per ticker = 360 lag columns, plus VWAP, T-1-shifted macro, and lagged sentiment aggregates.
-- **Trains** a Stacking GBDT ensemble (3 base learners + logistic meta) for both 5-day and 20-day classification horizons. Quantile-thresholded UP/SIDE/DOWN labels.
-- **Scrapes** Vietnamese financial news in parallel across 5 portals (cafef, vietstock, tinnhanhchungkhoan, vneconomy, vietnambiz) and routes the diverse top-3 articles per ticker to **Gemini 2.5 Flash** for sentiment + reasoning.
-- **Dispatches** Top-3 BUY signals per session via Telegram, with a Vietnamese HTML report including the LLM's reasoning, top model drivers, and source URLs.
-- **Manages** per-user portfolios via 9 interactive bot commands (`/suggest_buy`, `/verify`, `/add`, `/remove`, `/suggest_sell`, `/audit_weekly`, `/audit_monthly`, `/news`, `/help`).
-- **Logs** every command for post-mortem accuracy review (`/audit_weekly` correlates past `/verify` and `/add` calls against actual price moves, with Gemini explaining the catalysts).
-
-See [`docs/ARCHITECTURE_V6.md`](docs/ARCHITECTURE_V6.md) for the deeper system design.
+> **Status:** research/production hybrid. Read **§7 Known Limitations &
+> Honest Caveats** before trusting any number in this document — every
+> headline metric there is annotated with its sample size and regime.
 
 ---
 
-## Quick start (< 5 minutes)
+## 1. System Overview
 
-```bash
-# 1. Clone and enter the project
-git clone <repo-url> stock_price_v3
-cd stock_price_v3
-
-# 2. Create venv and install dependencies (see Dependencies section below)
-python3.11 -m venv .venv
-source .venv/bin/activate           # Windows: .venv\Scripts\activate
-pip install -U pip
-pip install -r requirements.txt     # see "Dependencies" if file is missing
-
-# 3. Configure env — copy template and fill in your keys
-cp .env.example .env
-# Edit .env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GEMINI_API_KEY
-
-# 4. (Cold-start only) crawl historical OHLCV — outside market hours
-python -X utf8 main.py --task crawl_hose --force-crawl
-
-# 5. (Cold-start only) build Alpha360 features
-python -X utf8 main.py --task build_alpha360
-
-# 6. (Cold-start only) train the Stacking GBDT model
-python -X utf8 -m src.models.stacking_model.train_stacking
-
-# 7. Run daily inference (no crawling, uses existing data)
-python -X utf8 main.py --task daily_inference
-
-# 8. (Long-running) Start the interactive Telegram bot
-python -X utf8 run_bot.py
+```
+ OHLCV (vnstock) ┐
+ Macro (yfinance) ├─► DuckDB ─► Feature Pipelines ─┬─► 5d Stacking (trend)
+ News (GNews/RSS) ┘                                 └─► MR LightGBM (capitulation)
+                                                            │
+                                          Gemini sentiment (catalyst/risk)
+                                                            │
+                                   Telegram bot · role routing · oversight
 ```
 
-> **Windows users:** always use `python -X utf8` to avoid `UnicodeEncodeError` from
-> emoji in Vietnamese output.
+Two models run **in parallel** on every relevant command. They are
+deliberately **not blended** — they fire in opposite regimes:
 
----
-
-## Telegram bot commands
-
-Once `run_bot.py` is running and you've messaged the bot:
-
-| Command | What it does |
-|---|---|
-| `/help` (or `/start`) | Show the command menu |
-| `/suggest_buy` | Run the full pipeline; reply with Top-3 BUY signals (Quant + Sentiment). 30s per-user cooldown. |
-| `/suggest_sell` | BÁN / GIỮ recommendation for every ticker in your `portfolio` |
-| `/verify <ticker>` | Ad-hoc 5d Quant + LLM Sentiment verdict on one ticker (e.g. `/verify HPG`). 30s cooldown. |
-| `/add <ticker> <volume> <price>` | Add a position to your personal portfolio |
-| `/remove <ticker>` | Remove every lot of that ticker from your portfolio |
-| `/audit_weekly` / `/audit_monthly` | Post-mortem: actual % return + Gemini-explained catalyst for every `/verify` and `/add` you made in the last 7 / 30 days |
-| `/news` | The 20 most recent items from the configured Vietnamese RSS feeds |
-
-All replies use Telegram HTML mode (`<b>`, `<i>`, `<code>`). Per-user data isolation
-is enforced at the DB layer: each user only ever sees their own portfolio + audit
-history.
-
----
-
-## CLI tasks (`main.py`)
-
-```bash
-python -X utf8 main.py --task <task-name> [options]
-```
-
-| Task | Purpose | When to run |
+| | When it acts | Role |
 |---|---|---|
-| `daily_inference` *(default)* | Live pipeline: load features → predict → arbitrate → dispatch Telegram alerts | Daily, ~16:00 ICT via cron |
-| `crawl_hose` | Crawl OHLCV for the full HOSE universe | Cold-start only, or `--force-crawl` after market close |
-| `build_alpha360` | Rebuild `data/alpha360_features.parquet` from the full DuckDB | After a full historical re-crawl |
-| `full_pipeline` | All of the above in sequence | Weekly / monthly retrain cycle |
-
-Useful options: `--window-rows N` (per-ticker tail rows for live inference, default 120),
-`--max-candidates N` (Top-N pool sent to the arbitrator, default 6),
-`--force-crawl` (bypass the 15:00 market-close guard).
+| **Alpha360 5d Stacking** | Established up-trends | Trend / momentum continuation |
+| **MR Knife-Catcher** | Extreme panic / capitulation | Mean-reversion V-bottom alert |
 
 ---
 
-## Architecture at a glance
+## 2. Core Models
 
-```text
-┌─────────────┐    ┌──────────────┐    ┌───────────────┐    ┌────────────────┐
-│ vnstock 4.x │───>│  DuckDB      │───>│ Alpha360      │───>│ Stacking GBDT  │
-│ yfinance    │    │  + parquet   │    │ (Polars +     │    │ (5d + 20d)     │
-│             │    │              │    │  60 lags)     │    │                │
-└─────────────┘    └──────────────┘    └───────────────┘    └────────┬───────┘
-                          ▲                                          │
-                          │                                          v
-                   ┌──────┴───────┐    ┌────────────────┐    ┌───────────────┐
-                   │ Audit log    │    │ News scraper   │───>│ Gemini 2.5    │
-                   │ Portfolio    │    │ (5 VN portals  │    │ Flash         │
-                   │ Trade history│    │  in parallel)  │    │ (Sentiment +  │
-                   │ RL log       │    │                │    │  Reasoning)   │
-                   └──────────────┘    └────────────────┘    └───────┬───────┘
-                          ▲                                          │
-                          │            ┌────────────────┐            │
-                          └────────────┤  Arbitrator    │<───────────┘
-                                       │  (Top-6 → 3)   │
-                                       └────────┬───────┘
-                                                │
-                                                v
-                                       ┌─────────────────┐
-                                       │ Telegram bot    │
-                                       │ (run_bot.py)    │
-                                       └─────────────────┘
-```
+### 2.1 Alpha360 — 5d Stacking Ensemble (Trend-Following)
 
-Full sequencing, leak-prevention rules, and quant decisions are in
-[`docs/ARCHITECTURE_V6.md`](docs/ARCHITECTURE_V6.md).
+- **Architecture:** XGBoost + LightGBM + CatBoost → LightGBM meta-learner.
+- **Features:** Microsoft-Qlib-style Alpha360 (60-bar rolling-Z OHLCV lags)
+  + real macro (S&P500, DXY, USD/VND log-returns, 2014→2026) + per-ticker
+  LLM sentiment.
+- **Labels:** de Prado **volatility-scaled triple-barrier** with intrabar
+  touch detection and a conservative same-bar tie-break (ambiguous → DOWN).
+- **Validation:** **PurgedKFold** (purge + embargo ≥ horizon) — zero
+  label-window leakage. Selection metric is **cost-aware Net Sharpe**, not
+  macro-F1 (0.8% round-trip VN friction baked in).
+- **Decision:** primary side + a **meta-labeler** that must independently
+  predict the trade is profitable net of cost.
+- **OOS backtest (2024-01-01 → 2026-05-15, leak-free):** at the
+  Sharpe-optimal threshold ≈ **+4.6 Net Sharpe, ~85% hit, ~54 trades / 2y**.
+  **Deployed** at the operator-chosen `τ* = 0.48` (≈15 trades/mo) →
+  **+3.25 Net Sharpe @ the conservative 0.8% cost, ~73% hit**. *(Sample is
+  small — see §7.)*
 
----
+### 2.2 MR Knife-Catcher — Single LightGBM (Mean-Reversion)
 
-## Directory layout
-
-```text
-stock_price_v3/
-├── main.py                       # CLI orchestration + crash alerter
-├── run_bot.py                    # Telegram bot entrypoint (systemd-friendly)
-├── config/
-│   ├── settings.py               # CONFIG dataclasses
-│   └── settings.json             # User overrides
-├── src/
-│   ├── data/
-│   │   ├── db_engine.py          # DuckDB singleton, schema, migrations
-│   │   └── crawlers.py           # StockCrawler (vnstock) + MacroCrawler (yfinance/TE)
-│   ├── features/
-│   │   └── alpha360_generator.py # Polars rolling-Z-score lag matrix builder
-│   ├── models/
-│   │   ├── stacking_model/
-│   │   │   └── train_stacking.py # 3-base + logistic-meta trainer
-│   │   └── quant_agent_arbitrator.py  # Async news scrape + Gemini + Top-6→3
-│   ├── crawlers/
-│   │   └── sentiment_crawler.py  # Historical LLM-labelled sentiment archive
-│   ├── trading/
-│   │   └── portfolio_manager.py  # Unified `portfolio` table (cron + bot users)
-│   ├── rl/
-│   │   └── trading_env.py        # RL env scaffolding (Phase-3, WIP)
-│   └── utils/
-│       ├── telegram_bot.py       # Long-running bot: handlers, rate limiter
-│       ├── telegram_alerter.py   # One-shot push alerter (cron path)
-│       ├── audit_evaluator.py    # /audit_weekly + /audit_monthly engine
-│       └── logging_utils.py      # RotatingFileHandler factories (10 MiB × 5)
-├── data/
-│   ├── quant_v6_core.duckdb      # Single source of truth (OHLCV, macro, portfolio, audit, RL)
-│   ├── ohlcv_<TICKER>.parquet    # Per-ticker historical parquet (one per HOSE symbol)
-│   ├── macro_daily.parquet       # Wide-format global + VN macro
-│   └── alpha360_features.parquet # Full training matrix
-├── models/stacking/
-│   ├── 5d/                       # selected_features.json, scaler.joblib, xgboost/lightgbm/catboost/meta artifacts
-│   └── 20d/
-├── logs/                         # Rotating: quant_v6.log, crawler_errors.txt (10 MiB × 5)
-├── backups/                      # Daily DuckDB cp backups (14-day retention)
-├── deploy/
-│   └── quant-v6-bot.service      # systemd unit
-├── scripts/
-│   └── backup_db.sh              # Cron-friendly daily DB backup
-├── docs/
-│   ├── ARCHITECTURE_V6.md        # System design + leak-prevention rules
-│   └── RUNBOOK.md                # Operational procedures (planned, see TD-39)
-├── AUDIT_REPORT.md               # Historical tech-debt audits
-└── .env.example                  # Required env var template
-```
+- **Why separate:** a reversal audit proved the 5d stack is ~81%
+  price-momentum and structurally blind to V-bottoms. The MR model uses a
+  **dedicated oversold feature set** (`src/features/mr_features.py`):
+  distance-to-MA, Bollinger %B / lower-band pierce, RSI(9/14), Williams %R,
+  normalized ATR, overnight gap — pure-vectorized, leak-audited.
+- **Label:** capitulation = `+3% / 3-bar bounce` **AND** a panic setup at
+  *t* (RSI9<20 ∨ below-lower-BB ∨ DMA20<−5%). Genuinely rare (~4% train).
+- **Imbalance:** `scale_pos_weight`, shallow regularized trees.
+- **Threshold:** intentionally **strict `τ* = 0.96`** (high precision, low
+  recall — fire only on absolute panic).
+- **Hold-out (untouched last year):** **64% precision** on **14 fires**
+  (~1 signal/month universe-wide), `avg_precision` ≈ 0.33 (~13× base-rate
+  lift). A rare high-conviction safety-net, **not** a continuous strategy
+  (see §7).
 
 ---
 
-## Configuration
+## 3. Telegram Features & Roles
 
-### Required environment variables (`.env`)
+Two tenants, configured in `.env` (`TELEGRAM_CHAT_ID_1` = Admin,
+`TELEGRAM_CHAT_ID_2` = User):
 
-```bash
-# Telegram bot (single bot, comma-separated chat IDs for multi-recipient pushes)
-TELEGRAM_BOT_TOKEN=123456:ABCdef...
-TELEGRAM_CHAT_ID=123456789,987654321
-
-# Google Gemini (https://aistudio.google.com/apikey)
-GEMINI_API_KEY=AIza...
-GEMINI_MODEL=gemini-flash-latest      # optional override
-```
-
-A template lives in [`.env.example`](.env.example).
-
-### Code-level configuration (`config/settings.py`)
-
-Trading thresholds (`stop_loss_pct`, `take_profit_pct`, `virtual_allocation_per_ticker`),
-crawler throttles, model hyperparameters, sentiment LLM settings — all defined as
-typed dataclasses in `config/settings.py`. Override at runtime by editing
-`config/settings.json` (auto-loaded by `Config.from_json`).
-
----
-
-## Operations
-
-### Production deployment
-
-The bot is designed to run as a systemd service. Unit file in
-[`deploy/quant-v6-bot.service`](deploy/quant-v6-bot.service). Quick install
-(operator runbook will live at `docs/RUNBOOK.md`):
-
-```bash
-sudo cp deploy/quant-v6-bot.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now quant-v6-bot.service
-sudo systemctl status quant-v6-bot.service
-journalctl -u quant-v6-bot.service -f
-```
-
-### Daily cron schedule (recommended)
-
-| Time (ICT) | Command | Purpose |
+| Capability | Admin (ID 1) | User (ID 2) |
 |---|---|---|
-| **16:00** | `python -X utf8 main.py --task daily_inference` | Live inference after market close (15:00 guard ensures the daily candle is closed) |
-| **23:00** | `scripts/backup_db.sh` | DuckDB backup, 14-day retention |
-| Weekly | Manual full_pipeline + retrain | Recommend Sunday morning before market opens Monday |
+| Analytical commands | ✅ | ✅ |
+| Portfolio mutation (`/add`, `/remove`) | ✅ | ❌ blocked (polite VN) |
+| Unknown sender | — | ❌ denied |
 
-### Logs
+### Commands
 
-- `logs/quant_v6.log` — Main application log, rotated (10 MiB × 5 backups → max 60 MiB)
-- `logs/crawler_errors.txt` — Per-ticker crawler failures (rotated, same policy)
-- `/var/log/quant-v6-bot.log` (when running under systemd) — stdout/stderr capture
-- `journalctl -u quant-v6-bot.service` — systemd-level events
-
-### Backups & restore
-
-```bash
-# Backup (automated daily)
-scripts/backup_db.sh
-
-# Restore (stop the bot first)
-sudo systemctl stop quant-v6-bot.service
-cp backups/quant_v6_core_YYYYMMDD.duckdb data/quant_v6_core.duckdb
-sudo systemctl start quant-v6-bot.service
-```
-
----
-
-## Dependencies
-
-Python 3.11 is required. There is **no `requirements.txt` at the project root yet**
-(open tech-debt item) — install the dependency set manually:
-
-```bash
-pip install \
-  "python-telegram-bot[job-queue]>=20.7" \
-  duckdb \
-  polars \
-  pandas \
-  numpy \
-  scikit-learn \
-  xgboost \
-  lightgbm \
-  catboost \
-  joblib \
-  vnstock \
-  yfinance \
-  cloudscraper \
-  requests \
-  beautifulsoup4 \
-  feedparser \
-  gnews \
-  googlenewsdecoder \
-  aiohttp \
-  google-genai \
-  python-dotenv \
-  tqdm
-```
-
-> **GPU note:** XGBoost / LightGBM / CatBoost are configured for CUDA in
-> `train_stacking.py`. If you don't have a GPU, edit the `build_base_models()`
-> block to swap `device="cuda"` → `device="cpu"` (tracked as TD-10).
-
----
-
-## Development
-
-### Code style
-
-No formatter is currently enforced. The codebase follows informal Black + isort
-conventions with type hints throughout. **No CI / pre-commit hooks yet** (open
-tech-debt item TD-32 — planned).
-
-### Tests
-
-**Currently no test suite** (open tech-debt item TD-17). Verification has been
-done via sandbox dry-runs inside development sessions. Adding `tests/` with
-pytest is on the immediate roadmap — covering the rate limiter, RL backfill,
-portfolio isolation, audit evaluator, news diversity selector, and DuckDB
-schema migrations is the highest-leverage starting set.
-
-### Running a smoke check
-
-```bash
-# 1. Syntax sanity across the main modules
-python -X utf8 -c "
-import ast
-for p in ['main.py', 'run_bot.py', 'src/data/db_engine.py',
-          'src/utils/telegram_bot.py', 'src/models/quant_agent_arbitrator.py',
-          'src/features/alpha360_generator.py']:
-    ast.parse(open(p, encoding='utf-8').read())
-    print('OK', p)
-"
-
-# 2. Crash-alert dry-run (mock token, no network)
-TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN python -X utf8 -c "
-import traceback
-from main import _send_crash_alert
-try: raise ValueError('smoke-check')
-except ValueError as e: _send_crash_alert('smoke', e, traceback.format_exc())
-"
-
-# 3. DuckDB schema + migration smoke
-python -X utf8 -c "
-from src.data.db_engine import DuckDBEngine
-db = DuckDBEngine()
-print('tables:', db.conn.execute('SHOW TABLES').fetchall())
-"
-```
-
----
-
-## Further reading
-
-| Doc | Purpose |
+| Command | Description |
 |---|---|
-| [`docs/ARCHITECTURE_V6.md`](docs/ARCHITECTURE_V6.md) | Full system design — leak-prevention rules, model decisions, data flow |
-| `docs/RUNBOOK.md` *(planned)* | Operational procedures: deploy, restore, incident response, escalation |
-| [`AUDIT_REPORT.md`](AUDIT_REPORT.md) | Historical tech-debt audits |
-| [`.env.example`](.env.example) | Required env vars (copy to `.env` and fill in) |
-| [`deploy/quant-v6-bot.service`](deploy/quant-v6-bot.service) | systemd unit |
+| `/suggest_buy` | Dual-model: candidates tagged `[📈 ĐÁNH TREND]` (5d) / `[🔪 BẮT ĐÁY]` (MR). Weak-market fallback returns a flagged monitoring-only report. |
+| `/suggest_sell` | Per-holding sell/hold + 🎯 target / 🛡️ stop. **MR Veto:** if trend says SELL but MR fires → prominent *"đừng bán đúng đáy"* warning. |
+| `/verify <TICKER>` | Dual output: trend odds (Cửa Tăng/Đi Ngang/Giảm) **and** `🔪 Trạng thái Bắt đáy` (Chưa đạt / CẢNH BÁO HOẢNG LOẠN). |
+| `/feedback <msg>` | User → Admin direct channel. |
+| `/msg_id2 <msg>` | **Admin-only**, hidden from menu/help. Broadcast `📢 [THÔNG BÁO TỪ ADMIN]` to the User. Silent-ignore for anyone else. |
+| `/news`, `/rebalance`, `/help` | Market news / AI rebalance / menu (with privacy disclosure). |
+
+All user-facing text is **plain Vietnamese, jargon-free** (no `τ*`,
+"meta-labeler", "Stacking", etc.).
 
 ---
 
-## Known gaps / tech debt
+## 4. Oversight & Retraining
 
-These items are tracked in audit reports and recent work is ongoing. Major open
-items at the time of this README:
-
-- **No `requirements.txt`** — install list above must be kept in sync manually.
-- **No automated tests** — TD-17, highest long-term risk.
-- **VN macro features (`vnibor`, `inflation_yoy`)** — columns exist in `macro_daily`
-  but are not populated. Both upstream sources (vnstock 4.x money-market API, and
-  `markets.tradingeconomics.com` DNS) are unavailable from VN ISPs. Tracked as TD-25.
-- **No CI / pre-commit** — TD-32.
-- **Architecture doc** is from before the Telegram bot / audit log / RL backfill /
-  portfolio merge work — partial refresh pending.
-
-The active tech-debt log lives in the latest audit at the top of
-[`AUDIT_REPORT.md`](AUDIT_REPORT.md).
+- **Invisible oversight gate** (`group=-1` pre-dispatch handler): every
+  ID2 command is shadow-copied to ID1 (request + the full response), with
+  a disclosure line in `/help` (consented monitoring of a known user on an
+  owner-operated financial bot).
+- **`/audit_weekly` · `/audit_monthly` dual-routing:**
+  - **User:** identical plain-VN performance post-mortem (wins/losses with
+    LLM-written catalyst explanations). **No** retrain.
+  - **Admin:** same report **+** instant *"đang retrain dưới nền…"* reply
+    **+** non-blocking background **rolling re-fit** of the MR sub-model
+    (`src/scripts/audit_and_retrain.py`, ~35s — bounded; the heavy 5d
+    stacking retrain is intentionally *not* per-audit) **+** a completion
+    summary pushed to Admin. Runs via `asyncio.to_thread` — the event loop
+    never blocks.
 
 ---
 
-## License / contributing
+## 5. Sentiment Engine
 
-Not yet specified. Private project for now. If you've been granted access and want
-to contribute: open a PR with a clear description of the change, run the smoke
-checks above, and tag the maintainer.
+- **Gemini LLM** (`GEMINI_MODEL`, default GA `gemini-2.5-flash`) produces
+  per-ticker **catalyst / risk / Vietnamese reasoning** + sentiment score.
+- **Schema auto-normalization:** tolerates dict-keyed, list-of-objects,
+  wrapped, and single-object JSON shapes (the original `"Lỗi gọi API"`
+  outage was a deterministic list-vs-dict parse bug, now fixed).
+- **Transient-only exponential backoff** (2→3→5s) on 429/5xx/timeout;
+  permanent errors (bad key/4xx) fail fast. Exhausted retries → a polite
+  VN fallback, never a raw stack trace.
+- **Source attribution:** top-2 article links rendered inline
+  (`🔗 Nguồn báo: <a>Bài viết 1</a> | <a>Bài viết 2</a>`).
+
+---
+
+## 6. Setup
+
+```bash
+pip install python-telegram-bot lightgbm xgboost catboost polars duckdb \
+            pandas numpy scikit-learn google-genai gnews feedparser \
+            vnstock yfinance joblib python-dotenv psutil
+cp .env.example .env   # set GEMINI_API_KEY, TELEGRAM_BOT_TOKEN,
+                       # TELEGRAM_CHAT_ID_1 (Admin), TELEGRAM_CHAT_ID_2 (User)
+python run_bot.py      # starts the polling bot
+```
+
+Offline pipeline: `python main.py --task build_alpha360` →
+`python -m src.models.stacking_model.train_stacking` (5d) ·
+`python -m src.models.train_mr_lgbm` (MR) ·
+`python backfill_context_data.py` (macro + sentiment).
+
+---
+
+## 7. Known Limitations & Honest Caveats
+
+*This section is deliberate. Numbers above are real but small-sample —
+deploy with eyes open.*
+
+1. **5d hit-rate is regime- and threshold-dependent.** "~85%" is the
+   Sharpe-optimal OOS config over only **~54 trades / 2 years**. Deployed
+   `τ*=0.48` trades ~15×/month at ~73% hit. Confidence intervals are wide;
+   it is a **selective, low-frequency** strategy, not an always-on engine.
+2. **MR fires ~1×/month universe-wide** (hold-out precision 64% on
+   **n=14**). Statistically fragile; treat as a rare capitulation *alert*,
+   not a return source. It will **not** ride most V-recoveries.
+3. **Sentiment is shallow historically.** The historical sentiment
+   backfill covers only ~1 week — the 5d model's edge is **macro-driven**;
+   sentiment mainly improves *live* inference, not the trained weights.
+4. **VN macro gaps.** `interbank_on_rate`/`vnibor` are NULL (SBV +
+   TradingEconomics DNS-blocked from VN ISPs); the model runs on
+   S&P500/DXY/USD-VND log-returns.
+5. **Upstream API capacity.** `gemini-flash-latest` showed intermittent
+   503 "high demand"; pinned to GA `gemini-2.5-flash`. Sustained Google
+   spikes still surface the polite fallback (by design — sentiment is
+   never faked).
+6. **Model artifacts are git-ignored** (`models/stacking/`, `models/mr/`)
+   — regenerable from the training scripts; not version-controlled.
+
+---
+
+## 8. Repository Layout
+
+```
+main.py                              CLI orchestrator + live inference + Telegram report builders
+run_bot.py                           Bot entrypoint (polling)
+config/settings.{py,json}            Typed config (split-date, costs, universe filter, Gemini model)
+src/features/alpha360_generator.py   Alpha360 + macro/sentiment integration (leak-guarded)
+src/features/triple_barrier.py       Vol-scaled triple-barrier (intrabar, conservative tie-break)
+src/features/mr_features.py          Mean-reversion oversold feature set
+src/models/stacking_model/           5d stack: train_stacking, purged_kfold, economic_metrics
+src/models/train_mr_lgbm.py          MR knife-catcher trainer
+src/models/quant_agent_arbitrator.py News scrape + Gemini sentiment (schema-normalized, backoff)
+src/utils/telegram_bot.py            Handlers, role routing, oversight gate, dual-audit
+src/utils/telegram_alerter.py        Plain-VN message formatter + source links
+src/scripts/audit_and_retrain.py     Bounded background rolling re-fit (admin)
+backfill_context_data.py             Macro + LLM-sentiment backfill
+```
