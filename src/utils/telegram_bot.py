@@ -40,9 +40,11 @@ from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    ApplicationHandlerStop,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -192,6 +194,29 @@ async def _send_or_reply_chunks(
     """Edit `wait_msg` in place if 1 chunk, else delete it and post fresh replies."""
     if not chunks:
         return
+
+    # 1-way oversight: mirror the FULL response to the Admin (ID1) whenever
+    # the requester is the monitored User (ID2). Runs before the user-facing
+    # delivery branches so it fires for both the single-edit and multi-chunk
+    # paths. Best-effort — a mirror failure never affects the user reply.
+    if ADMIN_CHAT_ID and _role_for(update) == "user":
+        try:
+            _bot = update.get_bot()
+            await _bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text="👁️ <b>[GIÁM SÁT] Bản sao phản hồi gửi cho người dùng:</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            for _c in chunks:
+                await _bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=_c,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("[Oversight] response mirror failed: %s", exc)
+
     if len(chunks) == 1 and wait_msg is not None:
         try:
             await wait_msg.edit_text(
@@ -275,6 +300,109 @@ def _extract_user_id(update: Update) -> str | None:
     if update.effective_user is not None:
         return str(update.effective_user.id)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Split-ID access control + 1-way admin oversight
+# ---------------------------------------------------------------------------
+# .env defines TELEGRAM_CHAT_ID_1 (Admin) and TELEGRAM_CHAT_ID_2 (User).
+# In a Telegram private chat the requester user_id == chat_id, so we match
+# on the requester id. ID1 = full access. ID2 = analytical/read-only, BLOCKED
+# from portfolio-mutating commands. Every ID2 command (request + response)
+# is shadow-copied to ID1 for real-time oversight.
+ADMIN_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID_1") or "").strip()
+USER_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID_2") or "").strip()
+_EDIT_ONLY_COMMANDS = {"add", "remove"}  # portfolio mutation → ADMIN only
+_PERMISSION_DENIED_VI = (
+    "🚫 Bạn không có quyền thực hiện tính năng chỉnh sửa danh mục này."
+)
+_ACCESS_DENIED_VI = (
+    "🚫 Tài khoản của bạn chưa được cấp quyền sử dụng bot này."
+)
+
+
+def _role_for(update: Update) -> str:
+    """'admin' (ID1), 'user' (ID2), or 'unknown'."""
+    uid = _extract_user_id(update)
+    if uid and ADMIN_CHAT_ID and uid == ADMIN_CHAT_ID:
+        return "admin"
+    if uid and USER_CHAT_ID and uid == USER_CHAT_ID:
+        return "user"
+    return "unknown"
+
+
+def _command_of(update: Update) -> str:
+    """Bare command name from the message text ('/add@Bot x' -> 'add')."""
+    txt = (update.message.text if update.message and update.message.text else "") or ""
+    if not txt.startswith("/") or len(txt) < 2:
+        return ""
+    return txt[1:].split("@")[0].split()[0].lower()
+
+
+async def _notify_admin(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Fire-and-forget oversight message to ID1. Never raises/blocks."""
+    if not ADMIN_CHAT_ID:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("[Oversight] admin notify failed: %s", exc)
+
+
+async def _oversight_gate(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """group=-1 pre-dispatch gate, runs BEFORE every command handler.
+
+    • unknown id      → polite VN denial, stop pipeline.
+    • ID2 (user)      → shadow the REQUEST to ID1; if the command mutates
+                         the portfolio (/add,/remove) deny + stop.
+    • ID1 (admin)     → full access, no shadowing.
+
+    Raising ApplicationHandlerStop prevents the real handler from running
+    when access is denied. The RESPONSE copy for ID2 is mirrored centrally
+    in `_send_or_reply_chunks` (covers the analytical command outputs).
+    """
+    if update.message is None or not (update.message.text or "").startswith("/"):
+        return
+
+    role = _role_for(update)
+    cmd = _command_of(update)
+
+    if role == "unknown":
+        try:
+            await update.message.reply_text(
+                _ACCESS_DENIED_VI, parse_mode=ParseMode.HTML
+            )
+        finally:
+            raise ApplicationHandlerStop
+
+    if role == "user":
+        uid = _extract_user_id(update) or "?"
+        raw = (update.message.text or "").strip()
+        await _notify_admin(
+            context,
+            f"👁️ <b>[GIÁM SÁT]</b> Người dùng "
+            f"<code>{html.escape(uid)}</code> vừa gọi: "
+            f"<code>{html.escape(raw)}</code>",
+        )
+        if cmd in _EDIT_ONLY_COMMANDS:
+            await update.message.reply_text(
+                _PERMISSION_DENIED_VI, parse_mode=ParseMode.HTML
+            )
+            await _notify_admin(
+                context,
+                f"⛔ <b>[GIÁM SÁT]</b> Đã CHẶN lệnh "
+                f"<code>/{html.escape(cmd)}</code> của người dùng "
+                f"(không có quyền chỉnh sửa danh mục).",
+            )
+            raise ApplicationHandlerStop
+    # role == "admin": full access, no shadow, fall through.
 
 
 # ---------------------------------------------------------------------------
@@ -962,6 +1090,11 @@ def build_application() -> Application:
         )
 
     app = ApplicationBuilder().token(token).post_init(_set_bot_commands).build()
+
+    # --- Phase 0: split-ID access control + 1-way oversight (runs FIRST) ---
+    # group=-1 → evaluated before any CommandHandler. Denies unknown ids,
+    # blocks ID2 from /add,/remove, and shadow-copies ID2 activity to ID1.
+    app.add_handler(TypeHandler(Update, _oversight_gate), group=-1)
 
     # --- Phase 1 ---
     app.add_handler(CommandHandler("help", help_command))

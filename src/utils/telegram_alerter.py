@@ -54,10 +54,21 @@ def _domain_label(url: str) -> str:
 class TelegramBot:
     def __init__(self) -> None:
         self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
-        chat_ids = os.getenv("TELEGRAM_CHAT_ID", "").split(",")
-        self.chat_id_list = [
-            c.strip() for c in chat_ids if c.strip() and c.strip() != "YOUR_CHAT_ID"
-        ]
+        # Split-ID env (TELEGRAM_CHAT_ID_1 = Admin, _2 = User). Both receive
+        # system broadcasts; legacy comma-separated TELEGRAM_CHAT_ID is kept
+        # as a fallback for older deployments.
+        ids: list[str] = []
+        for _k in ("TELEGRAM_CHAT_ID_1", "TELEGRAM_CHAT_ID_2"):
+            _v = (os.getenv(_k) or "").strip()
+            if _v and _v != "YOUR_CHAT_ID":
+                ids.append(_v)
+        if not ids:
+            ids = [
+                c.strip()
+                for c in os.getenv("TELEGRAM_CHAT_ID", "").split(",")
+                if c.strip() and c.strip() != "YOUR_CHAT_ID"
+            ]
+        self.chat_id_list = ids
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
 
     # ------------------------------------------------------------------
