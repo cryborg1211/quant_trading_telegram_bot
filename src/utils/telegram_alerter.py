@@ -51,6 +51,24 @@ def _domain_label(url: str) -> str:
     return next((v for k, v in _DOMAIN_LABELS.items() if k in domain), domain or "Nguồn")
 
 
+def format_source_links(urls: list[str] | None, limit: int = 2) -> str:
+    """One-line clickable source attribution for the Telegram cards.
+
+    Top `limit` (default 2) URLs →
+    '🔗 <b>Nguồn báo:</b> <a href="U1">Bài viết 1</a> | <a href="U2">Bài viết 2</a>'
+    href is attribute-escaped (quote=True). Shared by the normal
+    /suggest_buy card AND the fallback report (single source of truth).
+    """
+    clean = [u.strip() for u in (urls or []) if isinstance(u, str) and u.strip()][:limit]
+    if not clean:
+        return "🔗 <b>Nguồn báo:</b> <i>Chưa có liên kết tham khảo</i>"
+    parts = [
+        f'<a href="{html.escape(u, quote=True)}">Bài viết {i}</a>'
+        for i, u in enumerate(clean, 1)
+    ]
+    return "🔗 <b>Nguồn báo:</b> " + " | ".join(parts)
+
+
 class TelegramBot:
     def __init__(self) -> None:
         self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
@@ -136,14 +154,7 @@ class TelegramBot:
             signal_data.get("gemini_summary", "Chưa có dữ liệu tin tức."),
         )
 
-        article_urls: list[str] = signal_data.get("article_urls", []) or []
-        if article_urls:
-            url_lines = "\n".join(
-                f"  • [{html.escape(_domain_label(u))}] {html.escape(u)}"
-                for u in article_urls[:3]
-            )
-        else:
-            url_lines = "  • Không có tin tức đáng kể."
+        source_line = format_source_links(signal_data.get("article_urls", []) or [])
 
         trend_block = "\n".join(trend_lines)
         return (
@@ -159,8 +170,8 @@ class TelegramBot:
             f"• 👍 <b>Điểm cộng:</b> {plus}\n"
             f"• 👎 <b>Điểm trừ:</b> {minus}\n"
             f"• 📌 <b>Kết luận:</b> {conclusion}\n"
-            f"\n"
-            f"🔗 <b>Nguồn tham khảo:</b>\n{url_lines}\n"
+            f"{source_line}\n"
+            f"\n"  # clean double newline — never collides with footers
         )
 
     # ------------------------------------------------------------------

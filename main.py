@@ -33,7 +33,7 @@ from src.models.quant_agent_arbitrator import (
     scrape_centralized_news,
 )
 from src.trading.portfolio_manager import PortfolioManager
-from src.utils.telegram_alerter import TelegramBot
+from src.utils.telegram_alerter import TelegramBot, format_source_links
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 # OHLCV crawl guard: 15:00 ICT.
@@ -1086,8 +1086,14 @@ def _build_fallback_observability_report_vi(
                if mr.get("fired") else ""),
             f"   • <b>Lý do:</b> {html.escape(why)}",
             f"   • <b>Tin tức &amp; Tâm lý:</b> {html.escape(str(reason_vi))[:500]}",
+            f"   • {format_source_links(s.get('source_urls', []) or [])}",
             "",
         ]
+    # Fix the footer-collision bug: guarantee exactly ONE blank line
+    # (clean \n\n) between the last sentiment block and the footer.
+    while out and out[-1] == "":
+        out.pop()
+    out.append("")
     out.append(
         "<i>Đây là chế độ theo dõi khi thị trường yếu — KHÔNG phải khuyến "
         "nghị MUA. Hệ thống sẽ tự động báo khi có điểm mua an toàn.</i>"
