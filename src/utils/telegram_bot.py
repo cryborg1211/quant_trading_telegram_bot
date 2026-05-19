@@ -27,10 +27,12 @@ import html
 import logging
 import os
 import re
+import subprocess
 import sys
 import threading
 import time as _time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -915,6 +917,55 @@ async def news_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text(chunk)
 
 
+async def _admin_retrain_task(update: Update) -> None:
+    """Non-blocking rolling-retrain for the ADMIN audit flow.
+
+    Runs ``src/scripts/audit_and_retrain.py`` in a worker thread (via
+    ``asyncio.to_thread`` — keeps the event loop fully responsive and is
+    Windows-safe vs. event-loop subprocess transports), then pushes a
+    plain-VN completion summary to ID1.
+    """
+    bot = update.get_bot()
+
+    async def _to_admin(text: str) -> None:
+        if not ADMIN_CHAT_ID:
+            return
+        try:
+            await bot.send_message(
+                chat_id=ADMIN_CHAT_ID, text=text,
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("[AdminRetrain] notify failed: %s", exc)
+
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "src/scripts/audit_and_retrain.py"],
+            capture_output=True, text=True, timeout=900,
+        )
+        rc = proc.returncode
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("[AdminRetrain] subprocess crashed")
+        await _to_admin(
+            f"❌ <b>[ADMIN] Luồng học lại lỗi:</b> "
+            f"<code>{html.escape(str(exc))}</code>"
+        )
+        return
+
+    summary = "Hoàn tất (không đọc được tóm tắt)."
+    try:
+        sp = Path("models/mr/last_retrain_summary.txt")
+        if sp.exists():
+            summary = sp.read_text(encoding="utf-8").strip() or summary
+    except Exception:  # noqa: BLE001
+        pass
+    head = "🤖 <b>[ADMIN] Luồng học lại cuốn chiếu đã xong</b>"
+    if rc != 0:
+        head = "🤖 <b>[ADMIN] Luồng học lại KẾT THÚC (có lỗi)</b>"
+    await _to_admin(f"{head}\n{html.escape(summary)}")
+
+
 async def _run_audit_command(
     update: Update,
     command_label: str,
@@ -980,6 +1031,22 @@ async def _run_audit_command(
         return
 
     await _send_or_reply_chunks(update, wait_msg, _split_html_report(report_html))
+
+    # ── DUAL-AUDIT ROUTING ───────────────────────────────────────────
+    # Both roles get the IDENTICAL post-mortem above. ADMIN (ID1) ALSO
+    # kicks off the rolling retrain in the background (non-blocking) and
+    # is notified on completion. USER (ID2) gets the report ONLY — no
+    # retrain. (Unknown ids never reach here — the group=-1 oversight
+    # gate already denied them.)
+    if _role_for(update) == "admin":
+        await update.message.reply_text(
+            "⏳ [ADMIN] Báo cáo hiệu suất đã gửi. Hệ thống đang kích hoạt "
+            "luồng học lại cuốn chiếu (Retrain) dưới nền, dự kiến hoàn "
+            "thành sau 1-2 phút...",
+        )
+        # Fire-and-forget: returns immediately, event loop stays free;
+        # the subprocess runs in a worker thread inside the task.
+        asyncio.create_task(_admin_retrain_task(update))
 
 
 async def audit_weekly_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
