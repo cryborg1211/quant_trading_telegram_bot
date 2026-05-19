@@ -350,7 +350,23 @@ async def suggest_buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if not report_html or not report_html.strip():
-        await wait_msg.edit_text(EMPTY_BUY_RESULT_MESSAGE, parse_mode=ParseMode.HTML)
+        # Task 2.3: when the pool is empty, append the 5d top-5 probability
+        # breakdown so the operator sees EXACTLY why the bot stayed quiet
+        # (which tickers were close, and whether τ* or the meta-gate blocked).
+        msg = EMPTY_BUY_RESULT_MESSAGE
+        try:
+            import main as _main  # noqa: PLC0415
+
+            lines = list(getattr(_main, "_LATEST_5D_BREAKDOWN", []))
+            if lines:
+                body = "\n".join(html.escape(ln) for ln in lines)
+                msg += (
+                    "\n\n🔎 <b>Vì sao bot im lặng — Top 5 (5d):</b>\n"
+                    f"<pre>{body}</pre>"
+                )
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed to attach 5d breakdown to empty reply")
+        await wait_msg.edit_text(msg, parse_mode=ParseMode.HTML)
         return
 
     await _send_or_reply_chunks(update, wait_msg, _split_html_report(report_html))

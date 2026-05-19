@@ -391,6 +391,12 @@ def load_stacking_artifacts(horizon: int) -> tuple[list[str], dict[str, Any], An
     return selected_features, quantile_thresholds, xgb_model, lgbm_model, cat_model, meta_model, meta_labeler
 
 
+# Task 2: most-recent 5d top-5 probability breakdown, populated by
+# predict_stacking_horizon and surfaced in the Telegram empty-pool reply
+# so the operator can see WHY the bot stayed quiet.
+_LATEST_5D_BREAKDOWN: list[str] = []
+
+
 def aligned_proba(model, x: np.ndarray) -> np.ndarray:
     probs = np.asarray(model.predict_proba(x), dtype=np.float32)
     classes = getattr(model, "classes_", np.array([0, 1, 2]))
@@ -453,6 +459,7 @@ def predict_stacking_horizon(latest_df, horizon: int) -> tuple[dict[str, list[fl
     tau_star = float(quantile_thresholds.get("pnl_threshold_tau", 0.5))
     has_tau = "pnl_threshold_tau" in quantile_thresholds
     p_up_arr = meta_probs[:, 2]
+    p_profit = None  # set only in the meta-labeled branch below
 
     if not has_tau:
         # Legacy artifact (pre-Task-2): preserve old behaviour — no gate.
@@ -488,6 +495,13 @@ def predict_stacking_horizon(latest_df, horizon: int) -> tuple[dict[str, list[fl
 
     meta_gate = {t: bool(g) for t, g in zip(tickers, gate_arr, strict=False)}
 
+    # Per-ticker P(profit) map (meta-labeled mode only) for the diagnostic.
+    pprofit_by_ticker: dict[str, float] = {}
+    if p_profit is not None:
+        pprofit_by_ticker = {
+            t: float(pp) for t, pp in zip(tickers, p_profit, strict=False)
+        }
+
     sorted_preds = sorted(predictions.items(), key=lambda x: x[1][2], reverse=True)
     top_10_str = " | ".join(
         f"{t}:{p[2]*100:.1f}%{'✓' if meta_gate.get(t) else '✗'}"
@@ -499,6 +513,35 @@ def predict_stacking_horizon(latest_df, horizon: int) -> tuple[dict[str, list[fl
         horizon, gate_mode, sum(meta_gate.values()), len(meta_gate),
         float(quantile_thresholds.get("round_trip_cost", 0.0)),
     )
+
+    # ── TASK 2: per-candidate 3-class breakdown for the TOP 5 ──────────
+    # Always logged regardless of gate pass, so the operator sees EXACTLY
+    # why the bot is quiet. Cached for the Telegram empty-pool message.
+    def _reason(tk: str, pu: float) -> str:
+        if not has_tau:
+            return "ACCEPTED (legacy, no gate)"
+        if pu < tau_star:
+            return f"REJECTED (P(UP)={pu*100:.1f}% < tau={tau_star:.2f})"
+        if meta_labeler is not None:
+            pp = pprofit_by_ticker.get(tk)
+            if pp is not None and pp < 0.5:
+                return (f"REJECTED (P(UP) ok, meta P(profit)="
+                        f"{pp*100:.1f}% < 50%)")
+        return f"ACCEPTED (P(UP)>=tau={tau_star:.2f}"+(
+            f", P(profit)={pprofit_by_ticker.get(tk,0)*100:.1f}%)"
+            if meta_labeler is not None else ")")
+
+    breakdown_lines: list[str] = []
+    for tk, pr in sorted_preds[:5]:
+        p_dn, p_sd, p_u = pr[0], pr[1], pr[2]
+        line = (f"{tk}: P(UP)={p_u*100:.1f}%, P(SIDE)={p_sd*100:.1f}%, "
+                f"P(DN)={p_dn*100:.1f}% | Gate: {_reason(tk, p_u)}")
+        breakdown_lines.append(line)
+        LOGGER.info("[StackingGBDT %sd][TOP5] %s", horizon, line)
+    if horizon == 5:
+        _LATEST_5D_BREAKDOWN.clear()
+        _LATEST_5D_BREAKDOWN.extend(breakdown_lines)
+
     return predictions, quantile_thresholds, xgb_model, selected_features, meta_gate
 
 
