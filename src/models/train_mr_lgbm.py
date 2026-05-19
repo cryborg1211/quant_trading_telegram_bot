@@ -114,16 +114,46 @@ def load_ohlcv() -> pd.DataFrame:
 
 
 def label_3d_bounce(df: pd.DataFrame) -> pd.DataFrame:
-    """Add target_return_3d, y (1 if >+3% in 3 bars), and t1 (event-end
-    date for PurgedKFold). Rows without a full +3-bar window are dropped.
+    """Genuine capitulation-bounce label = OUTCOME ∧ PANIC-SETUP-at-t.
+
+    y = 1  IFF
+        (1) 3-bar fwd return > +3%                        [the bounce], AND
+        (2) at least one panic condition is TRUE at t     [the setup]:
+              mr_rsi_9 < 20  OR  mr_bb_below_lower == 1  OR
+              mr_dma_sma20 < -0.05
+
+    Gating on the setup is what makes this a knife-catcher rather than a
+    momentum chaser (the design fix). The mr_* setup features are
+    backward-looking (audited in mr_features.py), so condition (2) uses
+    only data ≤ t — no leak. Requires build_mr_features() to have run.
+    Rows without a full +3-bar window are dropped (can't label / purge).
     """
+    need = {"mr_rsi_9", "mr_bb_below_lower", "mr_dma_sma20"}
+    if not need.issubset(df.columns):
+        raise ValueError(
+            f"label_3d_bounce needs MR setup columns {sorted(need - set(df.columns))}"
+            " — call build_mr_features(df) BEFORE labeling."
+        )
+
     df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
     g = df.groupby("ticker", sort=False, group_keys=False)
     fwd_close = g["close"].shift(-HORIZON)          # close[t+3]  (TARGET, not a feature)
     df["target_return_3d"] = fwd_close / df["close"] - 1.0
     df["t1"] = g["date"].shift(-HORIZON)            # date[t+3] — label-decided date
     df = df.dropna(subset=["target_return_3d", "t1"]).reset_index(drop=True)
-    df["y"] = (df["target_return_3d"] > BOUNCE_THRESHOLD).astype(np.int8)
+
+    # PANIC setup at t — NaN (warm-up) treated as "no panic" (False).
+    rsi9 = pd.to_numeric(df["mr_rsi_9"], errors="coerce")
+    bb_lo = pd.to_numeric(df["mr_bb_below_lower"], errors="coerce")
+    dma20 = pd.to_numeric(df["mr_dma_sma20"], errors="coerce")
+    panic = (
+        (rsi9 < 20.0).fillna(False)
+        | (bb_lo == 1.0).fillna(False)
+        | (dma20 < -0.05).fillna(False)
+    )
+
+    bounce = df["target_return_3d"] > BOUNCE_THRESHOLD
+    df["y"] = (bounce & panic).astype(np.int8)
     return df
 
 
