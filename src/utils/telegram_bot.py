@@ -1178,7 +1178,7 @@ async def msg_id2_command(
     if not msg:
         await update.message.reply_text(
             "Vui lòng nhập nội dung. Ví dụ: /msg_id2 Hệ thống vừa cập nhật "
-            "tính năng báo cáo mới!"
+            "tính năng mới nha!"
         )
         return
 
