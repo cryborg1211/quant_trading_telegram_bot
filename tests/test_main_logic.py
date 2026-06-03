@@ -21,7 +21,6 @@ from main import (
     _format_sentiment_status,
     _get_live_exec_prices,
     _humanize_feature,
-    aligned_proba,
     is_crawl_allowed,
 )
 
@@ -216,68 +215,9 @@ class TestGetLiveExecPrices:
 
 
 # ---------------------------------------------------------------------------
-# aligned_proba
+# (TestAlignedProba removed — `aligned_proba` was a V6 stacker orphan, purged
+#  in the V4 refactor.  The V4 3-class alignment lives in TabularEnsemble.)
 # ---------------------------------------------------------------------------
-
-def _mock_model(proba: list[list[float]], classes: list[int] | None = None) -> MagicMock:
-    """Build a minimal sklearn-style mock model."""
-    m = MagicMock()
-    m.predict_proba.return_value = np.array(proba, dtype=np.float32)
-    if classes is not None:
-        m.classes_ = np.array(classes)
-    else:
-        # Simulate a model that has no classes_ attribute.
-        del m.classes_
-    return m
-
-
-class TestAlignedProba:
-    def test_full_three_class_passthrough(self):
-        model = _mock_model([[0.1, 0.3, 0.6]], classes=[0, 1, 2])
-        x = np.zeros((1, 5), dtype=np.float32)
-        out = aligned_proba(model, x)
-        assert out.shape == (1, 3)
-        np.testing.assert_allclose(out[0], [0.1, 0.3, 0.6], atol=1e-6)
-
-    def test_missing_class_1_fills_zero(self):
-        # Model trained on only classes 0 and 2
-        model = _mock_model([[0.3, 0.7]], classes=[0, 2])
-        x = np.zeros((1, 5), dtype=np.float32)
-        out = aligned_proba(model, x)
-        assert out.shape == (1, 3)
-        np.testing.assert_allclose(out[0, 1], 0.0, atol=1e-6)
-        np.testing.assert_allclose(out[0, 0], 0.3, atol=1e-5)
-        np.testing.assert_allclose(out[0, 2], 0.7, atol=1e-5)
-
-    def test_missing_class_0_fills_zero(self):
-        model = _mock_model([[0.4, 0.6]], classes=[1, 2])
-        x = np.zeros((1, 5), dtype=np.float32)
-        out = aligned_proba(model, x)
-        np.testing.assert_allclose(out[0, 0], 0.0, atol=1e-6)
-        np.testing.assert_allclose(out[0, 1], 0.4, atol=1e-5)
-        np.testing.assert_allclose(out[0, 2], 0.6, atol=1e-5)
-
-    def test_output_rows_sum_to_one(self):
-        model = _mock_model([[0.2, 0.5, 0.3], [0.1, 0.1, 0.8]], classes=[0, 1, 2])
-        x = np.zeros((2, 5), dtype=np.float32)
-        out = aligned_proba(model, x)
-        np.testing.assert_allclose(out.sum(axis=1), [1.0, 1.0], atol=1e-6)
-
-    def test_batch_input_shape(self):
-        proba = [[0.2, 0.3, 0.5]] * 5
-        model = _mock_model(proba, classes=[0, 1, 2])
-        x = np.zeros((5, 3), dtype=np.float32)
-        out = aligned_proba(model, x)
-        assert out.shape == (5, 3)
-
-    def test_no_classes_attr_defaults_to_012(self):
-        # No classes_ attribute → defaults to [0, 1, 2]
-        model = MagicMock(spec=["predict_proba"])
-        model.predict_proba.return_value = np.array([[0.2, 0.3, 0.5]], dtype=np.float32)
-        x = np.zeros((1, 3), dtype=np.float32)
-        out = aligned_proba(model, x)
-        assert out.shape == (1, 3)
-        np.testing.assert_allclose(out[0], [0.2, 0.3, 0.5], atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

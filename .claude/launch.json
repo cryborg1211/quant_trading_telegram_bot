@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "telegram-bot",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["run_bot.py"],
+      "port": null,
+      "_note": "Long-running interactive Quant V6 Telegram bot (app.run_polling — long-polling, no HTTP port/webhook). Requires TELEGRAM_BOT_TOKEN and GEMINI_API_KEY in the environment / .env."
+    }
+  ]
+}

@@ -80,7 +80,7 @@ LOGGER = logging.getLogger(__name__)
 NEWS_FETCH_TIMEOUT_SEC: float = 7.0
 NEWS_MAX_CONCURRENT: int = 4
 NEWS_MAX_PER_HOST: int = 1
-NEWS_MAX_ARTICLES_PER_TICKER: int = 3
+NEWS_MAX_ARTICLES_PER_TICKER: int = 6   # >=5 sources/ticker (LLM bodies + tracked URLs)
 NEWS_DAYS_BACK: int = 3
 NEWS_DOMAIN_JITTER_RANGE_SEC: tuple[float, float] = (0.5, 1.5)
 
@@ -157,35 +157,39 @@ NEWS_HEADERS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # AGENT PROMPTS
 # ---------------------------------------------------------------------------
-NEWS_ANALYST_SYSTEM_PROMPT = """Bạn là TradingAgents-style News Analyst cho thị trường chứng khoán Việt Nam.
+NEWS_ANALYST_SYSTEM_PROMPT = """Bạn là News Analyst tổ chức (institutional-grade) cho thị trường chứng khoán Việt Nam.
 
-Bạn phân tích FULL ARTICLE BODY, không chỉ title. Tin tài chính Việt Nam thường clickbait: tiêu đề tích cực có thể chứa rủi ro sâu trong thân bài, hoặc ngược lại.
+Bạn phân tích FULL ARTICLE BODY, không chỉ title. Tin tài chính Việt Nam thường clickbait: tiêu đề tích cực có thể che giấu rủi ro sâu trong thân bài, hoặc ngược lại.
 
-PHƯƠNG PHÁP (theo TradingAgents/TauricResearch):
+PHƯƠNG PHÁP:
 1. Đọc toàn bộ thân bài đã trích xuất từ <p> tags.
-2. Tách rõ catalyst tăng giá, risk/headwind, clickbait reversal.
+2. Cân nhắc ĐỒNG THỜI xúc tác tăng giá, rủi ro/headwind, và khả năng clickbait reversal.
 3. Ưu tiên tin 24-48h gần nhất, nhưng không bỏ qua rủi ro sâu trong body.
-4. Đánh giá tác động trực tiếp lên cổ phiếu/ticker, không đánh giá chung chung.
+4. Đánh giá tác động TRỰC TIẾP lên từng ticker, không đánh giá chung chung.
+5. CRITICAL (entity resolution): Chỉ chấm sentiment nếu bài báo nói RÕ RÀNG về công ty/cổ phiếu niêm yết ứng với mã trong header "=== TICKER: X ===". Nếu văn bản dùng mã đó như một VIẾT TẮT tiếng Việt thông thường (ví dụ 'KDC' = Khu Dân Cư, 'HCM' = Thành phố Hồ Chí Minh) chứ KHÔNG phải công ty niêm yết, thì trả về sentiment_score = 0.0 và trong reasoning_vi nêu rõ "nhầm thực thể (entity mismatch)".
 
 OUTPUT BẮT BUỘC:
 - Trả về RAW JSON hợp lệ. Không markdown. Không ```json.
-- Mỗi ticker phải có đúng các field sau:
+- Mỗi ticker có đúng các field: catalyst, risk, sentiment_score, reasoning_vi, source_urls.
 {
   "FPT": {
-    "catalyst": "Xúc tác: ...",
-    "risk": "Rủi ro: ...",
+    "catalyst": "Mảng dịch vụ CNTT nước ngoài ký hợp đồng lớn, biên lợi nhuận cải thiện.",
+    "risk": "Định giá P/E đã cao; rủi ro tỷ giá ảnh hưởng doanh thu xuất khẩu.",
     "sentiment_score": 0.35,
-    "reasoning_vi": "Kết luận Tâm lý (Sentiment Score): +0.35. ...",
+    "reasoning_vi": "Kết luận Tâm lý (Sentiment Score): +0.35. Dòng tin 48h gần nhất nghiêng tích cực nhờ hợp đồng CNTT nước ngoài mới và biên lợi nhuận mở rộng, song mức định giá P/E cao cùng rủi ro tỷ giá lên doanh thu xuất khẩu giới hạn dư địa tăng — tổng hòa là tích cực vừa phải, phù hợp nắm giữ hơn là mua đuổi.",
     "source_urls": ["https://..."]
   }
 }
 
-RÀNG BUỘC:
-- catalyst: bắt đầu bằng "Xúc tác:"
-- risk: bắt đầu bằng "Rủi ro:"
-- reasoning_vi: bắt đầu bằng "Kết luận Tâm lý (Sentiment Score):"
-- sentiment_score: float trong [-1.0, 1.0]
-- Nếu body không đủ bằng chứng: sentiment_score gần 0.0, nói rõ thiếu bằng chứng.
+QUY TẮC VIẾT reasoning_vi (QUAN TRỌNG NHẤT — đây là phần người dùng đọc):
+- reasoning_vi là MỘT đoạn văn DUY NHẤT, súc tích (3-5 câu), văn phong phân tích chuyên nghiệp, khách quan, dày đặc thông tin.
+- TÍCH HỢP xúc tác + rủi ro + kết luận sentiment vào CÙNG một đoạn liền mạch. TUYỆT ĐỐI KHÔNG tách "Điểm cộng/Điểm trừ", KHÔNG gạch đầu dòng, và KHÔNG lặp lại nguyên văn catalyst/risk rồi mới kết luận.
+- Bắt đầu chính xác bằng tiền tố: "Kết luận Tâm lý (Sentiment Score): {score}." rồi viết tiếp phần phân tích tích hợp trong cùng đoạn.
+- Nêu con số/sự kiện cụ thể từ body khi có. Nếu body không đủ bằng chứng: sentiment_score gần 0.0 và nói rõ thiếu bằng chứng.
+
+RÀNG BUỘC field khác:
+- catalyst / risk: mỗi field MỘT câu ngắn, chỉ phục vụ phân tích/nội bộ (KHÔNG hiển thị cho người dùng).
+- sentiment_score: float trong [-1.0, 1.0].
 """
 
 PORTFOLIO_MANAGER_CONTEXT = """As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
@@ -221,7 +225,9 @@ def get_rebalance_advice(
         return "Không thể tư vấn: thiếu API Key."
 
     client = genai.Client(api_key=api_key)
-    gemini_model_name = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+    # Default to GA pin gemini-2.5-flash: the floating gemini-flash-latest alias
+    # intermittently 503s (see SYSTEM_DESIGN TD). `.env GEMINI_MODEL` overrides.
+    gemini_model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
     holdings_lines = []
     for h in holdings_context:
@@ -638,7 +644,7 @@ def map_tickers_to_news(
     news_items: list[dict[str, Any]],
     vn100_tickers: list[str],
 ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
-    """Map full-body articles to candidate tickers; cap at 3 articles/ticker.
+    """Map full-body articles to candidate tickers; cap at 6 articles/ticker.
 
     Returns:
         ticker_news_dict: ticker → list of formatted article strings (for LLM prompt)
@@ -794,7 +800,9 @@ def get_batch_sentiment_scores(ticker_news_dict: dict[str, list[str]]) -> dict[s
 
     # New SDK: stateless Client; model name does not need the "models/" prefix.
     client = genai.Client(api_key=api_key)
-    gemini_model_name = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+    # Default to GA pin gemini-2.5-flash: the floating gemini-flash-latest alias
+    # intermittently 503s (see SYSTEM_DESIGN TD). `.env GEMINI_MODEL` overrides.
+    gemini_model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     LOGGER.info("[News Analyst][DEBUG] Initializing Gemini (google-genai) model=%s", gemini_model_name)
 
     user_prompt = (
@@ -806,7 +814,9 @@ def get_batch_sentiment_scores(ticker_news_dict: dict[str, list[str]]) -> dict[s
         user_prompt += f"=== TICKER: {ticker} ===\n" + "".join(news_list[:NEWS_MAX_ARTICLES_PER_TICKER]) + "\n\n"
     user_prompt += (
         "Return strictly RAW JSON with fields: catalyst, risk, sentiment_score, reasoning_vi, source_urls. "
-        "reasoning_vi MUST start with 'Kết luận Tâm lý (Sentiment Score):'."
+        "reasoning_vi MUST be a SINGLE integrated analytical paragraph (3-5 câu) that starts with "
+        "'Kết luận Tâm lý (Sentiment Score):' and MUST NOT restate catalyst/risk as separate bullets "
+        "or repeat them verbatim before concluding."
     )
 
     generate_config = genai_types.GenerateContentConfig(
@@ -815,7 +825,7 @@ def get_batch_sentiment_scores(ticker_news_dict: dict[str, list[str]]) -> dict[s
         temperature=0.0,
     )
 
-    max_retries = 3
+    max_retries = 5      # was 3 — more headroom for transient 429/503 before fallback
 
     for attempt in range(max_retries):
         try:
@@ -892,8 +902,9 @@ def get_batch_sentiment_scores(ticker_news_dict: dict[str, list[str]]) -> dict[s
                 time.sleep(2 ** attempt + 1)
 
     LOGGER.error(
-        "[News Analyst] All %s retries exhausted — graceful polite fallback.",
-        max_retries,
+        "[News Analyst] All %s retries exhausted (rate-limit/quota or model 503) — "
+        "graceful polite fallback. Check GEMINI_API_KEY quota + GEMINI_MODEL=%s.",
+        max_retries, gemini_model_name,
     )
     return {
         t: {

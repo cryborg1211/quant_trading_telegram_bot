@@ -1,0 +1,1 @@
+✅ Học lại xong sau 35s. Tỷ lệ tín hiệu hiếm (train): 4.03% | Độ chính xác kiểm định 1 năm: 64% trên 14 cảnh báo | Ngưỡng kích hoạt: 0.96.

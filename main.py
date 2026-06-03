@@ -8,7 +8,7 @@ import sys
 import time
 import traceback
 from contextlib import contextmanager
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -16,15 +16,22 @@ from zoneinfo import ZoneInfo
 import joblib
 import numpy as np
 import pandas as pd
-from catboost import CatBoostClassifier
+import polars as pl                                          # V3 feature pipeline is polars-native
 
 from config.settings import CONFIG
 from src.features.alpha360_generator import Alpha360Generator
 from src.features.mr_features import MR_FEATURE_COLUMNS, build_mr_features
-from src.models.stacking_model.economic_metrics import (
-    META_LABEL_FEATURE_NAMES,
-    N_CLOSE_LAGS_FOR_META,
-    meta_label_feature_matrix,
+from src.features.market_regime import REGIME_LABELS_VI, regime_label_vi
+from src.data import price_lookup  # fresh-parquet price lookups (stock_ohlcv retired)
+# ─── V3 V1-faithful Tabular Ensemble (locked-in GOLDEN, the only inference route) ─
+from src.bot.bot_inference import V3BotInference
+from src.bot.sizing import suggested_weight
+# Train/serve parity: live inference builds features through the SAME pipeline
+# used by train_models.py — single source of truth, no duplicated feature math.
+from src.backtest.pipeline import (
+    RunConfig as V3FeatureConfig,
+    build_features as build_v3_feature_panel,
+    FEATURE_RECIPE_VERSION,
 )
 from src.models.quant_agent_arbitrator import (
     evaluate_trades_batch,
@@ -321,12 +328,24 @@ def crawl_hose(
     end_date: str | None = None,
     data_dir: str = "data",
     force_crawl: bool = False,
+    days_back: int | None = None,
 ) -> None:
-    """Overnight-safe full HOSE OHLCV crawl."""
+    """Overnight-safe HOSE OHLCV crawl.
+
+    `days_back` (INCREMENTAL mode): when set, only the last `days_back` calendar
+    days are fetched — `start_date` is overridden to (today − days_back) in VN
+    time.  Use `--days-back 1` for a previous-day-only daily refresh; a small
+    window (3–5) adds overlap against late data corrections.  When None, a FULL
+    crawl from `start_date` runs.
+    """
     from src.data.crawlers import StockCrawler
 
     if not is_crawl_allowed(force_crawl=force_crawl):
         return
+
+    if days_back is not None:
+        start_date = (datetime.now(VN_TZ) - timedelta(days=int(days_back))).strftime("%Y-%m-%d")
+        LOGGER.info("Incremental crawl | last %d day(s) → start_date=%s", int(days_back), start_date)
 
     LOGGER.info("Starting Quant V6 HOSE overnight crawler...")
     LOGGER.info("Start date: %s", start_date)
@@ -345,11 +364,9 @@ def crawl_hose(
     LOGGER.info("crawl_hose completed. Summary=%s", summary)
 
 
-def build_alpha360() -> None:
-    LOGGER.info("Starting offline Alpha360 rebuild.")
-    with timed_step("Alpha360 full rebuild"):
-        generator = Alpha360Generator()
-        generator.run()
+# (RETIRED: build_alpha360() + the Alpha360 feature factory were removed in the
+#  parquet-first migration. The V4 pipeline recomputes features from raw OHLCV
+#  via src/backtest/pipeline.build_features and never reads an Alpha360 matrix.)
 
 
 # ─── Mean-Reversion (knife-catch) sub-model — shared live scorer ──────────
@@ -418,200 +435,231 @@ def mr_score_tickers(tickers: list[str]) -> dict[str, dict[str, Any]]:
     return out
 
 
-def load_stacking_artifacts(horizon: int) -> tuple[list[str], dict[str, Any], Any, Any, CatBoostClassifier, Any, Any]:
-    artifact_dir = Path("models/stacking") / f"{horizon}d"
-    required_artifacts = {
-        "selected_features": artifact_dir / "selected_features.json",
-        "xgboost": artifact_dir / "xgboost_model.joblib",
-        "lightgbm": artifact_dir / "lightgbm_model.joblib",
-        "catboost": artifact_dir / "catboost_model.cbm",
-        "meta_model": artifact_dir / "meta_model.joblib",
-        "thresholds": artifact_dir / "quantile_thresholds.json",
-    }
-    missing = [str(path) for path in required_artifacts.values() if not path.exists()]
-    if missing:
-        raise FileNotFoundError(f"Missing {horizon}d stacking artifacts: {missing}. Run train_stacking.py first.")
+# ─────────────────────────────────────────────────────────────────────────────
+# V3 TABULAR ENSEMBLE — drop-in replacement for the legacy V6 stacker
+# ─────────────────────────────────────────────────────────────────────────────
+# Loads the GOLDEN-config joblib bundle written by run_backtest.py and
+# exposes the SAME 5-tuple contract as the legacy `predict_stacking_horizon`,
+# so the four call sites in this file (daily_inference, inference_for_holdings,
+# verify, rebalance_portfolio) need only swap the function name.
 
-    # Task 3: the secondary meta-labeler is OPTIONAL. If absent (e.g. a model
-    # trained before Task 3, or a degenerate fold), inference cleanly falls
-    # back to the primary-only cost-aware gate — no crash.
-    meta_labeler_path = artifact_dir / "meta_labeler.joblib"
-
-    LOGGER.info("Loading %sd stacking artifacts from %s", horizon, artifact_dir)
-    with timed_step("Loading model artifacts"):
-        with required_artifacts["selected_features"].open("r", encoding="utf-8") as f:
-            selected_features = json.load(f)
-        with required_artifacts["thresholds"].open("r", encoding="utf-8") as f:
-            quantile_thresholds = json.load(f)
-
-        # StandardScaler removed from pipeline (train_stacking.py Flaw 3 fix).
-        # Alpha360 features are already rolling Z-scores; no secondary scaling needed.
-        xgb_model = joblib.load(required_artifacts["xgboost"])
-        lgbm_model = joblib.load(required_artifacts["lightgbm"])
-        cat_model = CatBoostClassifier()
-        cat_model.load_model(str(required_artifacts["catboost"]))
-        meta_model = joblib.load(required_artifacts["meta_model"])
-        meta_labeler = joblib.load(meta_labeler_path) if meta_labeler_path.exists() else None
-
-    LOGGER.info(
-        "Loaded %sd artifacts. selected_features=%s meta_labeler=%s",
-        horizon, len(selected_features), "ON" if meta_labeler is not None else "OFF (primary-only)",
-    )
-    return selected_features, quantile_thresholds, xgb_model, lgbm_model, cat_model, meta_model, meta_labeler
+# DUAL-HORIZON ARTIFACT REGISTRY ─────────────────────────────────────────────
+# Each horizon has its own GOLDEN bundle written by run_backtest.py
+# (the artifact filename embeds the horizon to prevent cross-horizon overwrite).
+# Loader is cached per horizon so the bot keeps a hot in-memory copy of each.
+_V3_BUNDLE_PATHS: dict[int, Path] = {
+    5:  Path("models/saved/v3_ensemble_5d.joblib"),
+    20: Path("models/saved/v3_ensemble_20d.joblib"),
+}
+# Legacy fallback for the un-suffixed bundle from V3.0 runs.
+_V3_BUNDLE_LEGACY_FALLBACK = Path("models/saved/v3_ensemble.joblib")
+_V3_BOT_CACHE: dict[int, V3BotInference] = {}
 
 
-# Task 2: most-recent 5d top-5 probability breakdown, populated by
-# predict_stacking_horizon and surfaced in the Telegram empty-pool reply
-# so the operator can see WHY the bot stayed quiet.
-_LATEST_5D_BREAKDOWN: list[str] = []
+def _load_v3_bot(horizon: int = 5) -> V3BotInference:
+    """Lazy-load + cache the V3 GOLDEN bundle for `horizon` ∈ {5, 20}.
 
-
-def aligned_proba(model, x: np.ndarray) -> np.ndarray:
-    probs = np.asarray(model.predict_proba(x), dtype=np.float32)
-    classes = getattr(model, "classes_", np.array([0, 1, 2]))
-    out = np.zeros((x.shape[0], 3), dtype=np.float32)
-    for idx, cls in enumerate(classes):
-        cls_int = int(cls)
-        if cls_int in (0, 1, 2):
-            out[:, cls_int] = probs[:, idx]
-    denom = out.sum(axis=1, keepdims=True)
-    return out / np.where(denom == 0.0, 1.0, denom)
-
-
-def predict_stacking_horizon(latest_df, horizon: int) -> tuple[dict[str, list[float]], dict[str, Any], Any, list[str], dict[str, bool]]:
+    Looks for `models/saved/v3_ensemble_{horizon}d.joblib`.  If absent AND
+    the horizon-agnostic legacy `v3_ensemble.joblib` exists, falls back to it
+    (so V3.0 single-horizon installs keep working).  Raises a clear error if
+    neither file is present — the operator must run
+    `python train_models.py --tb-horizon <h>` then `python run_backtest.py`
+    to produce the missing bundle.
     """
-    Run stacking model inference for a given horizon.
-
-    Returns:
-        predictions: {ticker: [p_down, p_sideways, p_up]}
-        thresholds:  cost-aware metadata (pnl_threshold_tau, round_trip_cost…)
-        xgb_model:   XGBoost base model (for feature importance)
-        selected_features: list of feature names
-        meta_gate:   {ticker: bool} — Task 3 combined decision. A ticker is
-                     tradeable ONLY if the primary model is bullish
-                     (P(UP) >= τ*) AND the meta-labeler says GO
-                     (P(profit) >= 0.5). Falls back to the primary-only
-                     cost-aware gate (or legacy all-pass) when no τ*/labeler.
-    """
-    (selected_features, quantile_thresholds, xgb_model, lgbm_model,
-     cat_model, meta_model, meta_labeler) = load_stacking_artifacts(horizon)
-
-    missing_features = [c for c in selected_features if c not in latest_df.columns]
-    if missing_features:
-        raise ValueError(f"Missing selected features in live Alpha360 data for {horizon}d: {missing_features[:10]}")
-
-    with timed_step(f"Preparing {horizon}d model input matrix"):
-        # No StandardScaler transform — features are already rolling Z-scores from Alpha360.
-        x_raw = latest_df[selected_features].replace([np.inf, -np.inf], np.nan)
-        x_input = x_raw.fillna(x_raw.median(numeric_only=True)).fillna(0.0).to_numpy(dtype=np.float32)
-    LOGGER.info("%sd model input shape=%s", horizon, x_input.shape)
-
-    with timed_step(f"Running {horizon}d XGBoost/LightGBM/CatBoost base model inference"):
-        base_meta = np.hstack([
-            aligned_proba(xgb_model, x_input),
-            aligned_proba(lgbm_model, x_input),
-            aligned_proba(cat_model, x_input),
-        ]).astype(np.float32)
-
-    with timed_step(f"Running {horizon}d meta-model inference"):
-        # aligned_proba → guaranteed [P(DOWN), P(SIDE), P(UP)] column order,
-        # identical to training's aligned_predict_proba (zero skew).
-        meta_probs = aligned_proba(meta_model, base_meta)
-
-    tickers = [str(t) for t in latest_df["ticker"].tolist()]
-    predictions = {
-        ticker: probs.tolist()
-        for ticker, probs in zip(tickers, meta_probs, strict=False)
-    }
-
-    # ── TASK 3: combined meta-labeling gate ─────────────────────────────
-    tau_star = float(quantile_thresholds.get("pnl_threshold_tau", 0.5))
-    has_tau = "pnl_threshold_tau" in quantile_thresholds
-    p_up_arr = meta_probs[:, 2]
-    p_profit = None  # set only in the meta-labeled branch below
-
-    if not has_tau:
-        # Legacy artifact (pre-Task-2): preserve old behaviour — no gate.
-        gate_arr = np.ones(len(tickers), dtype=bool)
-        gate_mode = "legacy-all-pass"
-    elif meta_labeler is None:
-        # Task-2 primary-only cost-aware gate.
-        gate_arr = p_up_arr >= tau_star
-        gate_mode = f"primary-only τ*={tau_star:.2f}"
-    else:
-        lag_cols = [f"close_{i}" for i in range(N_CLOSE_LAGS_FOR_META)]
-        miss = [c for c in lag_cols if c not in latest_df.columns]
-        if miss:
+    if horizon in _V3_BOT_CACHE:
+        return _V3_BOT_CACHE[horizon]
+    path = _V3_BUNDLE_PATHS.get(int(horizon))
+    if path is None or not path.exists():
+        if _V3_BUNDLE_LEGACY_FALLBACK.exists():
             LOGGER.warning(
-                "[MetaLabeler %sd] missing close lags %s — primary-only fallback.",
-                horizon, miss[:3],
+                "V3 horizon=%d bundle not found at %s — falling back to "
+                "horizon-agnostic legacy %s.  Run `python train_models.py "
+                "--tb-horizon %d` then `python run_backtest.py` to produce the proper artifact.",
+                horizon, path, _V3_BUNDLE_LEGACY_FALLBACK, horizon,
             )
-            gate_arr = p_up_arr >= tau_star
-            gate_mode = f"primary-only (no lags) τ*={tau_star:.2f}"
+            path = _V3_BUNDLE_LEGACY_FALLBACK
         else:
-            close_lags = (
-                latest_df[lag_cols]
-                .replace([np.inf, -np.inf], np.nan)
-                .fillna(0.0)
-                .to_numpy(dtype=np.float64)
+            raise FileNotFoundError(
+                f"V3 horizon={horizon} artifact not found at {path}. "
+                f"Run `python train_models.py --tb-horizon {horizon}` then "
+                f"`python run_backtest.py` first."
             )
-            x_meta = meta_label_feature_matrix(meta_probs, tau_star, close_lags)
-            p_profit = np.asarray(
-                meta_labeler.predict_proba(x_meta), dtype=np.float64
-            )[:, 1]
-            gate_arr = (p_up_arr >= tau_star) & (p_profit >= 0.5)
-            gate_mode = f"meta-labeled τ*={tau_star:.2f} ∧ P(profit)≥0.5"
+    bot = V3BotInference.from_artifact(path)
 
-    meta_gate = {t: bool(g) for t, g in zip(tickers, gate_arr, strict=False)}
+    # ── FEATURE-RECIPE TRIPWIRE ──────────────────────────────────────────────
+    # The artifact's structural feature recipe MUST match the live pipeline's.
+    # A mismatch means `build_features` changed shape (a new/removed/retuned
+    # feature, window, or ordering) since this model was trained → its live
+    # inputs no longer mean what the model learned (silent train/serve skew).
+    # Refuse to serve a drifted model; demand a retrain.
+    artifact_recipe = bot.metadata.get("feature_recipe_version")
+    if artifact_recipe is None:
+        # Backward-compat: artifacts trained before the stamp existed.  Assume
+        # compatible — the operator is expected to retrain to stamp the version.
+        LOGGER.warning(
+            "V3 horizon=%d artifact has no feature_recipe_version (pre-tripwire "
+            "build) — assuming compatible with pipeline %s.  Retrain to stamp it.",
+            horizon, FEATURE_RECIPE_VERSION,
+        )
+    elif artifact_recipe != FEATURE_RECIPE_VERSION:
+        raise RuntimeError(
+            f"FEATURE-RECIPE MISMATCH (horizon={horizon}): the artifact was trained "
+            f"with feature_recipe_version={artifact_recipe!r}, but the live pipeline "
+            f"is {FEATURE_RECIPE_VERSION!r}.  build_features has changed shape since "
+            f"this model was trained, so its live features no longer match what the "
+            f"model expects (train/serve skew).  RETRAIN: `python train_models.py "
+            f"--tb-horizon {horizon}` then `python run_backtest.py` to regenerate {path}."
+        )
 
-    # Per-ticker P(profit) map (meta-labeled mode only) for the diagnostic.
-    pprofit_by_ticker: dict[str, float] = {}
-    if p_profit is not None:
-        pprofit_by_ticker = {
-            t: float(pp) for t, pp in zip(tickers, p_profit, strict=False)
-        }
+    _V3_BOT_CACHE[int(horizon)] = bot
+    LOGGER.info("V3 ensemble loaded (horizon=%d, recipe=%s): %s",
+                horizon, artifact_recipe or "unstamped", bot.card())
+    return bot
 
-    sorted_preds = sorted(predictions.items(), key=lambda x: x[1][2], reverse=True)
-    top_10_str = " | ".join(
-        f"{t}:{p[2]*100:.1f}%{'✓' if meta_gate.get(t) else '✗'}"
-        for t, p in sorted_preds[:10]
+
+# ── V4.0 sizing note: Kelly math lives in `src/bot/sizing.py` (suggested_weight).
+#    run_trade_execution computes the half-Kelly size for EACH dispatched ticker
+#    from its own P(UP) and shows it ON that ticker's card.  There is NO summary
+#    table (the old format_kelly_section_html block was purged).
+
+
+# Latest market_regime (0–7) per ticker, refreshed on every _compute_v3_features
+# pass.  Read by run_trade_execution for regime-aware sizing + the Telegram card.
+# (Decoupled from the prediction return-tuple so the 4 call sites stay untouched.)
+_LATEST_REGIME_BY_TICKER: dict[str, int] = {}
+
+
+def _compute_v3_features(latest_df: pd.DataFrame, feature_list: list[str],
+                         frac_diff_d: float) -> pd.DataFrame:
+    """Build today's live feature row via the SHARED training pipeline.
+
+    Train/serve parity is structural: this calls
+    `src.backtest.pipeline.build_features` — the EXACT recipe `train_models.py`
+    uses — so FracDiff, the cross-sectional Gaussian-rank Z-scores, anti-FOMO
+    over-extension, the alpha factors AND the 5 advanced statistical features are
+    all computed identically.  We then project to `feature_list` (the iron-fist
+    selection persisted in the artifact's `tabular_features`), replaying the
+    train-time selection rather than hardcoding a feature set.
+
+    Input:   pandas DataFrame with (ticker, date, open, high, low, close,
+             volume) + per-ticker history for the rolling windows (the Alpha360
+             live path provides 120 bars).
+    Output:  pandas DataFrame indexed by ticker, columns = `feature_list` in the
+             model's trained order, one row per ticker (latest decision-bar).
+    """
+    required = {"ticker", "date", "open", "high", "low", "close", "volume"}
+    missing = required - set(latest_df.columns)
+    if missing:
+        raise ValueError(f"_compute_v3_features: missing OHLCV columns: {missing}")
+
+    ohlcv = pl.from_pandas(latest_df[list(required)].copy()).sort(["ticker", "date"])
+    # SAME recipe as training, with the EXACT frac_diff_d the artifact was trained
+    # with (threaded down from the bundle metadata — never a library default).
+    # The iron-fist SELECTION is replayed via feature_list.
+    panel, all_features, _ = build_v3_feature_panel(
+        ohlcv, V3FeatureConfig(frac_diff_d=frac_diff_d))
+
+    unknown = [f for f in feature_list if f not in all_features]
+    if unknown:
+        raise ValueError(
+            f"_compute_v3_features: the artifact requires features the live "
+            f"pipeline does not produce: {unknown}. Train/serve recipe drift — "
+            f"retrain against the current src/backtest/pipeline.py.")
+
+    # Stash today's market_regime per ticker (the panel ALWAYS carries it, even if
+    # a pre-regime artifact's feature_list does not) for regime-aware sizing + the
+    # Telegram card.  One cheap tail(1) group-by on the already-built panel.
+    if "market_regime" in panel.columns:
+        _reg = (panel.sort(["ticker", "date"])
+                     .group_by("ticker", maintain_order=True)
+                     .tail(1)
+                     .select(["ticker", "market_regime"]))
+        _LATEST_REGIME_BY_TICKER.update({
+            str(t): int(v)
+            for t, v in zip(_reg["ticker"].to_list(), _reg["market_regime"].to_list())
+            if v is not None
+        })
+
+    return (
+        panel.sort(["ticker", "date"])
+             .group_by("ticker", maintain_order=True)
+             .tail(1)                                  # today's decision-bar per ticker
+             .select(["ticker"] + list(feature_list))  # artifact's trained order
+             .to_pandas()
+             .set_index("ticker")
+             .dropna()
     )
-    LOGGER.info("[StackingGBDT %sd] TOP 10 UP (✓=gate open): %s", horizon, top_10_str)
-    LOGGER.info(
-        "[StackingGBDT %sd] gate=%s | %s/%s tickers tradeable | round_trip_cost=%.4f",
-        horizon, gate_mode, sum(meta_gate.values()), len(meta_gate),
-        float(quantile_thresholds.get("round_trip_cost", 0.0)),
-    )
 
-    # ── TASK 2: per-candidate 3-class breakdown for the TOP 5 ──────────
-    # Always logged regardless of gate pass, so the operator sees EXACTLY
-    # why the bot is quiet. Cached for the Telegram empty-pool message.
-    def _reason(tk: str, pu: float) -> str:
-        if not has_tau:
-            return "ACCEPTED (legacy, no gate)"
-        if pu < tau_star:
-            return f"REJECTED (P(UP)={pu*100:.1f}% < tau={tau_star:.2f})"
-        if meta_labeler is not None:
-            pp = pprofit_by_ticker.get(tk)
-            if pp is not None and pp < 0.5:
-                return (f"REJECTED (P(UP) ok, meta P(profit)="
-                        f"{pp*100:.1f}% < 50%)")
-        return f"ACCEPTED (P(UP)>=tau={tau_star:.2f}"+(
-            f", P(profit)={pprofit_by_ticker.get(tk,0)*100:.1f}%)"
-            if meta_labeler is not None else ")")
 
-    breakdown_lines: list[str] = []
-    for tk, pr in sorted_preds[:5]:
-        p_dn, p_sd, p_u = pr[0], pr[1], pr[2]
-        line = (f"{tk}: P(UP)={p_u*100:.1f}%, P(SIDE)={p_sd*100:.1f}%, "
-                f"P(DN)={p_dn*100:.1f}% | Gate: {_reason(tk, p_u)}")
-        breakdown_lines.append(line)
-        LOGGER.info("[StackingGBDT %sd][TOP5] %s", horizon, line)
-    if horizon == 5:
-        _LATEST_5D_BREAKDOWN.clear()
-        _LATEST_5D_BREAKDOWN.extend(breakdown_lines)
+def predict_v3_horizon(latest_df: pd.DataFrame, horizon: int = 5) -> tuple[
+    dict[str, list[float]], dict[str, Any], Any, list[str], dict[str, bool]
+]:
+    """DROP-IN replacement for `predict_stacking_horizon(latest_df, horizon)`.
 
-    return predictions, quantile_thresholds, xgb_model, selected_features, meta_gate
+    Returns the SAME 5-tuple shape — the four call sites in main.py and the
+    downstream `_build_feature_explanation`, arbitrator, and meta-gate logic
+    all keep working with no change:
+
+        ( predictions_dict,   # {ticker: [p_down, p_flat, p_up]}
+          thresholds,         # {'pnl_threshold_tau': ..., 'meta_labeler_enabled': False, ...}
+          model_obj,          # V3BotInference (exposes .feature_importances_ + .feature_names_in_)
+          selected_features,  # the artifact's iron-fist `tabular_features` (train/serve parity)
+          meta_gate )         # {ticker: True if P(UP) >= up_threshold else False}
+
+    The `horizon` parameter is accepted for API parity.  V3 was trained at the
+    horizon stored in the bundle (T+5 for the current GOLDEN); other horizons
+    return the SAME T+5 signal with a one-time warning so the arbitrator's
+    5d-vs-20d compare degrades gracefully instead of crashing.
+    """
+    # Route to the horizon-specific bundle (5d ↔ v3_ensemble_5d.joblib, 20d ↔
+    # v3_ensemble_20d.joblib).  _load_v3_bot is cached per horizon so dual-
+    # horizon bot endpoints share their loaded models across calls.
+    bot = _load_v3_bot(horizon)
+    trained_h = int(bot.metadata.get("tb_horizon", horizon))
+    if horizon != trained_h:
+        LOGGER.warning(
+            "predict_v3_horizon: bundle reports tb_horizon=%d but caller asked "
+            "for %d.  Using the bundle as-is.", trained_h, horizon,
+        )
+
+    feature_list = list(bot.tabular_features)          # iron-fist selection from the artifact
+    # RECIPE LOCK: conform to the artifact's training feature hyper-params, not
+    # library defaults.  frac_diff_d is the only config-driven knob in
+    # build_features; older artifacts without it fall back to the pipeline default.
+    frac_diff_d = float(bot.metadata.get("frac_diff_d", V3FeatureConfig().frac_diff_d))
+    feats = _compute_v3_features(latest_df, feature_list, frac_diff_d)
+    if feats.empty:
+        LOGGER.warning("predict_v3_horizon: V3 feature panel is empty after dropna.")
+        return ({}, {"pnl_threshold_tau": bot.up_threshold}, bot, feature_list, {})
+
+    proba_3 = bot.predict_proba_3class(feats)              # DataFrame indexed by ticker
+    predictions_dict: dict[str, list[float]] = {
+        str(t): [float(r["p_down"]), float(r["p_flat"]), float(r["p_up"])]
+        for t, r in proba_3.iterrows()
+    }
+    thresholds: dict[str, Any] = {
+        "pnl_threshold_tau": float(bot.up_threshold),
+        "meta_labeler_enabled": False,
+        "round_trip_cost": 0.008,                          # canonical VN cost (matches V6)
+        "method": "v3_tabular_ensemble",
+        "horizon_days": trained_h,
+    }
+    # V3 has no separate meta-labeler: the gate IS the up_threshold.
+    meta_gate: dict[str, bool] = {
+        str(t): bool(proba_3.loc[t, "p_up"] >= bot.up_threshold)
+        for t in proba_3.index
+    }
+    return predictions_dict, thresholds, bot, feature_list, meta_gate
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Legacy V6 stacker chain (load_stacking_artifacts / aligned_proba /
+# predict_stacking_horizon) + _LATEST_5D_BREAKDOWN cache were PURGED in the
+# V3.2 refactor.  All four call sites in this file (daily_inference,
+# inference_for_holdings, verify_single_ticker, rebalance_portfolio) route
+# through `predict_v3_horizon` above, which loads the per-horizon V3
+# TabularEnsemble bundle (models/saved/v3_ensemble_{5,20}d.joblib).
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 _REPORT_SEPARATOR = "\n\n══════════════════════════════\n\n"
@@ -727,33 +775,19 @@ def _backfill_rl_outcomes(db: Any) -> int:
 
     backfilled = 0
     for ticker, predicted_date, action in pending:
-        # T0 close — use ≤ predicted_date so a weekend prediction still
-        # finds the prior trading day's close. (Read — no lock needed.)
-        t0_row = db.conn.execute(
-            """
-            SELECT close FROM stock_ohlcv
-            WHERE ticker = ? AND date <= ?
-            ORDER BY date DESC LIMIT 1
-            """,
-            [ticker, predicted_date],
-        ).fetchone()
-        # T+5 close — first available trading day at or after predicted_date + 5d.
-        t5_row = db.conn.execute(
-            f"""
-            SELECT close FROM stock_ohlcv
-            WHERE ticker = ? AND date >= ? + INTERVAL {_RL_HORIZON_DAYS} DAY
-            ORDER BY date ASC LIMIT 1
-            """,
-            [ticker, predicted_date],
-        ).fetchone()
-
-        if not t0_row or not t5_row:
-            continue
-        t0_close, t5_close = t0_row[0], t5_row[0]
+        # Price lookups now hit the FRESH parquet vintage (the same source the
+        # model trains/serves on) via price_lookup — the stale stock_ohlcv table
+        # was retired. Semantics unchanged:
+        #   t0 = close on/before predicted_date (walks back over weekends);
+        #   t5 = first close on/after predicted_date + horizon.
+        t0_close = price_lookup.close_on_or_before(ticker, predicted_date, conn=db.conn)
+        t5_close = price_lookup.close_on_or_after(
+            ticker, predicted_date + timedelta(days=_RL_HORIZON_DAYS), conn=db.conn
+        )
         if t0_close is None or t5_close is None or t0_close <= 0:
             continue
 
-        actual = (float(t5_close) - float(t0_close)) / float(t0_close)
+        actual = (t5_close - t0_close) / t0_close
         # TD-50: UPDATE is the WRITE — lock it.
         with db._audit_lock:
             db.conn.execute(
@@ -769,10 +803,20 @@ def _backfill_rl_outcomes(db: Any) -> int:
     return backfilled
 
 
+# VN30 constituents — STRICT live universe gate (avoid noisy mid-caps → false
+# signals in weak markets). Update on the quarterly VN30 review.
+_VN30_UNIVERSE: frozenset[str] = frozenset({
+    "ACB", "BCM", "BID", "BVH", "CTG", "FPT", "GAS", "GVR", "HDB", "HPG",
+    "MBB", "MSN", "MWG", "PLX", "POW", "SAB", "SHB", "SSB", "SSI", "STB",
+    "TCB", "TPB", "VCB", "VHM", "VIB", "VIC", "VJC", "VNM", "VPB", "VRE",
+})
+
+
 def daily_inference(
     window_rows: int = 120,
     max_candidates: int = 6,
     broadcast: bool = True,
+    horizon: int = 5,
 ) -> str:
     """Daily trading path. No crawling. No full Alpha360 parquet load.
 
@@ -797,15 +841,43 @@ def daily_inference(
 
     with timed_step(f"Building live Alpha360 features from recent OHLCV/macro windows ({window_rows} rows/ticker)"):
         generator = Alpha360Generator()
-        live_pl = generator.build_live_features(window_rows=window_rows)
+        # V3/V4 tabular path needs the RAW multi-row OHLCV window (full
+        # open/high/low/close/volume + history) — NOT the Alpha360 tail-1 lag
+        # row, which drops open/high/low and collapses the time series.
+        live_pl = generator.load_live_ohlcv_window(window_rows=window_rows)
         latest_df = live_pl.to_pandas()
 
     LOGGER.info("Live feature frame loaded: %s rows x %s cols.", len(latest_df), len(latest_df.columns))
     if latest_df.empty:
         raise ValueError("Live feature frame is empty.")
 
-    stacking_predictions_5d, thr_5d, xgb_model_5d, selected_features_5d, meta_gate_5d = predict_stacking_horizon(latest_df, 5)
-    stacking_predictions_20d, _, _, _, _ = predict_stacking_horizon(latest_df, 20)
+    # DUAL-HORIZON: the user-selected `horizon` drives the primary signal +
+    # the Kelly sizing block, while the OTHER horizon is fetched for the
+    # arbitrator cross-check.  Variable names `_5d` / `_20d` are kept for
+    # back-compat with the downstream arbitrator / sentiment code, but they
+    # now mean "primary" / "secondary".
+    stacking_predictions_5d, thr_5d, xgb_model_5d, selected_features_5d, meta_gate_5d = predict_v3_horizon(latest_df, int(horizon))
+    # SECONDARY horizon = arbitrator cross-check ONLY; it must NEVER abort the
+    # PRIMARY command.  If the OTHER brain's artifact is missing or version-
+    # mismatched, degrade to an empty dict (evaluate_trades_batch falls back to
+    # the primary probs per-ticker).  This is the fix for /suggest_buy5 dying
+    # with "horizon=20 not found" when only the T+5 model was trained.
+    _secondary_h = 20 if int(horizon) == 5 else 5
+    try:
+        stacking_predictions_20d, _, _, _, _ = predict_v3_horizon(latest_df, _secondary_h)
+    except (FileNotFoundError, RuntimeError) as exc:
+        LOGGER.warning(
+            "Secondary horizon T+%d unavailable (%s) — running PRIMARY T+%d only; "
+            "arbitrator loses its dual-horizon cross-check.",
+            _secondary_h, exc.__class__.__name__, int(horizon),
+        )
+        stacking_predictions_20d = {}
+
+    # ── V4.0 KELLY SIZING ─────────────────────────────────────────────────
+    # Per-ticker half-Kelly size is computed from EACH dispatched ticker's OWN
+    # P(UP) inside run_trade_execution (src/bot/sizing.suggested_weight) and
+    # shown on its card.  No pre-filtered lookup map: the old map gated at
+    # P>=0.50 + top-5, so dispatched names below that threshold rendered "N/A".
 
     sorted_preds = sorted(stacking_predictions_5d.items(), key=lambda x: x[1][2], reverse=True)
     top_10_str = " | ".join([f"{t}: {p[2] * 100:.2f}%" for t, p in sorted_preds[:10]])
@@ -815,73 +887,23 @@ def daily_inference(
     bottom_3_str = " | ".join([f"{t}: {p[2] * 100:.2f}%" for t, p in bottom_3_sorted])
     LOGGER.info("[StackingGBDT] BOTTOM 3 RISK: %s", bottom_3_str)
 
-    # --- Liquidity Filter: ADDV >= 15,000,000,000 VND (20-day SMA of close*volume) ---
-    # Raw close prices may be stored in thousands (e.g. 10.5 = 10,500 VND).
-    # We multiply close*volume by 1000 when close < 1000 to restore actual VND turnover.
-    _ADDV_THRESHOLD_VND = 15_000_000_000
-    _ADDV_WINDOW = 20
-    liquid_tickers: set[str] = set()
-    if "close" in latest_df.columns and "volume" in latest_df.columns and "ticker" in latest_df.columns:
-        for _ticker, _grp in latest_df.groupby("ticker"):
-            _tail = _grp.tail(_ADDV_WINDOW)
-            _close_raw = _tail["close"].astype(float)
-            # Restore full-VND price if stored in thousands
-            _scale = np.where(_close_raw < 1_000.0, 1_000.0, 1.0)
-            _turnover = (_close_raw * _scale * _tail["volume"].astype(float))
-            _addv = _turnover.mean()
-            if np.isfinite(_addv) and _addv >= _ADDV_THRESHOLD_VND:
-                liquid_tickers.add(str(_ticker))
-        LOGGER.info(
-            "[LiquidityFilter] %s / %s tickers pass ADDV >= %.0f VND threshold.",
-            len(liquid_tickers), latest_df["ticker"].nunique(), _ADDV_THRESHOLD_VND,
-        )
-    else:
-        LOGGER.warning("[LiquidityFilter] close/volume/ticker columns missing — skipping liquidity filter.")
+    # --- Universe Gate: STRICT VN30 (avoid noisy mid-caps → false signals) ---
+    # Replaced the ADDV liquidity filter: only the 30 VN30 constituents reach the
+    # model gate / arbitrator. Filter the predicted tickers strictly to this set.
+    liquid_tickers: set[str] = {
+        str(t) for t in stacking_predictions_5d if str(t).upper() in _VN30_UNIVERSE
+    }
+    LOGGER.info("[VN30Gate] %s / %s predicted tickers are in VN30.",
+                len(liquid_tickers), len(stacking_predictions_5d))
+    if not liquid_tickers:
+        LOGGER.warning("[VN30Gate] no predicted ticker in VN30 — using all predictions as fallback.")
         liquid_tickers = set(stacking_predictions_5d.keys())
 
-    # --- Universe Filter -------------------------------------------------
-    # Segment exclusions applied AFTER liquidity, BEFORE the meta-labeler /
-    # arbitrator. Knobs live in CONFIG.universe_filter (config/settings.json)
-    # and default to a NO-OP, so live behaviour is unchanged until opted in.
-    #
-    # CAVEAT (no market-cap data in the pipeline): "penny / ultra-smallcap"
-    # is approximated by a RAW-PRICE FLOOR (`min_price_vnd`), not a true
-    # market cap. VN30 exclusion uses the published constituent list (exact).
-    _uf = CONFIG.universe_filter
+    # --- Universe = VN30 gate output ------------------------------------
+    # (Old UniverseFilter / CONFIG.universe_filter.exclude_vn30 block DELETED —
+    # it EXCLUDED VN30, which directly conflicts with the hardcoded VN30-only
+    # gate above. The VN30 frozenset IS the universe now.)
     universe_tickers: set[str] = set(liquid_tickers)
-    if _uf.enabled and liquid_tickers:
-        _vn30 = {t.upper() for t in _uf.vn30_tickers}
-        _manual = {t.upper() for t in _uf.exclude_tickers}
-        # Latest real-VND close per ticker (reuse the liquidity block's
-        # thousands-scaling rule: price < 1000 ⇒ stored in thousands).
-        _last_px: dict[str, float] = {}
-        if {"close", "ticker"}.issubset(latest_df.columns):
-            for _t, _g in latest_df.groupby("ticker"):
-                _c = float(_g["close"].iloc[-1])
-                _last_px[str(_t)] = _c * (1000.0 if _c < 1000.0 else 1.0)
-        _excluded: dict[str, str] = {}
-        for _t in liquid_tickers:
-            tu = str(_t).upper()
-            if _uf.exclude_vn30 and tu in _vn30:
-                _excluded[_t] = "VN30"
-            elif tu in _manual:
-                _excluded[_t] = "manual-blacklist"
-            elif (_uf.min_price_vnd > 0
-                  and _last_px.get(_t, float("inf")) < _uf.min_price_vnd):
-                _excluded[_t] = f"price<{_uf.min_price_vnd:.0f}VND(penny-proxy)"
-        universe_tickers -= set(_excluded)
-        LOGGER.info(
-            "[UniverseFilter] excluded %s/%s (exclude_vn30=%s min_price_vnd=%.0f "
-            "manual=%s). %s liquid→universe. e.g. %s",
-            len(_excluded), len(liquid_tickers), _uf.exclude_vn30,
-            _uf.min_price_vnd, len(_manual), len(universe_tickers),
-            dict(list(_excluded.items())[:6]),
-        )
-    else:
-        LOGGER.info(
-            "[UniverseFilter] disabled — passing all %s liquid tickers through.",
-            len(liquid_tickers),
-        )
 
     # Send Top-6 liquid tickers to arbitrator/sentiment layer.
     # 6 candidates → full LLM sentiment evaluation → final Top-3 selected by sentiment+quant score.
@@ -922,7 +944,7 @@ def daily_inference(
     fallback_reasons: dict[str, str] = {}
     if not candidate_tickers:
         fallback_mode = True
-        _tau5 = float(thr_5d.get("pnl_threshold_tau", 0.5))
+        _tau5 = 0.45   # FORCED weak-market safe floor (ignore artifact's stale 0.50 tau)
         _ranked = [
             t for t, _p in sorted(
                 stacking_predictions_5d.items(),
@@ -969,12 +991,14 @@ def daily_inference(
             )
         # MR knife-catch scores for the monitored names → [🔪 BẮT ĐÁY] tag.
         mr_scores = mr_score_tickers(candidate_tickers)
+        fb_prices = _get_live_exec_prices(latest_df, candidate_tickers)
         report_html = _build_fallback_observability_report_vi(
             candidate_tickers,
             stacking_predictions_5d,
             all_sentiments,
             fallback_reasons,
             mr_scores,
+            live_prices=fb_prices,
         )
         LOGGER.warning(
             "[FallbackObservability] Returning monitoring-only report for %s "
@@ -1028,10 +1052,28 @@ def daily_inference(
         latest_df=latest_df,
         xgb_model_5d=xgb_model_5d,
         selected_features_5d=selected_features_5d,
+        horizon=int(horizon),
         broadcast=broadcast,
     )
     LOGGER.info("Dual-horizon daily inference completed in %.2fs.", time.perf_counter() - total_start)
     return report_html
+
+
+def _smart_truncate(text: str, limit: int = 300) -> str:
+    """Word-aware truncation that never splits a word in half.
+
+    Operates on RAW text — callers must `html.escape()` the RESULT, never the
+    other way round — so it is impossible to sever an HTML entity (the
+    `html.escape(...)[:500]` anti-pattern cut `&amp;` → `&am`, which Telegram
+    rejects with a parse error).  Returns `text` unchanged when within `limit`;
+    otherwise trims to the last whole word and appends a single-glyph ellipsis.
+    """
+    text = str(text).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    word_cut = cut.rsplit(" ", 1)[0].rstrip()   # back off to the last whole word
+    return (word_cut if word_cut else cut.rstrip()) + "…"
 
 
 def _build_fallback_observability_report_vi(
@@ -1040,6 +1082,7 @@ def _build_fallback_observability_report_vi(
     all_sentiments: dict,
     fallback_reasons: dict,
     mr_scores: dict | None = None,
+    live_prices: dict | None = None,
 ) -> str:
     """Vietnamese 'weak-market' observability report (HTML, the bot's
     Telegram parse mode).
@@ -1076,8 +1119,11 @@ def _build_fallback_observability_report_vi(
         # sub-model fired on extreme panic.
         mr = (mr_scores or {}).get(t) or {}
         tag = " [🔪 BẮT ĐÁY]" if mr.get("fired") else ""
+        _px = (live_prices or {}).get(t)
+        price_str = f"{_px:,.0f} VND" if _px else "N/A"
         out += [
             f"<b>{i}. {html.escape(t)}{tag}</b>",
+            f"   • <b>Giá hiện tại:</b> {html.escape(price_str)}",
             f"   • <b>Đánh giá xu hướng (5 ngày tới):</b> "
             f"Cửa Tăng <b>{p_up:.1f}%</b> | Đi Ngang {p_sd:.1f}% | "
             f"Cửa Giảm {p_dn:.1f}%",
@@ -1085,7 +1131,7 @@ def _build_fallback_observability_report_vi(
             + ("  →  🔪 <b>nhưng MR phát hiện vùng bắt đáy!</b>"
                if mr.get("fired") else ""),
             f"   • <b>Lý do:</b> {html.escape(why)}",
-            f"   • <b>Tin tức &amp; Tâm lý:</b> {html.escape(str(reason_vi))[:500]}",
+            f"   • <b>Tin tức &amp; Tâm lý:</b> {html.escape(_smart_truncate(reason_vi, 800))}",
             f"   • {format_source_links(s.get('source_urls', []) or [])}",
             "",
         ]
@@ -1109,6 +1155,7 @@ def run_trade_execution(
     latest_df: Any,
     xgb_model_5d: Any,
     selected_features_5d: list[str],
+    horizon: int = 5,
     broadcast: bool = True,
 ) -> str:
     """Execute portfolio updates, RL outcome logging, and dispatch Telegram alerts.
@@ -1116,6 +1163,9 @@ def run_trade_execution(
     Args:
         stacking_predictions: dual-horizon dict {"5d": {...}, "20d": {...}} produced by the
             Stacking GBDT (XGBoost+LightGBM+CatBoost → logistic meta) model.
+        horizon: primary horizon (5 or 20) — rendered as the "T+{h} Model"
+            label at the top of each card. The half-Kelly position size is
+            computed per-ticker from its own P(UP) (suggested_weight) below.
         broadcast: When False, the per-ticker push alert via
             `TelegramBot.send_signal_alert()` is skipped. The combined HTML
             report is still built and returned. Used by the interactive bot
@@ -1180,28 +1230,27 @@ def run_trade_execution(
                 continue
 
             sentiment_data = all_sentiments.get(ticker, {})
-            # Cap raw URL list at 3; pass as list so Telegram formatter loops explicitly
-            source_urls: list[str] = (sentiment_data.get("source_urls", []) or [])[:3]
+            # Cap raw URL list at 6 (>=5 sources); pass as list so the Telegram formatter loops explicitly
+            source_urls: list[str] = (sentiment_data.get("source_urls", []) or [])[:6]
             _p5 = stacking_predictions.get("5d", {}).get(ticker, [0, 0, 0])
             confidence_5d = round(_p5[2] * 100, 2)
-            LOGGER.info("[Alert] %s source_urls=%s", ticker, source_urls)
+            _regime = _LATEST_REGIME_BY_TICKER.get(ticker)            # 0–7, or None pre-retrain
+            LOGGER.info("[Alert] %s source_urls=%s regime=%s", ticker, source_urls, _regime)
 
             signal_data = {
                 "action": "MUA",
                 "ticker": ticker,
                 "price": f"{exec_price:,.0f} VND",
-                "horizon": "5 ngày (5d)",
+                "horizon_label": f"T+{int(horizon)}",                  # card header → "T+5 Model"
+                # Regime-aware half-Kelly: regime 0/7 → 0% (stand aside), 1/6 → ≤10% cap.
+                "suggested_weight": suggested_weight(float(_p5[2]), market_regime=_regime),
+                "market_regime": _regime,                              # int 0–7 or None
+                "regime_label": regime_label_vi(_regime),              # VN label for the card
                 # Plain-VN trend split for the new card
                 "prob_up": round(_p5[2] * 100, 1),
                 "prob_side": round(_p5[1] * 100, 1),
                 "prob_down": round(_p5[0] * 100, 1),
-                "status_label": "CHẤP NHẬN TÍN HIỆU",
-                # News & sentiment bullets (degrade gracefully if arbitrator
-                # returned neutral — Điểm cộng/trừ/Kết luận stay readable).
-                "plus_points": sentiment_data.get(
-                    "catalyst", "Không có yếu tố tích cực nổi bật."),
-                "minus_points": sentiment_data.get(
-                    "risk", "Không có rủi ro nổi bật."),
+                # Single integrated analytical paragraph — the card renders only this.
                 "conclusion": sentiment_data.get(
                     "reasoning_vi", "Chưa có dữ liệu tin tức đáng kể."),
                 "sentiment_score": sentiment_data.get("sentiment_score", 0.0),
@@ -1266,7 +1315,7 @@ def _build_sell_hold_report(
         sentiment = all_sentiments.get(ticker, {})
         sentiment_score = float(sentiment.get("sentiment_score", 0.0) or 0.0)
         sentiment_status = _format_sentiment_status(sentiment)
-        reasoning = str(sentiment.get("reasoning_vi", "Không có tin tức đáng kể."))
+        reasoning = _smart_truncate(str(sentiment.get("reasoning_vi", "Không có tin tức đáng kể.")), 400)
         confidence_5d = round(predictions_5d.get(ticker, [0, 0, 0])[2] * 100, 2)
         price = live_exec_prices.get(ticker)
         price_str = f"{price:,.0f} VND" if price else "N/A"
@@ -1296,7 +1345,7 @@ def _build_sell_hold_report(
         else:
             target_str = stop_str = "N/A"
 
-        source_urls = (sentiment.get("source_urls", []) or [])[:3]
+        source_urls = (sentiment.get("source_urls", []) or [])[:6]
         if source_urls:
             url_lines = "\n".join(f"  • {html.escape(u)}" for u in source_urls)
         else:
@@ -1364,7 +1413,10 @@ def inference_for_holdings(
 
     with timed_step(f"Building live Alpha360 features ({window_rows} rows/ticker) for /suggest_sell"):
         generator = Alpha360Generator()
-        live_pl = generator.build_live_features(window_rows=window_rows)
+        # V3/V4 tabular path needs the RAW multi-row OHLCV window (full
+        # open/high/low/close/volume + history) — NOT the Alpha360 tail-1 lag
+        # row, which drops open/high/low and collapses the time series.
+        live_pl = generator.load_live_ohlcv_window(window_rows=window_rows)
         latest_df = live_pl.to_pandas()
 
     if latest_df.empty:
@@ -1388,10 +1440,17 @@ def inference_for_holdings(
             missing_tickers=missing,
         )
 
-    latest_df = latest_df[latest_df["ticker"].astype(str).isin(present)].reset_index(drop=True)
-
-    stacking_predictions_5d, _, _, _, _ = predict_stacking_horizon(latest_df, 5)
-    stacking_predictions_20d, _, _, _, _ = predict_stacking_horizon(latest_df, 20)
+    # CROSS-SECTIONAL PARITY: predict over the FULL universe (do NOT slice to the
+    # held set first, or the `_xsz` ranks degenerate); the predictions dict is
+    # keyed by ticker, so the arbitrator / exec-price / MR steps below read off
+    # `present`.  SECONDARY horizon (20d) is arbitrator cross-check only → non-fatal.
+    stacking_predictions_5d, _, _, _, _ = predict_v3_horizon(latest_df, 5)
+    try:
+        stacking_predictions_20d, _, _, _, _ = predict_v3_horizon(latest_df, 20)
+    except (FileNotFoundError, RuntimeError) as exc:
+        LOGGER.warning("[/suggest_sell] T+20 cross-check unavailable (%s) — using 5d only.",
+                       exc.__class__.__name__)
+        stacking_predictions_20d = {}
     horizon_predictions = {"5d": stacking_predictions_5d, "20d": stacking_predictions_20d}
 
     with timed_step("Holdings arbitrator + sentiment scoring"):
@@ -1481,7 +1540,7 @@ def _build_verify_report(
     # Sentiment
     sent_score = float(sentiment.get("sentiment_score", 0.0) or 0.0)
     sent_status = _format_sentiment_status(sentiment)
-    sent_reasoning = str(sentiment.get("reasoning_vi", "Không có tin tức đáng kể."))
+    sent_reasoning = _smart_truncate(str(sentiment.get("reasoning_vi", "Không có tin tức đáng kể.")), 600)
 
     # Final arbitrator verdict (decision integer 0/1/2)
     verdict_html = _VERIFY_VERDICT_LABELS.get(decision, "<i>(chưa có verdict)</i>")
@@ -1537,14 +1596,18 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
     LOGGER.info("[/verify] Single-ticker analysis: %s", ticker)
     total_start = time.perf_counter()
 
-    # --- Step 1: Liquidity / data availability check ---
-    # `Alpha360Generator.build_live_features(tickers=[ticker])` filters the
-    # parquet glob down to a single file — efficient single-ticker read.
-    # If the parquet doesn't exist → FileNotFoundError → warning to user.
+    # --- Step 1: Build features over the FULL active universe ---
+    # CROSS-SECTIONAL PARITY: the alpha features are cross-sectional Gaussian-
+    # rank Z-scores (`_xsz`).  Ranking a single ticker against itself collapses
+    # every `_xsz` to 0 → garbage prediction.  So we build the WHOLE universe's
+    # feature panel (exactly like daily_inference), let `_xsz` materialize over
+    # the full cross-section, and slice to `ticker` only from the RESULT below.
     try:
-        with timed_step(f"Building live features for /verify {ticker}"):
+        with timed_step(f"Building live universe OHLCV window for /verify {ticker}"):
             generator = Alpha360Generator()
-            live_pl = generator.build_live_features(tickers=[ticker], window_rows=window_rows)
+            # RAW multi-row OHLCV window (full OHLCV + history) for the V3/V4
+            # tabular pipeline — not the Alpha360 tail-1 lag row.
+            live_pl = generator.load_live_ohlcv_window(window_rows=window_rows)
             latest_df = live_pl.to_pandas()
     except FileNotFoundError:
         LOGGER.warning("[/verify] No OHLCV parquet for %s.", ticker)
@@ -1567,19 +1630,27 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
             f"không có dữ liệu để phân tích."
         )
 
-    # Defensive filter (build_live_features should already have filtered).
-    latest_df = latest_df[latest_df["ticker"].astype(str) == ticker].reset_index(drop=True)
+    # Do NOT slice latest_df to `ticker` here — inference must see the full
+    # universe so the cross-sectional `_xsz` ranks are non-degenerate.  The
+    # predictions dict below is keyed by ticker, so we slice the RESULT instead.
 
-    # --- Step 2: Stacking GBDT inference (5d primary + 20d for arbitrator) ---
+    # --- Step 2: Stacking GBDT inference (5d primary + 20d optional cross-check) ---
     try:
-        stacking_5d, _, _, _, _ = predict_stacking_horizon(latest_df, 5)
-        stacking_20d, _, _, _, _ = predict_stacking_horizon(latest_df, 20)
+        stacking_5d, _, _, _, _ = predict_v3_horizon(latest_df, 5)
     except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("[/verify] Stacking inference failed for %s.", ticker)
+        LOGGER.exception("[/verify] 5d inference failed for %s.", ticker)
         return (
             f"⚠️ Lỗi mô hình Stacking GBDT cho <b>{html.escape(ticker)}</b>: "
             f"<code>{html.escape(str(exc))}</code>"
         )
+    # 20d is the secondary cross-check — optional; degrade gracefully if its
+    # artifact is missing/mismatched so /verify still shows the 5d view.
+    try:
+        stacking_20d, _, _, _, _ = predict_v3_horizon(latest_df, 20)
+    except (FileNotFoundError, RuntimeError) as exc:
+        LOGGER.warning("[/verify] T+20 cross-check unavailable for %s (%s) — 5d only.",
+                       ticker, exc.__class__.__name__)
+        stacking_20d = {}
 
     if ticker not in stacking_5d:
         return (
@@ -1681,9 +1752,15 @@ def rebalance_portfolio(user_id: str, window_rows: int = 120) -> str:
 
     LOGGER.info("[/rebalance] Holdings: %s", held_tickers)
 
-    with timed_step(f"[/rebalance] Building live Alpha360 features for {held_tickers}"):
+    # CROSS-SECTIONAL PARITY: build the FULL active universe so `_xsz`
+    # Gaussian-rank Z-scores span the whole cross-section, not just the
+    # (possibly tiny) held set.  Predictions are sliced to held names afterwards.
+    with timed_step("[/rebalance] Building live universe features"):
         generator = Alpha360Generator()
-        live_pl = generator.build_live_features(tickers=held_tickers, window_rows=window_rows)
+        # V3/V4 tabular path needs the RAW multi-row OHLCV window (full
+        # open/high/low/close/volume + history) — NOT the Alpha360 tail-1 lag
+        # row, which drops open/high/low and collapses the time series.
+        live_pl = generator.load_live_ohlcv_window(window_rows=window_rows)
         latest_df = live_pl.to_pandas()
 
     if latest_df.empty:
@@ -1694,8 +1771,9 @@ def rebalance_portfolio(user_id: str, window_rows: int = 120) -> str:
     if not present:
         return ""
 
-    latest_df = latest_df[latest_df["ticker"].astype(str).isin(present)].reset_index(drop=True)
-    stacking_predictions_5d, _, _, _, _ = predict_stacking_horizon(latest_df, 5)
+    # Predict over the FULL universe (correct cross-section), then read off the
+    # held names — do NOT filter latest_df to `present` before inference.
+    stacking_predictions_5d, _, _, _, _ = predict_v3_horizon(latest_df, 5)
     live_prices = _get_live_exec_prices(latest_df, present)
 
     holdings_context: list[dict] = []
@@ -1719,83 +1797,36 @@ def rebalance_portfolio(user_id: str, window_rows: int = 120) -> str:
     return _build_rebalance_report(holdings_context, advice)
 
 
-def full_pipeline(force_crawl: bool = False) -> None:
-    """Legacy full pipeline entrypoint kept explicit; not default daily trading path."""
+def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> None:
+    """End-of-day pipeline: OHLCV crawl → LLM sentiment → inference.
+
+    A single `--task full_pipeline` runs the full EOD sequence so the bot is
+    primed for tomorrow's session:
+      1. ingest the day's HOSE OHLCV (market-hour guarded; `force_crawl` bypasses;
+         `days_back` limits to the last N days — e.g. 1 for previous-day-only);
+      2. refresh daily LLM news sentiment;
+      3. run the daily inference (T+5 Top-3 broadcast).
+
+    Step 1 is the ONLY OHLCV ingestion entrypoint in the bot/CLI; the V4 backtest
+    engine (train_models.py / run_backtest.py) reads the populated store and never
+    crawls.
+    """
     from src.crawlers.sentiment_crawler import update_daily_sentiment
-    from src.data.crawlers import MacroCrawler, MacroProvider, StockCrawler
-    from src.data.db_engine import DuckDBEngine
 
-    LOGGER.warning("Running legacy full_pipeline. This performs crawl-if-allowed + full rebuild + inference.")
+    LOGGER.warning("Running full_pipeline (EOD): OHLCV crawl + sentiment refresh + inference.")
 
-    if is_crawl_allowed(force_crawl=force_crawl):
-        db_engine = DuckDBEngine()
-        start_date = "2014-01-01"
+    # 1. EOD OHLCV ingestion (guarded by 15:00 ICT close unless --force-crawl).
+    #    days_back=1 (previous-day) keeps the daily refresh incremental.
+    crawl_hose(force_crawl=force_crawl, days_back=days_back)
 
-        try:
-            with timed_step(f"Fetching Macro Data since {start_date}"):
-                macro_crawler = MacroCrawler()
-                macro_df = macro_crawler.fetch_macro(start_date=start_date, file_path="data/macro_daily.parquet")
+    # 2. Daily LLM news sentiment.
+    with timed_step("Fetching daily LLM sentiment"):
+        sentiment_df = update_daily_sentiment(db_path="data/quant_v6_core.duckdb")
+        LOGGER.info("Fetched %s sentiment records.", len(sentiment_df))
 
-            if not macro_df.empty:
-                LOGGER.info("Fetched %s macro records. Upserting to DuckDB.", len(macro_df))
-                db_engine.upsert_dataframe(macro_df, "macro_daily")
-
-            with timed_step(f"Fetching CPI and Deposit Rates since {start_date}"):
-                macro_provider = MacroProvider()
-                macro_raw_df = macro_provider.fetch_all()
-
-            if not macro_raw_df.empty:
-                LOGGER.info("Fetched %s long-format macro records. Upserting to DuckDB.", len(macro_raw_df))
-                db_engine.upsert_dataframe(macro_raw_df, "macro_economic_raw")
-
-            with timed_step("Fetching daily LLM sentiment"):
-                sentiment_df = update_daily_sentiment(db_path="data/quant_v6_core.duckdb")
-                LOGGER.info("Fetched %s sentiment records.", len(sentiment_df))
-
-            stock_crawler = StockCrawler()
-            hose_tickers = stock_crawler.get_hose_universe()
-
-            if not hose_tickers:
-                LOGGER.error("Could not discover HOSE universe. Check connection.")
-                sys.exit(1)
-
-            LOGGER.info("HOSE Universe Discovered: %s tickers.", len(hose_tickers))
-
-            for idx, ticker in enumerate(hose_tickers, start=1):
-                LOGGER.info("Ingesting HOSE %s/%s ticker=%s", idx, len(hose_tickers), ticker)
-                # TD-12 circuit breaker: 45s hard cap per ticker.
-                try:
-                    stock_df = stock_crawler._fetch_ohlcv_with_timeout(
-                        ticker=ticker,
-                        start_date=start_date,
-                        file_path=f"data/ohlcv_{ticker}.parquet",
-                        sleep_before_request=True,
-                    )
-                except Exception as ticker_exc:  # noqa: BLE001
-                    LOGGER.error("Per-ticker fetch wrapper crashed for %s: %s", ticker, ticker_exc)
-                    continue
-                if not stock_df.empty:
-                    try:
-                        db_engine.upsert_dataframe(stock_df, "stock_ohlcv")
-                    except Exception as upsert_exc:  # noqa: BLE001
-                        LOGGER.error("DuckDB upsert failed for %s: %s — continuing.", ticker, upsert_exc)
-
-            LOGGER.info("Final Verification of DuckDB State...")
-            macro_count = db_engine.query("SELECT COUNT(*) FROM macro_daily").iloc[0, 0]
-            macro_raw_count = db_engine.query("SELECT COUNT(*) FROM macro_economic_raw").iloc[0, 0]
-            stock_count = db_engine.query("SELECT COUNT(*) FROM stock_ohlcv").iloc[0, 0]
-
-            LOGGER.info("Total Macro Records (Daily): %s", macro_count)
-            LOGGER.info("Total Macro Records (Raw Long): %s", macro_raw_count)
-            LOGGER.info("Total Stock Records (OHLCV): %s", stock_count)
-
-        finally:
-            LOGGER.info("Closing DuckDB connection to release file lock.")
-            db_engine.close()
-    else:
-        LOGGER.info("Crawl phase bypassed. Continuing with existing local data.")
-
-    build_alpha360()
+    # 3. Run the daily inference (T+5 Top-3 broadcast). The V4 serve path
+    #    recomputes features from raw OHLCV via load_live_ohlcv_window; there is
+    #    no Alpha360 feature-matrix build (that path was retired entirely).
     daily_inference()
 
 
@@ -1804,12 +1835,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--task",
         default="daily_inference",
-        choices=["daily_inference", "build_alpha360", "crawl_hose", "full_pipeline"],
-        help="Task to run. daily_inference is no-crawl live path.",
+        choices=["daily_inference", "crawl_hose", "full_pipeline"],
+        help="Task to run. daily_inference is the no-crawl live path; "
+             "crawl_hose / full_pipeline are the EOD ingestion paths.",
     )
-    parser.add_argument("--start-date", default="2016-01-01", help="Crawler start date, YYYY-MM-DD.")
-    parser.add_argument("--end-date", default=None, help="Crawler end date, YYYY-MM-DD. Defaults to today.")
-    parser.add_argument("--data-dir", default="data", help="Directory for ohlcv_<ticker>.parquet files.")
     parser.add_argument("--window-rows", type=int, default=120, help="Rows per ticker for live Alpha360 inference.")
     parser.add_argument(
         "--max-candidates",
@@ -1822,7 +1851,12 @@ def parse_args() -> argparse.Namespace:
             "Default 6 matches the Top-6→Top-3 design."
         ),
     )
-    parser.add_argument("--force-crawl", action="store_true", help="Bypass market-hour crawl guard.")
+    parser.add_argument("--force-crawl", action="store_true",
+                        help="Bypass the 15:00 ICT market-hour crawl guard (operator rebuild).")
+    parser.add_argument("--days-back", type=int, default=None,
+                        help="Incremental crawl: fetch only the last N calendar days "
+                             "(1 = previous day). Applies to --task crawl_hose / full_pipeline. "
+                             "Omit for a full crawl from the 2016 start date.")
     return parser.parse_args()
 
 
@@ -1902,16 +1936,9 @@ def main() -> None:
 
     try:
         if task_name == "crawl_hose":
-            crawl_hose(
-                start_date=args.start_date,
-                end_date=args.end_date,
-                data_dir=args.data_dir,
-                force_crawl=args.force_crawl,
-            )
-        elif task_name == "build_alpha360":
-            build_alpha360()
+            crawl_hose(force_crawl=args.force_crawl, days_back=args.days_back)
         elif task_name == "full_pipeline":
-            full_pipeline(force_crawl=args.force_crawl)
+            full_pipeline(force_crawl=args.force_crawl, days_back=args.days_back)
         else:
             daily_inference(window_rows=args.window_rows, max_candidates=args.max_candidates)
     except (KeyboardInterrupt, SystemExit):

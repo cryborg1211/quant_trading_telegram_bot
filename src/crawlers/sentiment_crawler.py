@@ -12,6 +12,7 @@ import duckdb  # type: ignore[import-untyped]
 import pandas as pd
 
 from config.settings import CONFIG
+from src.data import price_lookup  # fresh-parquet liquidity ranking (stock_ohlcv retired)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -159,22 +160,10 @@ class SentimentCrawler:
         return fallback
 
     def _active_tickers(self, limit: int) -> list[str]:
-        query = """
-            SELECT ticker
-            FROM stock_ohlcv
-            WHERE date >= (SELECT MAX(date) - INTERVAL 10 DAY FROM stock_ohlcv)
-            GROUP BY ticker
-            ORDER BY SUM(volume) DESC NULLS LAST
-            LIMIT ?
-        """
-        try:
-            # No `read_only=True` — DuckDB rejects mixed-config connections to
-            # the same file in one process (see db_engine.py docstring).
-            with duckdb.connect(self.db_path) as conn:
-                rows = conn.execute(query, [limit]).fetchall()
-            return [str(r[0]).upper() for r in rows]
-        except Exception:
-            return []
+        # Most-liquid names by recent volume, read from the FRESH parquet vintage
+        # (stock_ohlcv was retired). price_lookup opens its own in-memory
+        # connection, so no DuckDB *file* handle is taken here.
+        return price_lookup.top_tickers_by_volume(limit=limit, lookback_days=10)
 
     def _fetch_rss_items(self, start_date: date, end_date: date) -> list[NewsItem]:
         if feedparser is None:

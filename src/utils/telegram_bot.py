@@ -119,7 +119,8 @@ EMPTY_PORTFOLIO_MESSAGE = (
 HELP_TEXT = (
     "🤖 <b>TRỢ LÝ ĐẦU TƯ — DANH SÁCH LỆNH</b>\n"
     "\n"
-    "🟢 <b>/suggest_buy</b> — Gợi ý cổ phiếu nên MUA hôm nay.\n"
+    "<b>/suggest_buy5</b> — Khuyến nghị MUA T+5 (half-Kelly sizing).\n"
+    "<b>/suggest_buy20</b> — Khuyến nghị MUA T+20 (half-Kelly sizing).\n"
     "🔴 <b>/suggest_sell</b> — Đánh giá NÊN BÁN hay GIỮ danh mục của bạn.\n"
     "⚖️ <b>/rebalance</b> — Tư vấn cơ cấu lại danh mục hiện tại.\n"
     "🔍 <b>/verify</b> <i>[Mã]</i> — Soi nhanh 1 cổ phiếu "
@@ -423,86 +424,102 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
 
 
-async def suggest_buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
-    """Run the full daily inference pipeline on demand and reply with Top-3 BUY signals.
+async def _suggest_buy_dispatch(update: Update, horizon: int) -> None:
+    """Shared backend for /suggest_buy5 + /suggest_buy20.
 
-    Calls `daily_inference(broadcast=False)` so the per-chat-ID push alerts
-    in `TELEGRAM_CHAT_ID` are suppressed — only the bot reply is delivered,
-    preventing the duplicate-spam bug.
+    Posts ONE minimal loading message (so the bot doesn't look dead during the
+    1–2 min inference), then replaces/deletes it with the final cards.  NO
+    banners, NO summary table.  Calls `daily_inference(broadcast=False,
+    horizon=horizon)` (per-chat push alerts suppressed so only this reply
+    delivers the report).  Rate-limit key includes the horizon so the two
+    commands have independent cooldowns.
     """
     if update.message is None:
         return
-    _log_request("/suggest_buy", update)
+    cmd = f"suggest_buy{horizon}"
+    _log_request(f"/{cmd}", update)
 
-    # TD-30: per-user 30 s cooldown. /suggest_buy is expensive (Gemini call
-    # + 30 GNews fan-out) so we gate it BEFORE the wait message and audit
-    # write — repeat spam costs us nothing past one cheap reply.
     user_id = _extract_user_id(update)
-    cooldown_left = _check_and_record_rate_limit(user_id, "suggest_buy")
+    cooldown_left = _check_and_record_rate_limit(user_id, cmd)
     if cooldown_left is not None:
         await update.message.reply_text(
-            f"⏳ <b>Quá nhanh!</b> Vui lòng đợi <b>{cooldown_left:.0f}s</b> "
-            f"trước khi gọi lại /suggest_buy.",
+            f"<b>Quá nhanh.</b> Vui lòng đợi {cooldown_left:.0f}s trước khi gọi lại /{cmd}.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    # Audit trail at start so we record every invocation, including ones that
-    # subsequently fail (model crash, network blip) — useful for diagnosing
-    # "why is the bot slow at 9am" review questions.
-    await _audit_log_async(
-        user_id=user_id,
-        command="suggest_buy",
-    )
+    await _audit_log_async(user_id=user_id, command=cmd)
 
+    # Minimal loading indicator — replaced (single card) or deleted (multi-card)
+    # by the final delivery below, so the bot never looks dead during the 1–2 min
+    # inference.  `&amp;` is the HTML entity that renders the "&" character.
     wait_msg = await update.message.reply_text(
-        WAIT_MESSAGE_BUY,
+        f"⏳ Đang tổng hợp dữ liệu &amp; chạy mô hình T+{horizon}...",
         parse_mode=ParseMode.HTML,
     )
 
     try:
         from main import daily_inference  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("Failed to import daily_inference")
+        LOGGER.exception("/%s: failed to import daily_inference", cmd)
         await wait_msg.edit_text(
-            f"❌ <b>Lỗi import pipeline:</b>\n<code>{html.escape(str(exc))}</code>",
+            f"<b>Lỗi import pipeline:</b>\n<code>{html.escape(str(exc))}</code>",
             parse_mode=ParseMode.HTML,
         )
         return
 
     try:
-        # broadcast=False → suppresses TelegramBot.send_signal_alert() pushes,
-        # so the chat reply below is the ONLY delivery channel.
-        report_html: str = await asyncio.to_thread(daily_inference, broadcast=False)
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("/suggest_buy: daily_inference crashed")
+        report_html: str = await asyncio.to_thread(
+            daily_inference, broadcast=False, horizon=int(horizon),
+        )
+    except FileNotFoundError as exc:
+        LOGGER.exception("/%s: V3 horizon=%d bundle missing", cmd, horizon)
         await wait_msg.edit_text(
-            f"❌ <b>Lỗi khi chạy mô hình:</b>\n<code>{html.escape(str(exc))}</code>",
+            f"<b>Thiếu model T+{horizon}.</b>\n"
+            f"<code>{html.escape(str(exc))}</code>\n"
+            f"<i>Run: python train_models.py --tb-horizon {horizon} → python run_backtest.py</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    except RuntimeError as exc:
+        # Feature-recipe tripwire (train/serve skew) — actionable: retrain.
+        LOGGER.exception("/%s: V3 horizon=%d feature-recipe mismatch", cmd, horizon)
+        await wait_msg.edit_text(
+            f"<b>Model T+{horizon} lệch phiên bản feature (cần train lại).</b>\n"
+            f"<code>{html.escape(str(exc))}</code>\n"
+            f"<i>Run: python train_models.py --tb-horizon {horizon} → python run_backtest.py</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("/%s: daily_inference crashed", cmd)
+        await wait_msg.edit_text(
+            f"<b>Lỗi khi chạy mô hình:</b>\n<code>{html.escape(str(exc))}</code>",
             parse_mode=ParseMode.HTML,
         )
         return
 
     if not report_html or not report_html.strip():
-        # Task 2.3: when the pool is empty, append the 5d top-5 probability
-        # breakdown so the operator sees EXACTLY why the bot stayed quiet
-        # (which tickers were close, and whether τ* or the meta-gate blocked).
-        msg = EMPTY_BUY_RESULT_MESSAGE
-        try:
-            import main as _main  # noqa: PLC0415
-
-            lines = list(getattr(_main, "_LATEST_5D_BREAKDOWN", []))
-            if lines:
-                body = "\n".join(html.escape(ln) for ln in lines)
-                msg += (
-                    "\n\n🔎 <b>Vì sao bot im lặng — Top 5 (5d):</b>\n"
-                    f"<pre>{body}</pre>"
-                )
-        except Exception:  # noqa: BLE001
-            LOGGER.exception("Failed to attach 5d breakdown to empty reply")
-        await wait_msg.edit_text(msg, parse_mode=ParseMode.HTML)
+        await wait_msg.edit_text(
+            f"<b>Không có tín hiệu MUA T+{horizon} hôm nay.</b>\n"
+            "<i>Không có mã nào vượt qua Kelly threshold + Liquidity gate + Sentiment filter.</i>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
+    # Deliver the cards: _send_or_reply_chunks edits the loading message into the
+    # single card, or DELETES it and posts fresh messages when there are several.
     await _send_or_reply_chunks(update, wait_msg, _split_html_report(report_html))
+
+
+async def suggest_buy5_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
+    """T+5 BUY recommendations with half-Kelly sizing."""
+    await _suggest_buy_dispatch(update, horizon=5)
+
+
+async def suggest_buy20_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
+    """T+20 BUY recommendations with half-Kelly sizing."""
+    await _suggest_buy_dispatch(update, horizon=20)
 
 
 async def add_portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1199,7 +1216,7 @@ async def msg_id2_command(
         # Never falsely confirm delivery — report the real failure to Admin.
         LOGGER.warning("[msg_id2] delivery to ID2 failed: %s", exc)
         await update.message.reply_text(
-            f"❌ Gửi thất bại: <code>{html.escape(str(exc))[:200]}</code>",
+            f"❌ Gửi thất bại: <code>{html.escape(str(exc)[:200])}</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1213,7 +1230,8 @@ async def msg_id2_command(
 # The canonical command list pushed to Telegram via set_my_commands on startup.
 # This populates the "/" autocomplete menu in every chat.
 _BOT_COMMANDS: list[BotCommand] = [
-    BotCommand("suggest_buy", "Lấy khuyến nghị MUA (Top 3 Quant & Sentiment)"),
+    BotCommand("suggest_buy5", "Khuyến nghị MUA T+5 — Kelly sizing"),
+    BotCommand("suggest_buy20", "Khuyến nghị MUA T+20 — Kelly sizing"),
     BotCommand("suggest_sell", "Lấy khuyến nghị BÁN/HOLD cho danh mục cá nhân"),
     BotCommand("rebalance", "AI tư vấn cơ cấu danh mục hiện tại"),
     BotCommand("verify", "Kiểm định nhanh 1 cổ phiếu (VD: /verify HPG)"),
@@ -1261,11 +1279,18 @@ def build_application() -> Application:
     # Hyphens are NOT valid in slash commands. Canonical commands use the
     # underscore form; the hyphen MessageHandler regexes are fallbacks for
     # users typing the hyphenated forms manually.
-    app.add_handler(CommandHandler("suggest_buy", suggest_buy_command))
+    app.add_handler(CommandHandler("suggest_buy5",  suggest_buy5_command))
+    app.add_handler(CommandHandler("suggest_buy20", suggest_buy20_command))
     app.add_handler(
         MessageHandler(
-            filters.Regex(r"^/suggest-buy(@\w+)?(\s|$)"),
-            suggest_buy_command,
+            filters.Regex(r"^/suggest-buy5(@\w+)?(\s|$)"),
+            suggest_buy5_command,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.Regex(r"^/suggest-buy20(@\w+)?(\s|$)"),
+            suggest_buy20_command,
         )
     )
 

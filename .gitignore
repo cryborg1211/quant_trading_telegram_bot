@@ -26,12 +26,10 @@ data/ohlcv_*.parquet
 data/macro_daily.parquet
 data/alpha360_features.parquet
 models/stacking/
-models/mr/
 
-# --- Logs & scratch (throwaway) ---
+# --- Logs ---
 logs/
 *.log
-scratch/
 
 # --- IDE ---
 .idea/
@@ -43,9 +41,3 @@ scratch/
 # --- Vendored / archived code (not part of source) ---
 old-data/
 TradingAgents-main/
-
-# --- Claude Code session internals ---
-.claude/
-
-# --- All Parquet data artefacts (regenerable) ---
-*.parquet

@@ -26,6 +26,8 @@ import os
 from datetime import datetime, timedelta
 from typing import Any
 
+from src.data import price_lookup  # fresh-parquet price lookups (stock_ohlcv retired)
+
 LOGGER = logging.getLogger(__name__)
 
 # Commands recorded with a per-row ticker — the only ones we can audit
@@ -41,6 +43,26 @@ _MAX_TICKERS_PER_REPORT: int = 10
 # News-headline budget passed to Gemini for the "why did it move" prompt.
 # More than ~5 headlines drowns out the signal in clickbait.
 _MAX_HEADLINES_FOR_LLM: int = 5
+
+# VN round-trip transaction cost (~0.15%/leg fee+tax, buy+sell) deducted from the
+# gross price move so the audit reports a NET, cost-aware return (VN T+2.5).
+_VN_ROUND_TRIP_COST_PCT: float = 0.30
+
+# Commands that modify a REAL position → PnL is NET of round-trip cost.
+# /verify (+ /suggest_buy) are hypothetical signals → GROSS price move only.
+_NET_PNL_COMMANDS: frozenset[str] = frozenset({"add", "remove", "suggest_sell"})
+
+
+def _truncate(text: str, limit: int = 300) -> str:
+    """Word-aware truncation — never splits a word. Operates on RAW text so the
+    subsequent ``html.escape()`` can never sever an HTML entity. Single-glyph
+    ellipsis; returns the text unchanged when within ``limit``."""
+    text = str(text).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    w = cut.rsplit(" ", 1)[0].rstrip()
+    return (w or cut.rstrip()) + "…"
 
 
 # ─── Public entry ──────────────────────────────────────────────────────────
@@ -138,23 +160,14 @@ def _get_t0_price(ticker: str, ts: Any, db: Any) -> float | None:
         ts_date = ts.date()
     else:
         ts_date = ts
-    row = db.conn.execute(
-        "SELECT close FROM stock_ohlcv "
-        "WHERE ticker = ? AND date <= ? "
-        "ORDER BY date DESC LIMIT 1",
-        [ticker, ts_date],
-    ).fetchone()
-    return float(row[0]) if row and row[0] is not None else None
+    # Fresh-parquet lookup (stock_ohlcv retired). Same semantics: most recent
+    # completed candle at-or-before the query date.
+    return price_lookup.close_on_or_before(ticker, ts_date, conn=db.conn)
 
 
 def _get_current_price(ticker: str, db: Any) -> float | None:
     """Latest close price for the ticker."""
-    row = db.conn.execute(
-        "SELECT close FROM stock_ohlcv "
-        "WHERE ticker = ? ORDER BY date DESC LIMIT 1",
-        [ticker],
-    ).fetchone()
-    return float(row[0]) if row and row[0] is not None else None
+    return price_lookup.latest_close(ticker, conn=db.conn)
 
 
 # ─── Per-ticker pipeline ──────────────────────────────────────────────────
@@ -188,7 +201,11 @@ def _evaluate_one_ticker(
             "error": f"giá T0 không hợp lệ ({t0})",
         }
 
-    pct = (t_now - t0) / t0 * 100.0
+    cmds = {str(c).lower() for c in (item.get("commands") or [])}
+    is_net = bool(cmds & _NET_PNL_COMMANDS)        # realized position → net of cost
+    gross_pct = (t_now - t0) / t0 * 100.0
+    pct = gross_pct - _VN_ROUND_TRIP_COST_PCT if is_net else gross_pct
+    pnl_basis = "Net" if is_net else "Gross"
 
     try:
         explanation = _explain_move(ticker, days, pct)
@@ -202,6 +219,7 @@ def _evaluate_one_ticker(
         "t0": t0,
         "t_now": t_now,
         "pct": pct,
+        "pnl_basis": pnl_basis,
         "explanation": explanation,
     }
 
@@ -251,7 +269,7 @@ def _explain_move(ticker: str, days: int, pct: float) -> str:
     if not api_key:
         return "(GEMINI_API_KEY chưa set — bỏ qua phân tích AI.)"
 
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-flash-latest").removeprefix("models/")
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").removeprefix("models/")
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model=model_name,
@@ -295,10 +313,11 @@ def _build_audit_report(rows: list[dict[str, Any]], days: int, truncated: bool) 
             )
             continue
         move_label = _format_move(r["pct"])
-        explanation = html.escape(str(r.get("explanation", "—")))
+        basis = "Net – đã trừ phí" if r.get("pnl_basis") == "Net" else "Gross"
+        explanation = html.escape(_truncate(str(r.get("explanation", "—")), 300))
         blocks.append(
             f"\n• <b>Mã:</b> {ticker}\n"
-            f"• <b>Thực tế:</b> {move_label}\n"
+            f"• <b>Thực tế:</b> {move_label}  <i>({basis})</i>\n"
             f"• <b>Nguyên nhân (AI):</b> {explanation}"
         )
 

@@ -99,58 +99,28 @@ class DuckDBEngine:
 
     def _init_tables(self):
         """Creates the core research tables if they do not exist."""
-        # 1. stock_ohlcv
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS stock_ohlcv (
-                ticker VARCHAR,
-                date DATE,
-                open DOUBLE,
-                high DOUBLE,
-                low DOUBLE,
-                close DOUBLE,
-                volume DOUBLE,
-                adj_close DOUBLE,
-                PRIMARY KEY (ticker, date)
-            )
-        """)
+        # 1. (RETIRED table: stock_ohlcv — do NOT recreate.) crawl_hose writes the
+        #    fresh data/ohlcv_*.parquet shards, never this table, so it drifted
+        #    ~18 days stale. ALL OHLCV reads now hit the parquet vintage:
+        #    train/serve features via pipeline.load_ohlcv, and the live price
+        #    lookups (RL backfill / audit / sentiment liquidity) via
+        #    src/data/price_lookup.py. Recreating it here would resurrect the
+        #    stale-data trap the DB audit closed.
 
-        # 2. macro_daily — wide-format daily macro features.
-        # Schema-evolution safe: new columns (vnibor 1-month tenor, inflation_yoy)
-        # are added in-place to existing tables on next bot/cron startup.
-        self._init_macro_daily_table()
+        # 2. (RETIRED table: macro_daily — do NOT recreate.) V4 inference uses
+        #    cross-sectional price alphas + an HMM price proxy, not macro features;
+        #    its only writer (MacroCrawler.fetch_macro) is a manual dry-run never
+        #    wired into the live pipeline, and its only reader was the dead Alpha360
+        #    path. Dropped in the DB audit.
 
-        # 3. sentiment_score
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS sentiment_score (
-                ticker VARCHAR,
-                date DATE,
-                sentiment_nlp DOUBLE,
-                impact_force DOUBLE,
-                PRIMARY KEY (ticker, date)
-            )
-        """)
+        # 3. (removed dead table: sentiment_score — never populated; live LLM
+        #     sentiment lives in hist_sentiment_llm_labeled. See the DB audit.)
 
-        # 4. macro_economic_raw (Qlib-style Long Format)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS macro_economic_raw (
-                date DATE,
-                indicator_name VARCHAR,
-                value DOUBLE,
-                PRIMARY KEY (date, indicator_name)
-            )
-        """)
+        # 4. (removed dead table: macro_economic_raw — the MacroProvider writer
+        #     was excised; macro features live in macro_daily.)
         
-        # 5. live_positions (Active Portfolio Tracking)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS live_positions (
-                telegram_id VARCHAR,
-                ticker VARCHAR,
-                quantity INTEGER,
-                entry_price DOUBLE,
-                entry_date DATE,
-                PRIMARY KEY (telegram_id, ticker)
-            )
-        """)
+        # 5. (removed dead table: live_positions — legacy; live holdings live in
+        #     `portfolio` (see portfolio_manager.py).)
         
         # 6. trade_history (Historical Logs for RL/Reporting)
         # Split into two execute() calls: DuckDB's behaviour for multi-statement
@@ -192,53 +162,8 @@ class DuckDBEngine:
         # was called, so audit writes can begin as soon as the table exists.
         self._init_audit_log_table()
 
-    # Columns the wide-format macro_daily table is expected to expose.
-    # Adding to this list automatically migrates existing tables on next
-    # DuckDBEngine() init via ALTER TABLE ADD COLUMN.
-    _MACRO_DAILY_COLUMNS: tuple[tuple[str, str], ...] = (
-        ("date", "DATE"),
-        ("dxy_close", "DOUBLE"),
-        ("sp500_close", "DOUBLE"),
-        ("usd_vnd", "DOUBLE"),
-        ("interbank_on_rate", "DOUBLE"),
-        ("vnibor", "DOUBLE"),          # 1-month VN interbank rate (new)
-        ("inflation_yoy", "DOUBLE"),   # VN CPI YoY % (new, monthly cadence)
-    )
-
-    def _init_macro_daily_table(self) -> None:
-        """Create or migrate the `macro_daily` table to the latest column set."""
-        table_exists = bool(
-            self.conn.execute(
-                "SELECT COUNT(*) FROM information_schema.tables "
-                "WHERE table_name = 'macro_daily'"
-            ).fetchone()[0]
-        )
-
-        if not table_exists:
-            cols_sql = ",\n                ".join(
-                f"{name} {dtype}" for name, dtype in self._MACRO_DAILY_COLUMNS
-            )
-            self.conn.execute(f"""
-                CREATE TABLE macro_daily (
-                    {cols_sql},
-                    PRIMARY KEY (date)
-                )
-            """)
-            LOGGER.info("[DuckDB] Created `macro_daily` with %s columns.", len(self._MACRO_DAILY_COLUMNS))
-            return
-
-        existing_cols = {
-            r[0]
-            for r in self.conn.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = 'macro_daily'"
-            ).fetchall()
-        }
-
-        for col_name, col_type in self._MACRO_DAILY_COLUMNS:
-            if col_name not in existing_cols:
-                LOGGER.info("[DuckDB] Migrating macro_daily: ADD COLUMN %s %s", col_name, col_type)
-                self.conn.execute(f"ALTER TABLE macro_daily ADD COLUMN {col_name} {col_type}")
+    # (RETIRED: _MACRO_DAILY_COLUMNS + _init_macro_daily_table were removed with
+    #  the macro_daily table — see the DB audit. V4 does not use macro features.)
 
     def _init_audit_log_table(self) -> None:
         """Create the per-user command audit-trail table.

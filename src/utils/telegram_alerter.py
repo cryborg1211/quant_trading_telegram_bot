@@ -51,22 +51,22 @@ def _domain_label(url: str) -> str:
     return next((v for k, v in _DOMAIN_LABELS.items() if k in domain), domain or "Nguồn")
 
 
-def format_source_links(urls: list[str] | None, limit: int = 2) -> str:
-    """One-line clickable source attribution for the Telegram cards.
+def format_source_links(urls: list[str] | None, limit: int = 6) -> str:
+    """Clean single-line source attribution for the Telegram cards.
 
-    Top `limit` (default 2) URLs →
-    '🔗 <b>Nguồn báo:</b> <a href="U1">Bài viết 1</a> | <a href="U2">Bài viết 2</a>'
-    href is attribute-escaped (quote=True). Shared by the normal
-    /suggest_buy card AND the fallback report (single source of truth).
+    Up to `limit` (default 6) URLs rendered as domain-labelled links:
+    'Nguồn tham khảo: <a href="U1">VnExpress</a> · <a href="U2">CafeF</a> · …'
+    href is attribute-escaped (quote=True). Shared by the /suggest_buy card,
+    the combined report, and the fallback report (single source of truth).
     """
     clean = [u.strip() for u in (urls or []) if isinstance(u, str) and u.strip()][:limit]
     if not clean:
-        return "🔗 <b>Nguồn báo:</b> <i>Chưa có liên kết tham khảo</i>"
+        return "Nguồn tham khảo: chưa có liên kết."
     parts = [
-        f'<a href="{html.escape(u, quote=True)}">Bài viết {i}</a>'
-        for i, u in enumerate(clean, 1)
+        f'<a href="{html.escape(u, quote=True)}">{html.escape(_domain_label(u))}</a>'
+        for u in clean
     ]
-    return "🔗 <b>Nguồn báo:</b> " + " | ".join(parts)
+    return "Nguồn tham khảo: " + " · ".join(parts)
 
 
 class TelegramBot:
@@ -114,9 +114,12 @@ class TelegramBot:
 
     @staticmethod
     def _build_message(signal_data: dict) -> str:
-        """Plain-Vietnamese trade card. NO technical jargon — a reader
-        understands the trend odds and the news view instantly without
-        knowing the model internals.
+        """Institutional trade card — clean HTML, NO icons / bullets / &nbsp;.
+
+        The news view is a SINGLE integrated analytical paragraph (the LLM's
+        `reasoning_vi`); the old Điểm cộng / Điểm trừ / Kết luận three-line block
+        (which restated the same points) is gone.  Shared verbatim by the push
+        alert AND the interactive /suggest_buy report (_build_combined_report).
         """
         date_str = datetime.now().strftime("%d/%m/%Y")
 
@@ -131,47 +134,62 @@ class TelegramBot:
 
         ticker = esc("ticker", "N/A")
         price = esc("price", "N/A")
-        status_label = esc("status_label", "CHẤP NHẬN TÍN HIỆU")
+        horizon_label = esc("horizon_label", "T+5")
 
-        # Trend odds (5 trading days). Prefer the full 3-class split; fall
-        # back to a single "Cửa Tăng" line if only confidence is available.
+        # Suggested half-Kelly position size (NAV fraction), shown at the top.
+        sw = signal_data.get("suggested_weight")
+        try:
+            sizing_str = f"{float(sw) * 100:.1f}% NAV" if sw is not None else "N/A"
+        except (TypeError, ValueError):
+            sizing_str = "N/A"
+
+        # Detected market regime — shown right under the sizing so the user sees WHY
+        # the size is what it is (regime 0/7 → 0%, 1/6 → ≤10%, 3 → full Kelly).
+        # Omitted entirely when absent (e.g. a pre-regime artifact).
+        regime_label = signal_data.get("regime_label")
+        regime_id = signal_data.get("market_regime")
+        regime_line = ""
+        if regime_label and regime_id is not None:
+            regime_line = (f"Pha thị trường: <b>{html.escape(str(regime_label))}</b> "
+                           f"(Regime {int(regime_id)})\n")
+
+        # Trend odds. Prefer the full 3-class split; fall back to a single
+        # "Tăng" figure if only a scalar confidence is available.
         p_up, p_side, p_dn = pct("prob_up"), pct("prob_side"), pct("prob_down")
         if p_up != p_up:  # NaN → no triple, use legacy single confidence
             try:
                 p_up = float(signal_data.get("confidence", 0.0))
             except (TypeError, ValueError):
                 p_up = 0.0
-        trend_lines = [f"• Cửa Tăng:&nbsp;&nbsp;<b>{p_up:.1f}%</b>"]
+        trend = [f"Tăng: <b>{p_up:.1f}%</b>"]
         if p_side == p_side:
-            trend_lines.append(f"• Đi Ngang:&nbsp;&nbsp;{p_side:.1f}%")
+            trend.append(f"Đi ngang: {p_side:.1f}%")
         if p_dn == p_dn:
-            trend_lines.append(f"• Cửa Giảm:&nbsp;&nbsp;{p_dn:.1f}%")
+            trend.append(f"Giảm: {p_dn:.1f}%")
+        trend_line = "  |  ".join(trend)
 
-        plus = esc("plus_points", "Không có yếu tố tích cực nổi bật.")
-        minus = esc("minus_points", "Không có rủi ro nổi bật.")
-        conclusion = esc(
+        # SINGLE integrated analytical paragraph (LLM reasoning_vi). The separate
+        # catalyst/risk lines were removed — the paragraph already synthesises them.
+        analysis = esc(
             "conclusion",
-            signal_data.get("gemini_summary", "Chưa có dữ liệu tin tức."),
+            signal_data.get("gemini_summary", "Chưa có dữ liệu tin tức đáng kể."),
         )
 
         source_line = format_source_links(signal_data.get("article_urls", []) or [])
 
-        trend_block = "\n".join(trend_lines)
         return (
-            f"🟢 <b>KHUYẾN NGHỊ MUA — {ticker}</b>\n"
-            f"📅 {date_str}  •  Vùng giá: <b>{price}</b>\n"
+            f"<b>KHUYẾN NGHỊ MUA — {ticker}</b>\n"
+            f"{horizon_label} Model  |  Khuyến nghị đi vốn: <b>{sizing_str}</b>\n"
+            f"{regime_line}"
+            f"{date_str}  |  Vùng giá: <b>{price}</b>\n"
             f"\n"
-            f"📊 <b>Đánh giá xu hướng (5 ngày tới)</b>\n"
-            f"{trend_block}\n"
+            f"<b>Xác suất xu hướng ({horizon_label})</b>\n"
+            f"{trend_line}\n"
             f"\n"
-            f"✅ <b>Trạng thái: {status_label}</b>\n"
+            f"<b>Nhận định</b>\n"
+            f"{analysis}\n"
             f"\n"
-            f"📰 <b>Điểm tin tức &amp; Tâm lý</b>\n"
-            f"• 👍 <b>Điểm cộng:</b> {plus}\n"
-            f"• 👎 <b>Điểm trừ:</b> {minus}\n"
-            f"• 📌 <b>Kết luận:</b> {conclusion}\n"
-            f"{source_line}\n"
-            f"\n"  # clean double newline — never collides with footers
+            f"{source_line}"
         )
 
     # ------------------------------------------------------------------

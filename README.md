@@ -145,10 +145,10 @@ cp .env.example .env   # set GEMINI_API_KEY, TELEGRAM_BOT_TOKEN,
 python run_bot.py      # starts the polling bot
 ```
 
-Offline pipeline: `python main.py --task build_alpha360` →
-`python -m src.models.stacking_model.train_stacking` (5d) ·
+Offline pipeline: `python train_models.py` → `python run_backtest.py`
+(5d/20d stack; features recomputed in-pipeline from raw OHLCV) ·
 `python -m src.models.train_mr_lgbm` (MR) ·
-`python backfill_context_data.py` (macro + sentiment).
+`python backfill_context_data.py` (sentiment backfill).
 
 ---
 
