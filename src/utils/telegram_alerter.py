@@ -153,6 +153,13 @@ class TelegramBot:
             regime_line = (f"Pha thị trường: <b>{html.escape(str(regime_label))}</b> "
                            f"(Regime {int(regime_id)})\n")
 
+        # Event-driven rescue banner (status + VN reason) — only for non-standard signals.
+        _status = signal_data.get("status")
+        _ly_do = signal_data.get("ly_do")
+        event_line = ""
+        if _status and str(_status) != "MUA":
+            event_line = f"⚡ <b>{html.escape(str(_status))}</b>\n{html.escape(str(_ly_do))}\n"
+
         # Trend odds. Prefer the full 3-class split; fall back to a single
         # "Tăng" figure if only a scalar confidence is available.
         p_up, p_side, p_dn = pct("prob_up"), pct("prob_side"), pct("prob_down")
@@ -181,6 +188,7 @@ class TelegramBot:
             f"<b>KHUYẾN NGHỊ MUA — {ticker}</b>\n"
             f"{horizon_label} Model  |  Khuyến nghị đi vốn: <b>{sizing_str}</b>\n"
             f"{regime_line}"
+            f"{event_line}"
             f"{date_str}  |  Vùng giá: <b>{price}</b>\n"
             f"\n"
             f"<b>Xác suất xu hướng ({horizon_label})</b>\n"

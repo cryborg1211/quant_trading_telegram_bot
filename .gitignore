@@ -41,3 +41,5 @@ logs/
 # --- Vendored / archived code (not part of source) ---
 old-data/
 TradingAgents-main/
+# Added by code-review-graph
+.code-review-graph/

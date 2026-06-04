@@ -1254,6 +1254,53 @@ async def _set_bot_commands(app: Application) -> None:
     )
 
 
+async def msg_user2_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin → User relay. Only TELEGRAM_CHAT_ID_1 (Admin) may send free-text to
+    TELEGRAM_CHAT_ID_2 (User). Usage: /msg_user2 <nội dung>."""
+    if update.message is None:
+        return
+    _log_request("/msg_user2", update)
+
+    # Auth gate — strictly the Admin id (TELEGRAM_CHAT_ID_1).
+    if not ADMIN_CHAT_ID or _extract_user_id(update) != ADMIN_CHAT_ID:
+        await update.message.reply_text(
+            "⛔ Quyền truy cập bị từ chối.", parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Message body = everything after the command.
+    body = " ".join(context.args).strip() if context.args else ""
+    if not body:
+        await update.message.reply_text(
+            "Cú pháp: <code>/msg_user2 &lt;nội dung&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not USER_CHAT_ID:
+        await update.message.reply_text(
+            "❌ <b>Chưa cấu hình TELEGRAM_CHAT_ID_2.</b>", parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Deliver to User (HTML, escape the body so user text can't break parsing).
+    try:
+        await context.bot.send_message(
+            chat_id=USER_CHAT_ID,
+            text=f"📩 <b>Tin nhắn từ Admin:</b>\n{html.escape(body)}",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("[msg_user2] delivery to ID2 failed: %s", exc)
+        await update.message.reply_text(
+            f"❌ Gửi thất bại: <code>{html.escape(str(exc)[:200])}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await update.message.reply_text("✅ Đã gửi tin nhắn cho User (ID2) thành công!")
+
+
 def build_application() -> Application:
     """Build the python-telegram-bot Application with every command handler wired up."""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -1310,6 +1357,7 @@ def build_application() -> Application:
     # Admin-only announcement channel — intentionally NOT in _BOT_COMMANDS
     # / /help so it stays hidden from the monitored user.
     app.add_handler(CommandHandler("msg_id2", msg_id2_command))
+    app.add_handler(CommandHandler("msg_user2", msg_user2_command))
 
     # Post-mortem audit — weekly/monthly review of /verify + /add accuracy.
     app.add_handler(CommandHandler("audit_weekly", audit_weekly_command))

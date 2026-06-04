@@ -1044,6 +1044,71 @@ def daily_inference(
     LOGGER.info("[Brain] Sentiment-ranked pool (Top6): %s", _rank_str)
     LOGGER.info("[Brain] Top-3 Buy Signals after sentiment filter: %s", top_buy_signals)
 
+    # ── Event-Driven Rescue Loop (Vòng lặp vớt hàng) — ADDITIVE; core gates untouched ──
+    # Scan predictions for names the 0.45 technical gate REJECTED but with
+    # 0.42 ≤ P(UP) < 0.45 AND very bullish news (sentiment ≥ 0.60). Rescue each at a
+    # STRICT 5% NAV news-probe with a forced EVENT-DRIVEN status + reason.
+    event_overrides: dict[str, dict] = {}
+    if not fallback_mode:
+        _rescue_pool = [
+            t for t, _p in stacking_predictions_5d.items()
+            if t in universe_tickers and t not in top_buy_signals
+            and EVENT_MIN_P_UP <= float(_p[2]) < SAFE_BUY_THRESHOLD
+        ]
+        _missing = [t for t in _rescue_pool if t not in all_sentiments]
+        if _missing:
+            try:
+                _, _resc_sent = evaluate_trades_batch(horizon_predictions, _missing)
+                all_sentiments.update(_resc_sent)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("[Rescue] sentiment fetch failed for %s: %s", _missing, exc)
+        for t in _rescue_pool:
+            _sd = all_sentiments.get(t, {}) or {}
+            _ss = float(_sd.get("sentiment_score", 0.0) or 0.0)
+            if _ss >= EVENT_BULL_SENTIMENT:
+                _pu = float(stacking_predictions_5d[t][2])
+                # Reason text lives on the sentiment dict as `reasoning_vi`
+                # (evaluate_trades_batch / arbitrator). Fallbacks for safety.
+                _reason = str(
+                    _sd.get("reasoning_vi") or _sd.get("reason_vi")
+                    or _sd.get("explanation") or "tin tức tích cực mạnh"
+                ).strip()
+                _snippet = _smart_truncate(_reason, 160)   # word-aware, escaped on the card
+                event_overrides[t] = {
+                    "status": "EVENT-DRIVEN (BẮT TIN)",
+                    "weight": _EVENT_CAP,
+                    "ly_do": (
+                        f"P(Tăng)={_pu * 100:.1f}% (dưới ngưỡng an toàn "
+                        f"{SAFE_BUY_THRESHOLD * 100:.0f}% nhưng ≥ {EVENT_MIN_P_UP * 100:.0f}%) "
+                        f"+ sentiment={_ss:+.2f} ≥ {EVENT_BULL_SENTIMENT:.2f}, GIỚI HẠN "
+                        f"{_EVENT_CAP * 100:.0f}% NAV → Bắt tin: {_snippet}"
+                    ),
+                }
+        if event_overrides:
+            top_buy_signals = list(top_buy_signals) + list(event_overrides.keys())
+            LOGGER.warning("[Rescue] Event-driven RESCUED %s @ %.0f%% NAV: %s",
+                           len(event_overrides), _EVENT_CAP * 100, list(event_overrides.keys()))
+
+    # ── Bear VETO (additive; same event_overrides pattern) ────────────────────
+    # A strong technical BUY is HARD-blocked (0% NAV) when the news is severely
+    # negative — reinstates the veto the pure-rescue refactor dropped.
+    for t in top_buy_signals:
+        if t in event_overrides:                       # already rescued/overridden → skip
+            continue
+        _ss = float(all_sentiments.get(t, {}).get("sentiment_score", 0.0) or 0.0)
+        if _ss <= EVENT_BEAR_SENTIMENT:
+            event_overrides[t] = {
+                "status": "HỦY BỎ (TIN XẤU)",
+                "weight": 0.0,                          # HARD block — zero allocation
+                "ly_do": (
+                    f"Kỹ thuật ủng hộ MUA nhưng tin tức RẤT xấu (sentiment={_ss:+.2f} ≤ "
+                    f"{EVENT_BEAR_SENTIMENT:+.2f}) → PHỦ QUYẾT, chặn lệnh (0% NAV) dù mô "
+                    f"hình kỹ thuật cho tín hiệu mua."
+                ),
+            }
+            LOGGER.warning("[BearVeto] %s BLOCKED — sentiment=%+.2f ≤ %+.2f",
+                           t, _ss, EVENT_BEAR_SENTIMENT)
+
     report_html = run_trade_execution(
         top_buy_signals=top_buy_signals,
         final_decisions=final_decisions,
@@ -1054,6 +1119,7 @@ def daily_inference(
         selected_features_5d=selected_features_5d,
         horizon=int(horizon),
         broadcast=broadcast,
+        event_overrides=event_overrides,
     )
     LOGGER.info("Dual-horizon daily inference completed in %.2fs.", time.perf_counter() - total_start)
     return report_html
@@ -1147,6 +1213,18 @@ def _build_fallback_observability_report_vi(
     return "\n".join(out)
 
 
+# ── Event-driven thresholds — used by the rescue + bear-veto loops in
+#    daily_inference (additive event_overrides; core technical gate untouched). ──
+SAFE_BUY_THRESHOLD = 0.45      # standard P(UP) technical gate
+EVENT_MIN_P_UP = 0.42         # rescue floor: 0.42 ≤ P(UP) < 0.45
+EVENT_BULL_SENTIMENT = 0.60   # very bullish Gemini sentiment → rescue
+EVENT_BEAR_SENTIMENT = -0.50  # very bearish sentiment → bear veto (hard block)
+_EVENT_CAP = 0.05             # 5% NAV HARD cap for rescued (news-probe) entries
+
+# (_arbitrate_signal removed — superseded by the additive event_overrides rescue +
+#  Bear-VETO loops in daily_inference. The thresholds above are still used there.)
+
+
 def run_trade_execution(
     top_buy_signals: list[str],
     final_decisions: dict,
@@ -1157,6 +1235,7 @@ def run_trade_execution(
     selected_features_5d: list[str],
     horizon: int = 5,
     broadcast: bool = True,
+    event_overrides: dict | None = None,
 ) -> str:
     """Execute portfolio updates, RL outcome logging, and dispatch Telegram alerts.
 
@@ -1223,6 +1302,17 @@ def run_trade_execution(
             top_k=3,
         )
 
+        # Market-summary HEADER as a SEPARATE first message. Each stock card then
+        # sends as its own message below; `_dispatch` already sleeps 0.5s between
+        # every send → Telegram Flood-Control safe, and no single message nears 4096.
+        if broadcast and top_buy_signals:
+            _hdr = (
+                f"📊 <b>BÁO CÁO TÍN HIỆU NGÀY {datetime.now().strftime('%d/%m/%Y')}</b>\n"
+                f"Số mã phân tích: <b>{len(top_buy_signals)}</b> (mô hình T+{int(horizon)}).\n"
+                f"<i>Chi tiết từng mã ở các tin nhắn bên dưới.</i>"
+            )
+            bot.send_text_alert(_hdr, label="header")
+
         for ticker in top_buy_signals:
             exec_price = live_exec_prices.get(ticker)
             if exec_price is None:
@@ -1230,6 +1320,11 @@ def run_trade_execution(
                 continue
 
             sentiment_data = all_sentiments.get(ticker, {})
+            # Clean literal "None" leaks + word-aware 800-char cap so each card stays
+            # well under Telegram's 4096 limit (one message per card now).
+            _reason_vi = str(sentiment_data.get("reasoning_vi", "Chưa có dữ liệu tin tức đáng kể."))
+            _reason_vi = _reason_vi.replace("None", "").strip() or "Chưa có dữ liệu tin tức đáng kể."
+            _reason_vi = _smart_truncate(_reason_vi, 800)
             # Cap raw URL list at 6 (>=5 sources); pass as list so the Telegram formatter loops explicitly
             source_urls: list[str] = (sentiment_data.get("source_urls", []) or [])[:6]
             _p5 = stacking_predictions.get("5d", {}).get(ticker, [0, 0, 0])
@@ -1237,13 +1332,27 @@ def run_trade_execution(
             _regime = _LATEST_REGIME_BY_TICKER.get(ticker)            # 0–7, or None pre-retrain
             LOGGER.info("[Alert] %s source_urls=%s regime=%s", ticker, source_urls, _regime)
 
+            # Event-driven RESCUE override (set by daily_inference's rescue loop):
+            # forced status + reason + strict 5% NAV weight. Otherwise normal Kelly.
+            _ov = (event_overrides or {}).get(ticker)
+            if _ov:
+                _w = float(_ov["weight"])
+                _status = _ov["status"]
+                _ly_do = _ov["ly_do"]
+            else:
+                _w = suggested_weight(float(_p5[2]), market_regime=_regime)
+                _status = "MUA"
+                _ly_do = ""
+
             signal_data = {
                 "action": "MUA",
                 "ticker": ticker,
                 "price": f"{exec_price:,.0f} VND",
                 "horizon_label": f"T+{int(horizon)}",                  # card header → "T+5 Model"
-                # Regime-aware half-Kelly: regime 0/7 → 0% (stand aside), 1/6 → ≤10% cap.
-                "suggested_weight": suggested_weight(float(_p5[2]), market_regime=_regime),
+                # Regime-aware half-Kelly; event-driven rescues forced to 5% NAV.
+                "suggested_weight": _w,
+                "status": _status,                                     # MUA / EVENT-DRIVEN (BẮT TIN)
+                "ly_do": _ly_do,                                       # VN reason (only for rescues)
                 "market_regime": _regime,                              # int 0–7 or None
                 "regime_label": regime_label_vi(_regime),              # VN label for the card
                 # Plain-VN trend split for the new card
@@ -1251,11 +1360,10 @@ def run_trade_execution(
                 "prob_side": round(_p5[1] * 100, 1),
                 "prob_down": round(_p5[0] * 100, 1),
                 # Single integrated analytical paragraph — the card renders only this.
-                "conclusion": sentiment_data.get(
-                    "reasoning_vi", "Chưa có dữ liệu tin tức đáng kể."),
+                "conclusion": _reason_vi,                              # cleaned + ≤800 chars
                 "sentiment_score": sentiment_data.get("sentiment_score", 0.0),
                 "sentiment_status": _format_sentiment_status(sentiment_data),
-                "gemini_summary": sentiment_data.get("reasoning_vi", "Không có tin tức đáng kể."),
+                "gemini_summary": _reason_vi,
                 "article_urls": source_urls,          # raw list → Telegram formatter loops this
                 "confidence": confidence_5d,
                 "top_pos_features": top_pos_features,
