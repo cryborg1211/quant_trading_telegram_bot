@@ -180,29 +180,7 @@ class WalkForwardResult:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Torch oracle adapter (optional — harness is torch-free without it)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def make_lstm_oracle(model, device=None) -> SignalOracle:
-    """
-    Wrap a trained Phase-3 QuantLSTM as a SignalOracle.
-
-    Returns a closure `oracle(X) -> probs (n, 3)` running torch inference in
-    eval mode with grad disabled.  Import torch lazily so the harness has no
-    hard torch dependency when a non-LSTM oracle is supplied (e.g. for tests).
-    """
-    import torch
-
-    dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(dev).eval()
-
-    @torch.no_grad()
-    def oracle(X: np.ndarray) -> np.ndarray:
-        t = torch.from_numpy(np.ascontiguousarray(X, dtype=np.float32)).to(dev)
-        logits = model(t)
-        return torch.softmax(logits, dim=1).detach().cpu().numpy()
-
-    return oracle
+# (make_lstm_oracle removed — V4 is pure-tabular; no LSTM/torch oracle path.)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -51,11 +51,6 @@ _PARQUET_GLOB = (_DATA_DIR / "ohlcv_*.parquet").as_posix()
 _TICKER_RE = re.compile(r"[A-Z0-9]{1,12}")
 
 
-def parquet_glob() -> str:
-    """The absolute, forward-slash OHLCV shard glob (cross-ticker scans)."""
-    return _PARQUET_GLOB
-
-
 def _glob_source() -> str:
     return f"read_parquet('{_PARQUET_GLOB}')"
 

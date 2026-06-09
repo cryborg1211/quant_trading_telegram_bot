@@ -327,7 +327,17 @@ def main() -> None:
     )
 
     # ── Persist artifacts ──────────────────────────────────────────────
-    joblib.dump(final, ART_DIR / "mr_lgbm.joblib")
+    # Back up the existing MR model before overwrite — a bad retrain otherwise
+    # clobbers the live model with no rollback (mirrors run_backtest's policy).
+    _mr_path = ART_DIR / "mr_lgbm.joblib"
+    if _mr_path.exists():
+        import shutil, time as _t
+        _bk = ART_DIR / "backups"
+        _bk.mkdir(parents=True, exist_ok=True)
+        _dst = _bk / ("mr_lgbm_%s.joblib" % _t.strftime("%Y%m%dT%H%M%SZ", _t.gmtime()))
+        shutil.copy2(_mr_path, _dst)
+        LOGGER.info("Backed up existing MR artifact → %s", _dst)
+    joblib.dump(final, _mr_path)
     threshold_doc = {
         "model": "mr_lgbm_single",
         "tau": tau,

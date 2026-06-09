@@ -1,3 +1,8 @@
+> ⚠️ **SUPERSEDED / HISTORICAL** — point-in-time V6 audit. The codebase is now
+> V4.0 (Parquet-first SSOT, 5 DuckDB tables, Alpha360 factory + MacroCrawler
+> removed, market_regime added). For current architecture see `CONTEXT_DUMP.md`
+> + `doc/SYSTEM_DESIGN.md`. Kept only as a historical record.
+
 # Quant V6 Codebase Audit Report
 
 **Auditor:** Senior Quant / Data Scientist  

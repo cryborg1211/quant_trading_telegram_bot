@@ -1044,10 +1044,9 @@ def daily_inference(
     LOGGER.info("[Brain] Sentiment-ranked pool (Top6): %s", _rank_str)
     LOGGER.info("[Brain] Top-3 Buy Signals after sentiment filter: %s", top_buy_signals)
 
-    # ── Event-Driven Rescue Loop (Vòng lặp vớt hàng) — ADDITIVE; core gates untouched ──
-    # Scan predictions for names the 0.45 technical gate REJECTED but with
-    # 0.42 ≤ P(UP) < 0.45 AND very bullish news (sentiment ≥ 0.60). Rescue each at a
-    # STRICT 5% NAV news-probe with a forced EVENT-DRIVEN status + reason.
+    # ── Event layer (rescue bull-bypass + bear veto) ──────────────────────────
+    # Pure decision logic lives in build_event_overrides() (unit-tested). Only the
+    # sentiment fetch for sub-gate rescue candidates is impure (kept here).
     event_overrides: dict[str, dict] = {}
     if not fallback_mode:
         _rescue_pool = [
@@ -1062,52 +1061,13 @@ def daily_inference(
                 all_sentiments.update(_resc_sent)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("[Rescue] sentiment fetch failed for %s: %s", _missing, exc)
-        for t in _rescue_pool:
-            _sd = all_sentiments.get(t, {}) or {}
-            _ss = float(_sd.get("sentiment_score", 0.0) or 0.0)
-            if _ss >= EVENT_BULL_SENTIMENT:
-                _pu = float(stacking_predictions_5d[t][2])
-                # Reason text lives on the sentiment dict as `reasoning_vi`
-                # (evaluate_trades_batch / arbitrator). Fallbacks for safety.
-                _reason = str(
-                    _sd.get("reasoning_vi") or _sd.get("reason_vi")
-                    or _sd.get("explanation") or "tin tức tích cực mạnh"
-                ).strip()
-                _snippet = _smart_truncate(_reason, 160)   # word-aware, escaped on the card
-                event_overrides[t] = {
-                    "status": "EVENT-DRIVEN (BẮT TIN)",
-                    "weight": _EVENT_CAP,
-                    "ly_do": (
-                        f"P(Tăng)={_pu * 100:.1f}% (dưới ngưỡng an toàn "
-                        f"{SAFE_BUY_THRESHOLD * 100:.0f}% nhưng ≥ {EVENT_MIN_P_UP * 100:.0f}%) "
-                        f"+ sentiment={_ss:+.2f} ≥ {EVENT_BULL_SENTIMENT:.2f}, GIỚI HẠN "
-                        f"{_EVENT_CAP * 100:.0f}% NAV → Bắt tin: {_snippet}"
-                    ),
-                }
+        event_overrides, _rescued = build_event_overrides(
+            stacking_predictions_5d, all_sentiments, universe_tickers, top_buy_signals)
+        if _rescued:
+            top_buy_signals = list(top_buy_signals) + _rescued
         if event_overrides:
-            top_buy_signals = list(top_buy_signals) + list(event_overrides.keys())
-            LOGGER.warning("[Rescue] Event-driven RESCUED %s @ %.0f%% NAV: %s",
-                           len(event_overrides), _EVENT_CAP * 100, list(event_overrides.keys()))
-
-    # ── Bear VETO (additive; same event_overrides pattern) ────────────────────
-    # A strong technical BUY is HARD-blocked (0% NAV) when the news is severely
-    # negative — reinstates the veto the pure-rescue refactor dropped.
-    for t in top_buy_signals:
-        if t in event_overrides:                       # already rescued/overridden → skip
-            continue
-        _ss = float(all_sentiments.get(t, {}).get("sentiment_score", 0.0) or 0.0)
-        if _ss <= EVENT_BEAR_SENTIMENT:
-            event_overrides[t] = {
-                "status": "HỦY BỎ (TIN XẤU)",
-                "weight": 0.0,                          # HARD block — zero allocation
-                "ly_do": (
-                    f"Kỹ thuật ủng hộ MUA nhưng tin tức RẤT xấu (sentiment={_ss:+.2f} ≤ "
-                    f"{EVENT_BEAR_SENTIMENT:+.2f}) → PHỦ QUYẾT, chặn lệnh (0% NAV) dù mô "
-                    f"hình kỹ thuật cho tín hiệu mua."
-                ),
-            }
-            LOGGER.warning("[BearVeto] %s BLOCKED — sentiment=%+.2f ≤ %+.2f",
-                           t, _ss, EVENT_BEAR_SENTIMENT)
+            LOGGER.warning("[EventLayer] overrides=%s (rescued=%s)",
+                           {t: o["status"] for t, o in event_overrides.items()}, _rescued)
 
     report_html = run_trade_execution(
         top_buy_signals=top_buy_signals,
@@ -1223,6 +1183,65 @@ _EVENT_CAP = 0.05             # 5% NAV HARD cap for rescued (news-probe) entries
 
 # (_arbitrate_signal removed — superseded by the additive event_overrides rescue +
 #  Bear-VETO loops in daily_inference. The thresholds above are still used there.)
+
+
+def build_event_overrides(
+    stacking_predictions_5d: dict, all_sentiments: dict,
+    universe_tickers, top_buy_signals,
+) -> tuple[dict[str, dict], list[str]]:
+    """PURE (no I/O): event_overrides from calibrated P(UP) + Gemini sentiment.
+
+      • RESCUE (bull bypass): name the 0.45 gate rejected but
+        EVENT_MIN_P_UP ≤ P(UP) < SAFE_BUY_THRESHOLD AND sentiment ≥
+        EVENT_BULL_SENTIMENT → forced EVENT-DRIVEN @ _EVENT_CAP (5%).
+      • BEAR VETO: approved technical BUY with sentiment ≤
+        EVENT_BEAR_SENTIMENT → hard-blocked (0% NAV).
+
+    Returns (overrides, rescued_tickers). Tested: tests/test_event_overrides.py.
+    """
+    universe = set(universe_tickers)
+    held = set(top_buy_signals)
+    overrides: dict[str, dict] = {}
+    rescued: list[str] = []
+
+    for t, p in stacking_predictions_5d.items():     # RESCUE
+        if t in held or t not in universe:
+            continue
+        pu = float(p[2])
+        if not (EVENT_MIN_P_UP <= pu < SAFE_BUY_THRESHOLD):
+            continue
+        sd = all_sentiments.get(t, {}) or {}
+        ss = float(sd.get("sentiment_score", 0.0) or 0.0)
+        if ss < EVENT_BULL_SENTIMENT:
+            continue
+        reason = str(sd.get("reasoning_vi") or sd.get("reason_vi")
+                     or sd.get("explanation") or "tin tức tích cực mạnh").strip()
+        overrides[t] = {
+            "status": "EVENT-DRIVEN (BẮT TIN)",
+            "weight": _EVENT_CAP,
+            "ly_do": (
+                f"P(Tăng)={pu * 100:.1f}% (dưới ngưỡng an toàn "
+                f"{SAFE_BUY_THRESHOLD * 100:.0f}% nhưng ≥ {EVENT_MIN_P_UP * 100:.0f}%) "
+                f"+ sentiment={ss:+.2f} ≥ {EVENT_BULL_SENTIMENT:.2f}, GIỚI HẠN "
+                f"{_EVENT_CAP * 100:.0f}% NAV → Bắt tin: {_smart_truncate(reason, 160)}"
+            ),
+        }
+        rescued.append(t)
+
+    for t in top_buy_signals:                        # BEAR VETO
+        if t in overrides:
+            continue
+        ss = float(all_sentiments.get(t, {}).get("sentiment_score", 0.0) or 0.0)
+        if ss <= EVENT_BEAR_SENTIMENT:
+            overrides[t] = {
+                "status": "HỦY BỎ (TIN XẤU)",
+                "weight": 0.0,
+                "ly_do": (
+                    f"Kỹ thuật ủng hộ MUA nhưng tin tức RẤT xấu (sentiment={ss:+.2f} ≤ "
+                    f"{EVENT_BEAR_SENTIMENT:+.2f}) → PHỦ QUYẾT, chặn lệnh (0% NAV)."
+                ),
+            }
+    return overrides, rescued
 
 
 def run_trade_execution(

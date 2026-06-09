@@ -90,28 +90,8 @@ class SentimentConfig:
     article_char_limit: int = 4000
 
 
-@dataclass
-class UniverseFilterConfig:
-    """Live-inference universe exclusions, applied AFTER the liquidity
-    filter and BEFORE the meta-labeler/arbitrator.
-
-    NOTE: the pipeline carries OHLCV only — there is NO market-cap data.
-    `min_price_vnd` is therefore a PRICE-LEVEL proxy for "penny / ultra
-    smallcap", not a true market cap. `vn30_tickers` is the published
-    constituent list (exact); it is rebalanced ~biannually by VSD, so keep
-    it current in config/settings.json. All knobs default to a NO-OP so a
-    live bot's behaviour is unchanged until you explicitly opt in.
-    """
-
-    enabled: bool = True
-    exclude_vn30: bool = False           # opt-in
-    min_price_vnd: float = 0.0           # 0 = off; e.g. 10000 drops penny/ultra-smallcap
-    exclude_tickers: list[str] = field(default_factory=list)  # arbitrary manual blacklist
-    vn30_tickers: list[str] = field(default_factory=lambda: [
-        "ACB", "BCM", "BID", "BVH", "CTG", "FPT", "GAS", "GVR", "HDB", "HPG",
-        "MBB", "MSN", "MWG", "PLX", "POW", "SAB", "SHB", "SSB", "SSI", "STB",
-        "TCB", "TPB", "VCB", "VHM", "VIB", "VIC", "VJC", "VNM", "VPB", "VRE",
-    ])
+# (UniverseFilterConfig removed — superseded by the hardcoded VN30 gate
+#  `_VN30_UNIVERSE` in main.py. The old exclude_vn30 knob conflicted with it.)
 
 
 @dataclass
@@ -122,7 +102,6 @@ class Config:
     trading: TradingConfig = field(default_factory=TradingConfig)
     crawler: CrawlerConfig = field(default_factory=CrawlerConfig)
     sentiment: SentimentConfig = field(default_factory=SentimentConfig)
-    universe_filter: UniverseFilterConfig = field(default_factory=UniverseFilterConfig)
 
     @classmethod
     def from_json(cls, path: str | Path = "config/settings.json") -> "Config":
@@ -140,7 +119,6 @@ class Config:
             trading=TradingConfig(**raw.get("trading", {})),
             crawler=CrawlerConfig(**raw.get("crawler", {})),
             sentiment=SentimentConfig(**raw.get("sentiment", {})),
-            universe_filter=UniverseFilterConfig(**raw.get("universe_filter", {})),
         )
 
 
