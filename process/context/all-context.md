@@ -1,6 +1,6 @@
 # Quant Engine V4.0 - All Context
 
-Last updated: 2026-06-09
+Last updated: 2026-06-10
 
 This file is the root context entrypoint for the repo.
 
@@ -62,7 +62,7 @@ For most substantial tasks:
 | Group | Entry point | Scope |
 |---|---|---|
 | `planning/` | `process/context/planning/all-planning.md` | plan-shape calibration, planning examples, SIMPLE vs COMPLEX reference docs |
-| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 137 tests, in-memory DuckDB stubs, debugging quick-ref |
+| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 158 tests, in-memory DuckDB stubs, debugging quick-ref |
 
 ## Task Routing Table
 
@@ -117,7 +117,7 @@ When durable project knowledge changes:
 
 ```
 stock_price_v3/
-  main.py                 -- God-module: daily pipeline orchestrator + report builders + serving
+  main.py                 -- Pipeline orchestrator + serving (report builders extracted to src/reports/)
   run_bot.py              -- Telegram bot entry (continuous via systemd)
   run_backtest.py         -- Walk-forward backtest runner
   train_models.py         -- Model training entry (tabular ensemble + MR-LGBM)
@@ -161,13 +161,16 @@ stock_price_v3/
       construction.py     -- Mean-variance optimization
     trading/
       portfolio_manager.py -- Portfolio state management
+    reports/
+      __init__.py         -- Re-exports report builders
+      builders.py         -- 10 report builder functions + 11 constants (extracted from main.py)
     utils/
       telegram_alerter.py -- Telegram message formatting + delivery
       telegram_bot.py     -- PTB application builder (commands, handlers)
       logging_utils.py    -- Centralized logging setup
       audit_evaluator.py  -- Trade audit evaluation
       version.py          -- Version string
-  tests/                  -- 10 test files, 137 tests (pytest)
+  tests/                  -- 13 test files, 158 tests (pytest)
   scripts/
     migrate_sqlite_to_duckdb.py -- Legacy SQLite → DuckDB migration
     backup_db.sh          -- Database backup script
@@ -196,7 +199,7 @@ stock_price_v3/
 - **Bot:** python-telegram-bot 22.7 (async PTB framework)
 - **HTTP:** aiohttp 3.13, requests 2.33
 - **Config:** python-dotenv 1.2 (.env), dataclass-based settings with JSON overrides
-- **Testing:** pytest (137 tests, in-memory DuckDB stubs)
+- **Testing:** pytest (158 tests, in-memory DuckDB stubs)
 - **Deployment:** Bare metal VPS — systemd (bot), cron (daily pipeline at 15:30 ICT Mon–Fri)
 
 ## Key Patterns and Conventions
@@ -223,9 +226,10 @@ stock_price_v3/
 5. `TabularEnsemble.fit` — degree 75
 6. `build_application` (telegram_bot.py) — degree 72
 
-**Active refactoring:**
-- `daily_inference` decomposition: Phase 1 done (extracted `build_event_overrides`), Phase 2 next (integration test + `_gate_vn30()`, `_rescue_loop()`, `_dispatch()`)
-- Future Phase 3: extract report builders from `main.py` → `src/reports/`
+**Active refactoring (V4.1 Structural Debt program):**
+- Phase 1 COMPLETE: `daily_inference` decomposed (271→169 lines) into `_select_candidates()`, `_rescue_loop()`, `_dispatch_signals()`. Report builders (10 functions + 11 constants) extracted to `src/reports/builders.py`. 21 new tests added.
+- Phase 2 NEXT: Automated feature-schema hashing to replace manual `FEATURE_RECIPE_VERSION`
+- Phase 3: Hub-node test coverage
 
 **Deprecated:** `alpha360_generator.py` is gutted in V4.0 — system is purely tabular.
 
@@ -251,7 +255,7 @@ stock_price_v3/
 
 | Feature | Folder | Status |
 |---|---|---|
-| V4.1 Structural Debt | `process/features/v4-1-structural-debt/` | not-started |
+| V4.1 Structural Debt | `process/features/v4-1-structural-debt/` | in-progress (Phase 1 done, Phase 2 next) |
 
 ## Code-Review-Graph MCP
 

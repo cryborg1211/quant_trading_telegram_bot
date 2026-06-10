@@ -1,6 +1,6 @@
 # Quant Engine V4.0 - All Tests
 
-Last updated: 2026-06-09
+Last updated: 2026-06-10
 
 Attach this file first when the task involves testing, verification, or test debugging.
 
@@ -50,7 +50,7 @@ Use this file when you need to:
 
 ### Use `pytest` for everything
 
-- All 137 tests run through pytest
+- All 158 tests run through pytest
 - `pytest -q` for quick output (default via `pytest.ini`)
 - No separate test runners, no browser tests, no e2e framework
 - Tests use in-memory DuckDB and stubs — no external services needed
@@ -67,7 +67,7 @@ Unless the task clearly needs a different path:
 
 | Scope | Command | Notes |
 |---|---|---|
-| Full suite | `pytest -q` | 137 tests, all in-memory |
+| Full suite | `pytest -q` | 158 tests, all in-memory |
 | Single file | `pytest -q tests/test_<name>.py` | targeted verification |
 | Single test | `pytest -q tests/test_<name>.py::test_<func>` | surgical |
 | Verbose | `pytest -v` | full test names + pass/fail |
@@ -86,6 +86,9 @@ Unless the task clearly needs a different path:
 | `test_cards.py` | Telegram alert card formatting | message rendering | 4096-char limit awareness |
 | `test_telegram_split.py` | multi-message splitting | long report handling | recently added after crash fix |
 | `test_event_overrides.py` | build_event_overrides (rescue/veto) | Phase 1 extraction | newly added with decomposition |
+| `test_select_candidates.py` | `_select_candidates()` VN30+meta gate | 10 tests | Phase 1 extraction |
+| `test_rescue_loop.py` | `_rescue_loop()` sentiment rescue | 8 tests | Phase 1 extraction |
+| `test_daily_inference_integration.py` | `daily_inference` end-to-end | 3 tests | happy path, fallback, rescue |
 | `test_serve_resilience.py` | serve-path error handling | graceful degradation | API failure stubs |
 | `conftest.py` (tests/) | shared fixtures | fixture definitions | in-memory DuckDB, sample data |
 
@@ -99,9 +102,11 @@ Unless the task clearly needs a different path:
 
 ## Known Gaps
 
-- No integration test for the full `daily_inference` happy path (Phase 2 target)
-- No tests for `run_backtest.py::main` flow (high hub degree but untested end-to-end)
+- No tests for `run_backtest.py::main` flow (high hub degree but untested end-to-end) — Phase 3 target
 - No tests for `train_models.py::main` flow
-- Report builder functions in `main.py` are untested (will move to `src/reports/` in Phase 3)
+- No tests for `triple_barrier_pipeline` (degree 82) — Phase 3 target
+- No tests for `TabularEnsemble.fit` (degree 75) — Phase 3 target
+- No tests for `build_application` (degree 72) — Phase 3 target
+- Report builders in `src/reports/builders.py` have partial coverage via `test_main_logic.py` (original import paths)
 - No performance/load tests
 - No tests for the systemd deployment path or cron scheduling

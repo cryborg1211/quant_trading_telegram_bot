@@ -14,13 +14,13 @@ Driven by the Architecture & Alpha Bottleneck Audit (2026-06-09) which identifie
 
 | Phase | Name | Status |
 |---|---|---|
-| 1 | `daily_inference` decomposition + report builder extraction | not-started |
+| 1 | `daily_inference` decomposition + report builder extraction | completed |
 | 2 | Automated feature-schema hashing | not-started |
 | 3 | Hub-node test coverage | not-started |
 
 ## Key Source Files
 
-- `main.py` — God-module (orchestration + serving + 4 report builders)
+- `main.py` — Pipeline orchestrator + serving (report builders extracted to src/reports/)
 - `src/backtest/pipeline.py` — FEATURE_RECIPE_VERSION, build_features
 - `src/models/tabular_ensemble.py` — TabularEnsemble.fit (untested hub)
 - `src/labels/triple_barrier.py` — triple_barrier_pipeline (untested hub)
@@ -34,4 +34,4 @@ Driven by the Architecture & Alpha Bottleneck Audit (2026-06-09) which identifie
 
 ## Current Status
 
-Status: not-started
+Status: in-progress (Phase 1 completed 2026-06-10, Phase 2 next)
