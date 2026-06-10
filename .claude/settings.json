@@ -1,25 +1,62 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "hooks": {
-    "PostToolUse": [
+    "SessionStart": [
       {
-        "matcher": "Edit|Write|Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "cat >/dev/null || true; git rev-parse --git-dir >/dev/null 2>&1 && code-review-graph update --skip-flows --repo \"C:/Users/caokh/Desktop/vscode/stock_price_v3\" || true",
-            "timeout": 30
+            "command": "node .claude/hooks/session-init.cjs"
           }
         ]
       }
     ],
-    "SessionStart": [
+    "SubagentStart": [
       {
-        "matcher": "",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "cat >/dev/null || true; git rev-parse --git-dir >/dev/null 2>&1 && code-review-graph status --repo \"C:/Users/caokh/Desktop/vscode/stock_price_v3\" || echo 'Not a git repo, skipping'",
-            "timeout": 10
+            "command": "node .claude/hooks/subagent-init.cjs"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/descriptive-name.cjs"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|Glob|Grep|Read|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/scout-block.cjs"
+          },
+          {
+            "type": "command",
+            "command": "node .claude/hooks/privacy-block.cjs"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/hooks/session-state.cjs"
+          },
+          {
+            "type": "command",
+            "command": "node .claude/hooks/post-edit-simplify-reminder.cjs"
           }
         ]
       }
