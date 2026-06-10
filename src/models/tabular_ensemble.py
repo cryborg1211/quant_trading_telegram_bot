@@ -5,10 +5,10 @@ A direct restoration of the original Pure Tabular Stacking Ensemble from
 `src/models/stacking_model/train_stacking.py` @ ccb6d84 (the LogisticRegression-
 meta era BEFORE the May-17 "Flaw 7" LightGBM-meta upgrade), adapted to the V3
 panel: 9 cross-sectional alpha features, triple-barrier 3-class labels, AFML
-sample weights, CPU.
+sample weights, GPU-accelerated (CUDA).
 
-Architecture (identical hyperparameters to the historical ccb6d84 block —
-GPU flags stripped for portability):
+Architecture (identical hyperparameters to the historical ccb6d84 block,
+GPU-accelerated for CUDA devices):
 
     Level 1 — 3 base GBM classifiers (multiclass, 3 classes):
         - XGBClassifier   (180 est, max_depth=5,  lr=0.03,  reg_alpha=0.1, reg_lambda=2.0)
@@ -104,7 +104,7 @@ __all__ = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1) Base learners — verbatim ccb6d84 hyperparameters, GPU flags stripped
+# 1) Base learners — verbatim ccb6d84 hyperparameters, GPU-accelerated
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_base_models(seed: int) -> dict[str, Any]:
     models: dict[str, Any] = {}
@@ -114,6 +114,8 @@ def _build_base_models(seed: int) -> dict[str, Any]:
             num_class=3,
             eval_metric="mlogloss",
             tree_method="hist",
+            device="cuda",
+            max_bin=512,
             n_estimators=180,
             max_depth=6,                       # RELAXED 5→6: deeper splits for the recall boost
             learning_rate=0.03,
@@ -122,7 +124,7 @@ def _build_base_models(seed: int) -> dict[str, Any]:
             reg_alpha=0.1,
             reg_lambda=1.0,                    # RELAXED 2.0→1.0: less L2 shrinkage
             random_state=int(seed),
-            n_jobs=-1,
+            n_jobs=1,
             verbosity=0,
         )
     if _HAS_LGB:
@@ -132,13 +134,16 @@ def _build_base_models(seed: int) -> dict[str, Any]:
             n_estimators=220,
             learning_rate=0.03,
             num_leaves=63,                     # RELAXED 31→63: 2× capacity, more interactions captured
+            max_bin=255,
             subsample=0.85,
             colsample_bytree=0.85,
             reg_alpha=0.1,
             reg_lambda=1.0,                    # RELAXED 2.0→1.0: less L2 shrinkage
             class_weight="balanced",
+            device_type="gpu",
+            gpu_use_dp=False,
             random_state=int(seed),
-            n_jobs=-1,
+            n_jobs=1,
             verbose=-1,
         )
     if _HAS_CAT:
@@ -149,6 +154,8 @@ def _build_base_models(seed: int) -> dict[str, Any]:
             depth=7,                           # RELAXED 6→7: deeper splits
             learning_rate=0.03,
             l2_leaf_reg=3.0,                   # RELAXED 5.0→3.0: less L2 leaf shrinkage
+            task_type="GPU",
+            max_bin=512,
             random_seed=int(seed),
             verbose=False,
             allow_writing_files=False,
@@ -177,11 +184,11 @@ def _as_named_df(X: Any, feature_names: Sequence[str] | None) -> pd.DataFrame:
     This is the root-cause fix for sklearn's "X does not have valid feature names,
     but <Estimator> was fitted with feature names" warning: by passing DataFrames
     with consistent column names at BOTH fit and predict, no metadata mismatch
-    occurs.  No-op when X is already a DataFrame.
+    occurs.  No-op when X is already a DataFrame with correct dtype.
     """
     if isinstance(X, pd.DataFrame):
         return X
-    arr = np.asarray(X)
+    arr = np.asarray(X, dtype=np.float32)
     cols = list(feature_names) if feature_names is not None else [f"f{i}" for i in range(arr.shape[1])]
     return pd.DataFrame(arr, columns=cols)
 
@@ -299,8 +306,8 @@ def _augment_for_missing_classes(
         return X, y, w, []
 
     is_df = isinstance(X, pd.DataFrame)
-    X_arr = (X.to_numpy(dtype=np.float64)
-             if is_df else np.asarray(X, dtype=np.float64))
+    X_arr = (X.to_numpy(dtype=np.float32)
+             if is_df else np.asarray(X, dtype=np.float32))
     # Empty-slice guard: if X has zero rows (PurgedKFold purged the entire fold
     # because the panel was not strictly time-sorted, or because n_splits ×
     # embargo overran the date axis), np.mean(axis=0) raises "Mean of empty
@@ -316,9 +323,9 @@ def _augment_for_missing_classes(
         LOGGER.warning(
             "    _augment_for_missing_classes received EMPTY X (0 rows, %d features) "
             "— using zero-vector synth (uninformative anchor)", n_features)
-        mean_row = np.zeros(n_features, dtype=np.float64)
+        mean_row = np.zeros(n_features, dtype=np.float32)
     else:
-        mean_row = X_arr.mean(axis=0)
+        mean_row = X_arr.mean(axis=0).astype(np.float32)
 
     n_inj = n_synth * len(missing)
     X_synth = np.tile(mean_row, (n_inj, 1))
