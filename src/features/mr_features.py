@@ -45,6 +45,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.utils.schema_hash import compute_feature_schema_hash
+
 # The engineered MR feature columns (everything this module adds).
 MR_FEATURE_COLUMNS: list[str] = [
     "mr_dma_sma10",
@@ -59,6 +61,9 @@ MR_FEATURE_COLUMNS: list[str] = [
     "mr_gap_pct",
     "mr_gap_down",
 ]
+
+_MR_SCHEMA: list[tuple[str, str]] = [(col, "float64") for col in MR_FEATURE_COLUMNS]
+MR_SCHEMA_HASH: str = compute_feature_schema_hash(_MR_SCHEMA, None)
 
 _REQUIRED = ("ticker", "date", "open", "high", "low", "close")
 

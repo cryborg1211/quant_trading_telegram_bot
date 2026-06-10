@@ -51,7 +51,7 @@ def test_load_v3_bot_passes_horizon_through(monkeypatch):
     seen = {}
 
     class _FakeBot:
-        metadata = {"feature_recipe_version": "v1.0", "tb_horizon": 5}
+        metadata = {"feature_recipe_version": "v2-sha8:00000000", "tb_horizon": 5}
         tabular_features = ["close_fd_xsz"]
         up_threshold = 0.5
 

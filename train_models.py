@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 
 from src.backtest.pipeline import (
+    FEATURE_RECIPE_VERSION,
     RunConfig,
     configure_logging,
     phase,
@@ -167,6 +168,7 @@ def main(cfg: RunConfig) -> None:
         "train_cfg": cfg,                        # RunConfig — evaluator rebuilds the SAME dataset
         "metadata": {
             "trained_at": datetime.utcnow().isoformat() + "Z",
+            "feature_schema_hash": FEATURE_RECIPE_VERSION,
             "n_seeds": len(seeds),
             "seeds": seeds,
             "tb_horizon": int(cfg.tb_horizon),

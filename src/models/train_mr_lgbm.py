@@ -49,7 +49,7 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
 )
 
-from src.features.mr_features import MR_FEATURE_COLUMNS, build_mr_features
+from src.features.mr_features import MR_FEATURE_COLUMNS, MR_SCHEMA_HASH, build_mr_features
 from src.models.stacking_model.purged_kfold import PurgedKFold
 
 logging.basicConfig(
@@ -189,14 +189,17 @@ def make_lgbm(scale_pos_weight: float) -> LGBMClassifier:
         max_depth=3,
         num_leaves=7,
         min_child_samples=300,
+        max_bin=255,
         subsample=0.8,
         subsample_freq=1,
         colsample_bytree=0.8,
         reg_alpha=0.5,
         reg_lambda=5.0,
         scale_pos_weight=scale_pos_weight,
+        device_type="gpu",
+        gpu_use_dp=False,
         random_state=SEED,
-        n_jobs=-1,
+        n_jobs=1,
         verbose=-1,
     )
 
@@ -339,6 +342,7 @@ def main() -> None:
         LOGGER.info("Backed up existing MR artifact → %s", _dst)
     joblib.dump(final, _mr_path)
     threshold_doc = {
+        "schema_hash": MR_SCHEMA_HASH,
         "model": "mr_lgbm_single",
         "tau": tau,
         "label": {

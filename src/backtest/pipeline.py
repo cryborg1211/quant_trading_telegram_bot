@@ -52,17 +52,33 @@ from src.labels.triple_barrier import TripleBarrierConfig, triple_barrier_pipeli
 from src.execution.vn_cost_model import InventoryTracker
 # ── 8-regime structural context (rule-based Polars classifier) ─────────────────
 from src.features.market_regime import build_regime_features
+from src.utils.schema_hash import compute_feature_schema_hash
 
 LOGGER = logging.getLogger("quant.pipeline")
 TRADING_DAYS = 252
 
-# Structural feature-recipe version.  BUMP this string whenever the hardcoded
-# feature logic in `build_features` changes shape — a new/removed/retuned
-# feature, a changed window (rs_windows, ma_windows, vol_span, frac-diff kernel),
-# or a reordered pool.  Trained artifacts stamp this version into their metadata;
-# the live bot asserts the loaded artifact's stamp matches this value and refuses
-# to serve a model whose feature logic has drifted (main._load_v3_bot tripwire).
-FEATURE_RECIPE_VERSION = "v1.1"   # v1.1: + market_regime categorical (8-regime classifier)
+# Authoritative schema for the feature pool in `build_features`.  Column order
+# is load-bearing (continuous pool first, then categoricals).  Dtype strings are
+# Polars canonical names (Float32, Int8, etc.).
+FEATURE_SCHEMA: list[tuple[str, str]] = [
+    ("close_fd_xsz",           "Float32"),
+    ("volume_fd_xsz",          "Float32"),
+    ("mom20_xsz",              "Float32"),
+    ("overext_5_xsz",          "Float32"),
+    ("overext_20_xsz",         "Float32"),
+    ("rs_10_xsz",              "Float32"),
+    ("rs_20_xsz",              "Float32"),
+    ("smart_money_20_xsz",     "Float32"),
+    ("vol_squeeze_xsz",        "Float32"),
+    ("amihud_liquidity_xsz",   "Float32"),
+    ("realized_skewness_20d_xsz", "Float32"),
+    ("vol_of_vol_20d_xsz",     "Float32"),
+    ("hl_range_ratio_xsz",     "Float32"),
+    ("gap_risk_xsz",           "Float32"),
+    ("market_regime",          "Int8"),
+]
+
+# FEATURE_RECIPE_VERSION is computed after RunConfig is defined (see below).
 
 # Features the GBMs treat as CATEGORICAL (native split), NOT continuous.  They
 # bypass the iron-fist corr/MI selection (always survive) and are declared
@@ -161,6 +177,15 @@ class RunConfig:
         # Coerce path-like strings to Path so callers can pass either.
         self.bitemporal_duckdb = Path(self.bitemporal_duckdb)
         self.core_duckdb = Path(self.core_duckdb)
+
+
+# Structural feature-recipe version.  Computed automatically from FEATURE_SCHEMA
+# and the frac_diff_d hyperparameter — any column add/remove/reorder, dtype
+# change, or frac-diff tuning produces a new hash, forcing a retrain before
+# the serve path accepts the artifact (main._load_v3_bot tripwire).
+FEATURE_RECIPE_VERSION: str = compute_feature_schema_hash(
+    FEATURE_SCHEMA, RunConfig().frac_diff_d
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -415,6 +440,12 @@ def build_features(
 
     # Continuous pool first, THEN the categorical(s) — column order is load-bearing.
     all_features = original_features + candidate_features + CATEGORICAL_FEATURES
+
+    assert [name for name, _ in FEATURE_SCHEMA] == all_features, (
+        f"FEATURE_SCHEMA names do not match all_features order. "
+        f"Schema: {[n for n,_ in FEATURE_SCHEMA]} | built: {all_features}. "
+        f"Update FEATURE_SCHEMA to match the hardcoded pool."
+    )
 
     # Drop rows with any NaN in the CONTINUOUS features (FracDiff / MA / factor
     # warm-up).  market_regime is excluded — it is never null.
@@ -691,6 +722,7 @@ def materialize_dataset(cfg: RunConfig) -> Dataset:
 __all__ = [
     "TRADING_DAYS",
     "FEATURE_RECIPE_VERSION",
+    "FEATURE_SCHEMA",
     "CATEGORICAL_FEATURES",
     "configure_logging",
     "phase",
