@@ -139,6 +139,19 @@ class WalkForwardConfig:
     atc_session: tuple[int, int] = (14, 35)        # HH, MM (ICT) for the ATC order ts
     fee_buffer: float = 0.015                      # 1.5% — absorbs sqrt impact + 0.1% sell tax + spread on LIQUID positions
 
+    # ── PRICE UNIT (panel → absolute VND) ────────────────────────────────────
+    # The parquet OHLCV shards store prices in THOUSANDS of VND (e.g. 13.45 =
+    # 13,450 VND), but VNCostModel's tick grid (10/50/100 VND), the band
+    # tolerances (±1 VND), and share-quantity math (qty = w·NAV / price) all
+    # assume ABSOLUTE VND.  Feeding thousand-scale prices in unfixed cost
+    # 5–100% of notional PER FILL in phantom tick-rounding "slippage" (e.g. a
+    # 13.45 buy rounded UP to the 20 grid line, a 9.8 sell rounded DOWN to 0)
+    # and inflated share counts 1000× (blowing through participation caps).
+    # `_prepare` multiplies open/high/low/close by this factor so every
+    # downstream computation runs in true VND.  Set to 1.0 for panels that are
+    # already in absolute VND.
+    price_unit_vnd: float = 1000.0
+
     # Constraints + cost model
     constraints: PortfolioConstraints = field(default_factory=lambda: PortfolioConstraints(
         max_weight=0.10,
@@ -303,6 +316,15 @@ class WalkForwardEngine:
             pdf["exchange"] = self.config.default_exchange
 
         pdf = pdf.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+        # Convert panel prices (thousand-VND parquet convention) to ABSOLUTE VND
+        # so tick rounding, band tolerances, and share-quantity math are correct.
+        # Feature columns are untouched (z-scored derivatives, scale-free).
+        scale = float(self.config.price_unit_vnd)
+        if scale != 1.0:
+            for col in ("open", "high", "low", "close"):
+                pdf[col] = pdf[col] * scale
+            LOGGER.info("Price unit | panel OHLC × %.0f → absolute VND", scale)
 
         # Per-ticker derived columns: prior close (band ref) + trailing daily vol.
         pdf["ref_price"] = pdf.groupby("ticker", sort=False)["close"].shift(1)
