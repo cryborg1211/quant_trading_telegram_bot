@@ -45,6 +45,19 @@ Per-seed at sig 0.40: 42: +41.9% / 43: +40.5% / 44: +39.5% / 45: +41.1%.
 - Saturation persists below sig ~0.41 (bottom two configs are clones), so PBO (88.4%) stays uninformative on the threshold axis. A future PBO-meaningful sweep must vary `hold_days` (20/30/40) instead.
 - DSR p=0.31 still FAIL — Sharpe 0.65 vs the 0.95 deflated hurdle. The binding constraint is drawdown (−27%), hence the per-tranche PT/SL barrier work (`a1b600c`); barrier validation run pending.
 
+## Addendum 2: per-tranche barrier exits — FALSIFIED (PT+SL)
+
+Single-seed validation at sig 0.43 / H=30 (`engine_pnl_attribution.py --pt-sigma 3.0 --sl-sigma 2.0`):
+
+| Config | Net | Gross/trip | WR | Median hold |
+|---|---|---|---|---|
+| No barriers | +45.5% | +2.84% | 53.3% | 28d |
+| PT 3σ + SL 2σ | **−5.7%** | +0.003% | 44.6% | 13d |
+
+| SL 2σ only | **+29.2%** | +1.59% | 40.9% | 28d |
+
+The edge is skew-driven (~50% WR, fat right tail). PT at +3σ (≈+6%) amputates the +10–30% winners that pay for everything; SL at −2σ realizes crash-day dips that mean-revert (SL-only gives up 16pp). The model predicts barrier *touches*, but holding through them earns more than exiting on them. **Position-level stops are conclusively dead for this signal — keep `tranche_pt_sigma`/`tranche_sl_sigma` OFF (the default).** DD control must come from portfolio-level knobs: vol-scaled tranche budgets, gross-exposure caps, or regime-conditional tranche sizing.
+
 ## Provenance
 
 - Engine: tranche mode `f6b1c4d`, price-scale fix `8ee0339`, evaluator integration `67e3e1f`
