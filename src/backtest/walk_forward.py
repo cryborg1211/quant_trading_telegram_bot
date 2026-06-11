@@ -127,6 +127,23 @@ class WalkForwardConfig:
     # Rebalance cadence
     rebalance_frequency: int = 1                   # every N trading days
 
+    # ── REBALANCE MODE ───────────────────────────────────────────────────────
+    # "grid"    → classic delta-rebalance of one concentrated book every
+    #             `rebalance_frequency` days.  ~45 correlated entry dates over
+    #             a 4-year OOS window: timing variance dominates (the grid-date
+    #             study measured picks at −0.83% T+20 vs +0.87% cohort).
+    # "tranche" → AFML-style staggered book matched to the triple-barrier
+    #             label horizon: EVERY day deploy NAV/`tranche_hold_days` into
+    #             the day's top `max_positions` names (equal weight), hold each
+    #             cohort exactly `tranche_hold_days` trading days, liquidate at
+    #             the ATC.  ~880 partially-independent bets harvest the
+    #             per-trade edge the per-row studies measured (+1.60% net T+20
+    #             for within-day top-5).  `rebalance_frequency` is ignored;
+    #             P(Bull) scales each NEW tranche's budget (no forced
+    #             mid-cycle liquidation).
+    rebalance_mode: str = "grid"
+    tranche_hold_days: int = 20
+
     # OOS gate: only place trades on/after this date.  Days before it are still
     # iterated (NAV marked, corporate actions applied, features/cov built from
     # them) so the engine has lookback, but NO trade is initiated until the
@@ -233,6 +250,10 @@ class WalkForwardEngine:
         self._prev_nav: float = 0.0
         self._last_rebalance_idx: int = -10**9
         self._dividend_cash_today: float = 0.0
+        # Tranche mode: each entry is {"entry_idx": int, "positions": {ticker: qty}}.
+        # A tranche expires `tranche_hold_days` trading days after entry; its
+        # positions are then sold (retrying daily on rejection / missing print).
+        self._tranches: list[dict] = []
 
     # ── Public entrypoint ──────────────────────────────────────────────────
     def run(
@@ -280,7 +301,10 @@ class WalkForwardEngine:
             n_orders = n_fills = n_rej = 0
             after_start = (self.config.start_trading_date is None
                            or D >= self.config.start_trading_date)
-            if (i >= self.config.seq_len and after_start
+            if self.config.rebalance_mode == "tranche":
+                if i >= self.config.seq_len and after_start:
+                    n_orders, n_fills, n_rej = self._tranche_day(i, D)
+            elif (i >= self.config.seq_len and after_start
                     and (i - self._last_rebalance_idx) >= self.config.rebalance_frequency):
                 p_up, sig_tickers = self._inference(D)
                 p_up, sig_tickers = self._apply_liquidity_filter(D, p_up, sig_tickers)
@@ -580,63 +604,159 @@ class WalkForwardEngine:
 
         n_fills = n_rej = 0
         for tk, side, qty in orders:
-            row = day[tk]
-
-            # Cash guard for buys: never spend cash we don't have.  Two layers:
-            #   (1) hard skip when cash is already non-positive (the bug fix —
-            #       a negative `self.cash` would otherwise feed a negative qty into
-            #       round_down_to_lot and crash the engine);
-            #   (2) defensive `max(0, ...)` on the affordable calc so any residual
-            #       transient negativity is floored to zero rather than propagated.
-            if side == OrderSide.BUY:
-                unit = row["close"] * (1.0 + cfg.fee_buffer)
-                if unit <= 0 or self.cash <= 0:
-                    continue
-                affordable = round_down_to_lot(max(0, int(self.cash / unit)), 100)
-                qty = min(qty, affordable)
-                if qty < 100:
-                    continue
-
-            vol = row["vol"]
-            if not np.isfinite(vol) or vol <= 0:
-                vol = 0.02                              # fallback daily vol
-            ref = row["ref_price"]
-            if not np.isfinite(ref) or ref <= 0:
-                ref = row["close"]
-            ref = self._adjusted_reference(D, tk, ref)
-
-            order = Order(
-                ticker=tk, side=side, quantity=int(qty),
-                target_price=float(row["close"]),
-                reference_price=float(ref),
-                daily_volume=float(row["volume"]),
-                daily_volatility=float(vol),
-                exchange=Exchange(str(row["exchange"]).upper()),
-                timestamp=ts,
-                is_atc=True,
-                atc_volume=float(row["volume"]) * cfg.atc_participation,
-            )
-            fill = self.model.simulate(order, inventory=self.inventory)
-
-            if fill.is_filled:
-                self.cash += fill.signed_cash_flow
-                if side == OrderSide.BUY:
-                    self._held_tickers.add(tk)
-                self.fills_log.append({
-                    "date": D.isoformat(), "ticker": tk, "side": side.value,
-                    "qty": fill.filled_quantity, "price": fill.filled_price,
-                    "cash_flow": fill.signed_cash_flow,
-                    "cost": fill.total_cost, "participation": fill.participation_pct,
-                })
+            filled_qty, rejected = self._place_atc_order(D, ts, tk, side, qty)
+            if filled_qty > 0:
                 n_fills += 1
-            else:
-                self.rejections_log.append({
-                    "date": D.isoformat(), "ticker": tk, "side": side.value,
-                    "qty": qty, "reason": fill.rejection_reason.value,
-                })
+            elif rejected:
                 n_rej += 1
 
         return len(orders), n_fills, n_rej
+
+    def _place_atc_order(
+        self, D: date, ts: datetime, tk: str, side: OrderSide, qty: int,
+    ) -> tuple[int, bool]:
+        """Place one ATC order through the cost model and book the outcome.
+
+        Shared by grid `_execute` and `_tranche_day`.  Returns
+        ``(filled_quantity, was_rejected)`` — ``(0, False)`` means the order
+        was skipped pre-simulation (no print / unaffordable / sub-lot).
+        """
+        cfg = self.config
+        day = self._day_index.get(D, {})
+        row = day.get(tk)
+        if row is None:
+            return 0, False                            # no print today → cannot trade
+
+        # Cash guard for buys: never spend cash we don't have.  Two layers:
+        #   (1) hard skip when cash is already non-positive (the bug fix —
+        #       a negative `self.cash` would otherwise feed a negative qty into
+        #       round_down_to_lot and crash the engine);
+        #   (2) defensive `max(0, ...)` on the affordable calc so any residual
+        #       transient negativity is floored to zero rather than propagated.
+        if side == OrderSide.BUY:
+            unit = row["close"] * (1.0 + cfg.fee_buffer)
+            if unit <= 0 or self.cash <= 0:
+                return 0, False
+            affordable = round_down_to_lot(max(0, int(self.cash / unit)), 100)
+            qty = min(qty, affordable)
+            if qty < 100:
+                return 0, False
+
+        vol = row["vol"]
+        if not np.isfinite(vol) or vol <= 0:
+            vol = 0.02                                  # fallback daily vol
+        ref = row["ref_price"]
+        if not np.isfinite(ref) or ref <= 0:
+            ref = row["close"]
+        ref = self._adjusted_reference(D, tk, ref)
+
+        order = Order(
+            ticker=tk, side=side, quantity=int(qty),
+            target_price=float(row["close"]),
+            reference_price=float(ref),
+            daily_volume=float(row["volume"]),
+            daily_volatility=float(vol),
+            exchange=Exchange(str(row["exchange"]).upper()),
+            timestamp=ts,
+            is_atc=True,
+            atc_volume=float(row["volume"]) * cfg.atc_participation,
+        )
+        fill = self.model.simulate(order, inventory=self.inventory)
+
+        if fill.is_filled:
+            self.cash += fill.signed_cash_flow
+            if side == OrderSide.BUY:
+                self._held_tickers.add(tk)
+            self.fills_log.append({
+                "date": D.isoformat(), "ticker": tk, "side": side.value,
+                "qty": fill.filled_quantity, "price": fill.filled_price,
+                "cash_flow": fill.signed_cash_flow,
+                "cost": fill.total_cost, "participation": fill.participation_pct,
+            })
+            return int(fill.filled_quantity), False
+
+        self.rejections_log.append({
+            "date": D.isoformat(), "ticker": tk, "side": side.value,
+            "qty": qty, "reason": fill.rejection_reason.value,
+        })
+        return 0, True
+
+    # ── 4b. Tranche-mode daily routine ──────────────────────────────────────
+    def _tranche_day(self, i: int, D: date) -> tuple[int, int, int]:
+        """One day of the staggered-tranche book.
+
+        1. SELL every position of every tranche older than
+           `tranche_hold_days` trading days (retrying daily until empty —
+           halts, band floors, and ATC volume caps just defer the exit).
+        2. BUY today's tranche: NAV/`tranche_hold_days` × P(Bull), split
+           equally across the day's top `max_positions` names above
+           `signal_threshold`.
+        """
+        cfg = self.config
+        ts = datetime.combine(D, dtime(*cfg.atc_session))
+        n_orders = n_fills = n_rej = 0
+
+        # 1. Liquidate expired tranches (sells first → frees cash for buys).
+        for tranche in self._tranches:
+            if i - tranche["entry_idx"] < cfg.tranche_hold_days:
+                continue
+            for tk, qty in list(tranche["positions"].items()):
+                if qty < 1:
+                    del tranche["positions"][tk]
+                    continue
+                n_orders += 1
+                filled, rejected = self._place_atc_order(D, ts, tk, OrderSide.SELL, qty)
+                if filled > 0:
+                    n_fills += 1
+                    remaining = qty - filled
+                    if remaining > 0:
+                        tranche["positions"][tk] = remaining   # ATC cap → finish tomorrow
+                    else:
+                        del tranche["positions"][tk]
+                elif rejected:
+                    n_rej += 1                                  # retry tomorrow
+        self._tranches = [t for t in self._tranches if t["positions"]]
+
+        # 2. Today's tranche.
+        p_up, tickers = self._inference(D)
+        p_up, tickers = self._apply_liquidity_filter(D, p_up, tickers)
+        if len(tickers) == 0:
+            return n_orders, n_fills, n_rej
+
+        order_idx = np.argsort(p_up)[::-1]
+        picks = [tickers[j] for j in order_idx
+                 if p_up[j] >= cfg.signal_threshold][:cfg.max_positions]
+        if not picks:
+            return n_orders, n_fills, n_rej
+
+        p_bull = float(np.clip(self._p_bull.get(D, 1.0), 0.0, 1.0))
+        nav = self._compute_nav(D)
+        budget = (nav / cfg.tranche_hold_days) * p_bull
+        budget = min(budget, max(self.cash, 0.0) / (1.0 + cfg.fee_buffer))
+        if budget <= 0:
+            return n_orders, n_fills, n_rej
+        per_name = budget / len(picks)
+
+        day = self._day_index.get(D, {})
+        positions: dict[str, int] = {}
+        for tk in picks:
+            row = day.get(tk)
+            if row is None or row["close"] <= 0:
+                continue
+            qty = round_down_to_lot(int(per_name / row["close"]), 100)
+            if qty < 100:
+                continue
+            n_orders += 1
+            filled, rejected = self._place_atc_order(D, ts, tk, OrderSide.BUY, qty)
+            if filled > 0:
+                n_fills += 1
+                positions[tk] = positions.get(tk, 0) + filled
+            elif rejected:
+                n_rej += 1
+        if positions:
+            self._tranches.append({"entry_idx": i, "positions": positions})
+
+        return n_orders, n_fills, n_rej
 
     def _adjusted_reference(self, D: date, ticker: str, raw_ref: float) -> float:
         """

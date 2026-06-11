@@ -43,7 +43,8 @@ from src.execution.vn_cost_model import ExecutionConfig
 CHECKPOINT_PATH = Path("models/saved/v3_training_checkpoint.joblib")
 
 
-def _run_engine(sig_thr: float, rebalance_frequency: int | None = None) -> tuple:
+def _run_engine(sig_thr: float, rebalance_frequency: int | None = None,
+                tranche: bool = False, hold_days: int = 20) -> tuple:
     ckpt = joblib.load(CHECKPOINT_PATH)
     cfg: RunConfig = ckpt["train_cfg"]
     if rebalance_frequency is not None:
@@ -80,6 +81,8 @@ def _run_engine(sig_thr: float, rebalance_frequency: int | None = None) -> tuple
         risk_aversion=cfg.risk_aversion,
         liquid_top_n=cfg.liquid_top_n,
         start_trading_date=cutoff,
+        rebalance_mode="tranche" if tranche else "grid",
+        tranche_hold_days=hold_days,
         constraints=PortfolioConstraints(
             max_weight=cfg.max_weight, long_only=True,
             target_leverage=0.95, target_vol=cfg.target_vol),
@@ -133,9 +136,10 @@ def _fifo_round_trips(fills: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(trips)
 
 
-def main(sig_thr: float, rebalance_frequency: int | None = None) -> None:
+def main(sig_thr: float, rebalance_frequency: int | None = None,
+         tranche: bool = False, hold_days: int = 20) -> None:
     configure_logging()
-    result, cfg = _run_engine(sig_thr, rebalance_frequency)
+    result, cfg = _run_engine(sig_thr, rebalance_frequency, tranche, hold_days)
 
     eq = result.equity_curve
     fills = pd.DataFrame(result.fills)
@@ -219,5 +223,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--sig-thr", type=float, default=0.40)
     p.add_argument("--rebalance-frequency", type=int, default=None)
+    p.add_argument("--tranche", action="store_true",
+                   help="staggered tranche book instead of grid rebalance")
+    p.add_argument("--hold-days", type=int, default=20)
     args = p.parse_args()
-    main(args.sig_thr, args.rebalance_frequency)
+    main(args.sig_thr, args.rebalance_frequency, args.tranche, args.hold_days)
