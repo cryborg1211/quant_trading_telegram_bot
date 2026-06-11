@@ -997,6 +997,34 @@ def build_event_overrides(
     return overrides, rescued
 
 
+def _tranche_signal_fields(strategy: dict | None, n_picks: int) -> dict:
+    """Tranche-mode dispatch enrichment from the artifact's `strategy` dict.
+
+    Returns {} for legacy artifacts (no strategy / non-tranche mode) so the
+    half-Kelly path is untouched.  Otherwise: the per-name NAV weight the
+    backtest was validated under (NAV/hold_days split across today's picks),
+    the trading-day exit date, and the optional PT/SL barrier rule.
+    """
+    if not strategy or strategy.get("mode") != "tranche":
+        return {}
+    hold_days = int(strategy.get("hold_days", 30))
+    weight = 1.0 / (hold_days * max(1, n_picks))
+    exit_date = pd.bdate_range(datetime.now().date(), periods=hold_days + 1)[-1]
+    fields = {
+        "suggested_weight": weight,
+        "hold_label": f"{hold_days} phiên (đến ~{exit_date.strftime('%d/%m/%Y')})",
+    }
+    pt, sl = strategy.get("pt_sigma"), strategy.get("sl_sigma")
+    if pt is not None or sl is not None:
+        parts = []
+        if pt is not None:
+            parts.append(f"chốt lời sớm tại +{float(pt):.1f}σ")
+        if sl is not None:
+            parts.append(f"cắt lỗ tại −{float(sl):.1f}σ")
+        fields["exit_rule"] = " / ".join(parts)
+    return fields
+
+
 def _dispatch_signals(
     top_buy_signals: list[str],
     all_sentiments: dict[str, Any],
@@ -1008,12 +1036,18 @@ def _dispatch_signals(
     horizon: int,
     broadcast: bool,
     bot: TelegramBot,
+    strategy: dict | None = None,
 ) -> list[dict]:
     """Per-ticker signal build + Telegram dispatch loop.
 
     Reads module-level global `_LATEST_REGIME_BY_TICKER` set by
     `_compute_v3_features`. This coupling is intentional and documented.
+
+    `strategy` — the artifact's portfolio-construction dict.  Tranche mode
+    overrides the half-Kelly size with the validated cohort weight and adds
+    hold-horizon / barrier guidance to the card; None keeps legacy behavior.
     """
+    tranche_fields = _tranche_signal_fields(strategy, len(top_buy_signals))
     dispatched_signals: list[dict] = []
     for ticker in top_buy_signals:
         exec_price = live_exec_prices.get(ticker)
@@ -1037,7 +1071,11 @@ def _dispatch_signals(
             _status = _ov["status"]
             _ly_do = _ov["ly_do"]
         else:
-            _w = suggested_weight(float(_p5[2]), market_regime=_regime)
+            # Tranche artifacts size at the validated cohort weight
+            # (NAV/hold_days across picks); legacy artifacts keep half-Kelly.
+            _w = tranche_fields.get(
+                "suggested_weight",
+                suggested_weight(float(_p5[2]), market_regime=_regime))
             _status = "MUA"
             _ly_do = ""
 
@@ -1063,6 +1101,10 @@ def _dispatch_signals(
             "top_pos_features": top_pos_features,
             "top_neg_features": top_neg_features,
         }
+        if "hold_label" in tranche_fields:
+            signal_data["hold_label"] = tranche_fields["hold_label"]
+        if "exit_rule" in tranche_fields:
+            signal_data["exit_rule"] = tranche_fields["exit_rule"]
 
         if broadcast:
             bot.send_signal_alert(signal_data)
@@ -1157,6 +1199,14 @@ def run_trade_execution(
             )
             bot.send_text_alert(_hdr, label="header")
 
+        # Portfolio-construction contract from the loaded artifact (cached per
+        # horizon).  Missing artifact / pre-tranche bundle → None → legacy
+        # half-Kelly dispatch.
+        try:
+            _strategy = _load_v3_bot(int(horizon)).strategy or None
+        except Exception:  # noqa: BLE001 — dispatch must not die on artifact issues
+            _strategy = None
+
         dispatched_signals = _dispatch_signals(
             top_buy_signals=top_buy_signals,
             all_sentiments=all_sentiments,
@@ -1168,6 +1218,7 @@ def run_trade_execution(
             horizon=horizon,
             broadcast=broadcast,
             bot=bot,
+            strategy=_strategy,
         )
         sent = len(dispatched_signals)
         LOGGER.info("Telegram alerts dispatched: %s (broadcast=%s)", sent, broadcast)

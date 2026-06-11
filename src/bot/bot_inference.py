@@ -63,6 +63,11 @@ class V3BotInference:
     macro_hmm: Any = None
     metadata: dict = field(default_factory=dict)
     schema_version: str = "v3.0"
+    # Portfolio-construction contract the thresholds were tuned under
+    # (run_backtest GOLDEN): {"mode", "hold_days", "signal_threshold",
+    # "pt_sigma", "sl_sigma"}.  Empty for pre-tranche artifacts — callers
+    # must treat absence as legacy half-Kelly dispatch.
+    strategy: dict = field(default_factory=dict)
 
     # ── loaders ───────────────────────────────────────────────────────────
     @classmethod
@@ -87,11 +92,13 @@ class V3BotInference:
             macro_hmm=bundle.get("macro_hmm"),
             metadata=dict(bundle.get("metadata", {})),
             schema_version=str(bundle.get("schema_version", "v3.0")),
+            strategy=dict(bundle.get("strategy") or {}),
         )
         LOGGER.info(
             "V3BotInference loaded | schema=%s  features=%d  up_threshold=%.2f  "
-            "signal_threshold=%.2f  trained_at=%s  oos_sharpe=%+.3f",
+            "signal_threshold=%.2f  strategy=%s  trained_at=%s  oos_sharpe=%+.3f",
             bot.schema_version, len(feats), up_thr, sig_thr,
+            bot.strategy or "legacy",
             bot.metadata.get("trained_at", "?"),
             bot.metadata.get("oos_sharpe", float("nan")),
         )

@@ -153,6 +153,16 @@ class TelegramBot:
             regime_line = (f"Pha thị trường: <b>{html.escape(str(regime_label))}</b> "
                            f"(Regime {int(regime_id)})\n")
 
+        # Tranche-strategy guidance (artifact `strategy` dict) — hold horizon +
+        # optional PT/SL barrier rule.  Absent for legacy half-Kelly artifacts.
+        hold_label = signal_data.get("hold_label")
+        hold_line = ""
+        if hold_label:
+            hold_line = f"Nắm giữ: <b>{html.escape(str(hold_label))}</b>\n"
+            exit_rule = signal_data.get("exit_rule")
+            if exit_rule:
+                hold_line += f"Quy tắc thoát: {html.escape(str(exit_rule))}\n"
+
         # Event-driven rescue banner (status + VN reason) — only for non-standard signals.
         _status = signal_data.get("status")
         _ly_do = signal_data.get("ly_do")
@@ -188,6 +198,7 @@ class TelegramBot:
             f"<b>KHUYẾN NGHỊ MUA — {ticker}</b>\n"
             f"{horizon_label} Model  |  Khuyến nghị đi vốn: <b>{sizing_str}</b>\n"
             f"{regime_line}"
+            f"{hold_line}"
             f"{event_line}"
             f"{date_str}  |  Vùng giá: <b>{price}</b>\n"
             f"\n"
