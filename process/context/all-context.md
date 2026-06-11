@@ -130,7 +130,7 @@ stock_price_v3/
   src/
     backtest/
       pipeline.py         -- Feature pipeline (build_features, FEATURE_RECIPE_VERSION)
-      walk_forward.py     -- Walk-forward backtesting engine
+      walk_forward.py     -- Walk-forward engine: "tranche" mode (AFML staggered cohorts, evaluator default) + legacy "grid" mode; scales thousand-VND parquet prices to absolute VND (price_unit_vnd)
     bot/
       bot_inference.py    -- V3BotInference (serve-path model loading + prediction)
       sizing.py           -- Half-Kelly position sizing (20% NAV cap)
@@ -215,6 +215,8 @@ stock_price_v3/
 **Architecture style:** Pure functions + procedural orchestration. No deep OOP inheritance trees. Prefer extracting pure functions over adding class methods.
 
 **Feature recipe versioning:** `FEATURE_RECIPE_VERSION` in `src/backtest/pipeline.py` (currently `"v1.1"`). Hard gate — serve-path checks match at load time. Any feature engineering change requires: bump version → full retrain.
+
+**Backtest portfolio construction:** `run_backtest.py` defaults to `--mode tranche --hold-days 30` (staggered AFML cohort book: daily deploy NAV/H into top-`max_positions` names, hold exactly H trading days). Legacy `--mode grid` (concentrated delta-rebalance) is structurally unfit for this signal — its ~45 correlated entry dates let market beta dominate. Price-scale rule: parquet OHLCV is in thousands of VND; the engine converts to absolute VND via `WalkForwardConfig.price_unit_vnd` — any new code feeding parquet prices into `VNCostModel` must do the same. Bot payload carries an additive `strategy` dict (mode/hold_days/signal_threshold); serve path does not consume it yet (Phase 2).
 
 **Telegram formatting:** Strict 4096-char limit. HTML mode with careful tag closure. Long reports split into multiple messages.
 

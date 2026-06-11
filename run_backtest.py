@@ -74,10 +74,37 @@ REQUIRED_CKPT_KEYS = ("ensembles", "tabular_features", "cutoff", "train_cfg")
 # OOS walk-forward (Phase 8) — frozen ensemble oracle
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
+                     mode: str = "tranche", hold_days: int = 30) -> WalkForwardConfig:
+    """Pure WalkForwardConfig builder — extracted from `run_oos` so the
+    mode/hold-days plumbing is unit-testable without running the engine.
+
+    `mode="grid"` reproduces the legacy delta-rebalance book byte-for-byte;
+    `mode="tranche"` runs the staggered AFML cohort book (the evaluator default
+    since the grid-date study showed the grid book destroys the per-trade edge).
+    """
+    return WalkForwardConfig(
+        seq_len=1,                               # V3/V4: pure tabular — single-bar inputs
+        feature_cols=tabular_features,
+        initial_capital=cfg.initial_capital, max_positions=cfg.max_positions,
+        rebalance_frequency=cfg.rebalance_frequency, signal_threshold=cfg.signal_threshold,
+        cov_lookback=60, kelly_fraction=cfg.kelly_fraction, risk_aversion=cfg.risk_aversion,
+        liquid_top_n=cfg.liquid_top_n,            # VN50 top-N ADV gate (tradeable universe)
+        start_trading_date=cutoff,
+        rebalance_mode=mode,
+        tranche_hold_days=hold_days,
+        constraints=PortfolioConstraints(
+            max_weight=cfg.max_weight, long_only=True,
+            target_leverage=0.95, target_vol=cfg.target_vol),
+        exec_config=ExecutionConfig(),
+    )
+
+
 def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
             corporate_actions: list, cutoff: date, cfg: RunConfig,
             p_bull_series: pd.Series | None = None,
-            inference_cache: dict | None = None) -> pd.DataFrame:
+            inference_cache: dict | None = None,
+            mode: str = "tranche", hold_days: int = 30) -> pd.DataFrame:
     """Walk-forward OOS using the pure-tabular ensemble oracle.
 
     The engine builds (n, 1, F) single-bar tensors internally (seq_len=1) and the
@@ -87,7 +114,9 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
     `inference_cache` — a PER-SEED ``{date: (p_up, tickers)}`` map reused across
     the threshold sweep.  Because oracle scoring is threshold-independent, only
     the first threshold for a given seed pays the GBM cost; the rest hit the
-    cache and re-run just the (cheap) allocation/execution path.
+    cache and re-run just the (cheap) allocation/execution path.  NOTE: tranche
+    mode scores DAILY (~900 OOS days), so the first threshold per seed is the
+    expensive one (~15 min); grid mode only scores on rebalance days.
     """
     oracle = make_ensemble_oracle(ensemble)
     # Lookback buffer ahead of cutoff so OOS day-1 has feature warm-up + cov history.
@@ -97,19 +126,7 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
     buf_start = all_dates[max(0, cutoff_idx - buffer)]
     sub = panel.filter(pl.col("date") >= buf_start)
 
-    wf_cfg = WalkForwardConfig(
-        seq_len=1,                               # V3/V4: pure tabular — single-bar inputs
-        feature_cols=tabular_features,
-        initial_capital=cfg.initial_capital, max_positions=cfg.max_positions,
-        rebalance_frequency=cfg.rebalance_frequency, signal_threshold=cfg.signal_threshold,
-        cov_lookback=60, kelly_fraction=cfg.kelly_fraction, risk_aversion=cfg.risk_aversion,
-        liquid_top_n=cfg.liquid_top_n,            # VN50 top-N ADV gate (tradeable universe)
-        start_trading_date=cutoff,
-        constraints=PortfolioConstraints(
-            max_weight=cfg.max_weight, long_only=True,
-            target_leverage=0.95, target_vol=cfg.target_vol),
-        exec_config=ExecutionConfig(),
-    )
+    wf_cfg = _build_wf_config(tabular_features, cutoff, cfg, mode, hold_days)
     eng = WalkForwardEngine(wf_cfg, oracle)
     # Soft HMM regime scaling: P(Bull) multiplies the daily target weights.
     result = eng.run(sub, corporate_actions=corporate_actions, p_bull_series=p_bull_series,
@@ -266,7 +283,9 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
          eval_overrides: dict | None = None,
          sweep_thresholds: list[float] | None = None,
          save_bot_payload: bool = True,
-         export_only: bool = False) -> None:
+         export_only: bool = False,
+         mode: str = "tranche",
+         hold_days: int = 30) -> None:
     configure_logging()
     t_start = time.perf_counter()
     sweep_thresholds = list(sweep_thresholds or DEFAULT_SWEEP_THRESHOLDS)
@@ -288,8 +307,9 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
     cfg = _apply_eval_overrides(train_cfg, eval_overrides or {})
 
     LOGGER.info("=" * 100)
-    LOGGER.info(" RUN_BACKTEST (Fast Evaluator) | horizon=T+%d  PT=%.1fσ  SL=%.1fσ  "
+    LOGGER.info(" RUN_BACKTEST (Fast Evaluator) | mode=%s%s  horizon=T+%d  PT=%.1fσ  SL=%.1fσ  "
                 "VN50_gate(liquid_top_n)=%d  seeds=%d",
+                mode, f" hold={hold_days}d" if mode == "tranche" else "",
                 cfg.tb_horizon, cfg.tb_pt, cfg.tb_sl, cfg.liquid_top_n, len(seeds))
     LOGGER.info("=" * 100)
 
@@ -298,7 +318,8 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
     # expensive dataset materialization) — just repackage the live-bot artifact
     # straight from the frozen checkpoint.  Finishes in seconds.
     if export_only:
-        _export_only(cfg, tabular_features, trained, macro_hmm)
+        _export_only(cfg, tabular_features, trained, macro_hmm,
+                     mode=mode, hold_days=hold_days)
         LOGGER.info(" Wall-clock: %.1fs", time.perf_counter() - t_start)
         return
 
@@ -344,14 +365,15 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
     for thr in sweep_thresholds:
         sig_thr = thr - 0.05                            # engine gate 5pp below model threshold
         cfg.signal_threshold = sig_thr                  # WalkForwardConfig pulls from here
-        with phase(f"Sweep | up_threshold={thr:.2f}  signal_threshold={sig_thr:.2f}"):
+        with phase(f"Sweep | mode={mode}  up_threshold={thr:.2f}  signal_threshold={sig_thr:.2f}"):
             per_seed: list[dict] = []
             monthly_cols_thr: dict[str, pd.Series] = {}
             for seed, ensemble in trained:
                 try:
                     eq = run_oos(ds.panel, tabular_features, ensemble, corporate_actions,
                                  cutoff, cfg, p_bull_series=p_bull_series,
-                                 inference_cache=seed_inference_caches[seed])
+                                 inference_cache=seed_inference_caches[seed],
+                                 mode=mode, hold_days=hold_days)
                     m = equity_metrics(eq, cfg.initial_capital)
                     # Inline UP-precision @thr (no log spam)
                     if len(Xte_all) > 0:
@@ -415,7 +437,7 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
     # ── 6. Persist the live-bot payload (bot_inference.V3BotInference schema) ─
     if save_bot_payload:
         _persist_bot_payload(cfg, tabular_features, golden, best_seed_record,
-                             macro_hmm, sweep_results)
+                             macro_hmm, sweep_results, mode=mode, hold_days=hold_days)
 
     # ── 7. Phase 4 DSR + PBO on the GOLDEN's per-seed equity curves ──────────
     # Multiplicity for DSR = TOTAL configs swept (thresholds × seeds).
@@ -433,13 +455,14 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
             pbo = {"pbo": float("nan"), "valid": False,
                    "warning": "single config — train ≥2 seeds for PBO"}
 
-    _print_sweep_report(sweep_results, golden)
+    _print_sweep_report(sweep_results, golden, mode=mode, hold_days=hold_days)
     _teardown_report(cfg, best_seed_record, dsr, pbo, len(seeds),
-                     time.perf_counter() - t_start)
+                     time.perf_counter() - t_start, mode=mode, hold_days=hold_days)
 
 
 def _persist_bot_payload(cfg: RunConfig, tabular_features: list[str], golden: dict,
-                         best_seed_record: dict, macro_hmm, sweep_results: list[dict]) -> None:
+                         best_seed_record: dict, macro_hmm, sweep_results: list[dict],
+                         mode: str = "tranche", hold_days: int = 30) -> None:
     """Single self-contained joblib the bot loads (src/bot/bot_inference.py):
     ensemble + feature-column order + decision thresholds + HMM overlay + provenance.
     Horizon-aware filename so dual-horizon bots can run side by side."""
@@ -466,6 +489,15 @@ def _persist_bot_payload(cfg: RunConfig, tabular_features: list[str], golden: di
         "tabular_features": list(tabular_features),          # column order is load-bearing
         "up_threshold": float(golden["up_threshold"]),
         "signal_threshold": float(golden["signal_threshold"]),
+        # ADDITIVE — the validated portfolio construction these thresholds were
+        # tuned under.  The serve path does not consume this yet (Phase 2:
+        # NAV/hold_days/max_positions sizing + exit-after-hold alerts); loaders
+        # validate required keys only, so unknown keys are safe.
+        "strategy": {
+            "mode": mode,
+            "hold_days": int(hold_days),
+            "signal_threshold": float(golden["signal_threshold"]),
+        },
         "macro_hmm": macro_hmm,                              # may be None
         "metadata": {
             "trained_at": datetime.utcnow().isoformat() + "Z",
@@ -581,11 +613,13 @@ def _plot_prob_distribution(
                        type(exc).__name__, exc)
 
 
-def _print_sweep_report(sweep_results: list[dict], golden: dict) -> None:
+def _print_sweep_report(sweep_results: list[dict], golden: dict,
+                        mode: str = "tranche", hold_days: int = 30) -> None:
     """Threshold-sweep summary table — one row per up_threshold, GOLDEN tagged."""
     bar = "=" * 100
+    mode_tag = f"mode={mode}" + (f" hold={hold_days}d" if mode == "tranche" else "")
     print(f"\n{bar}")
-    print(" THRESHOLD SWEEP REPORT  —  goal: maximise mean OOS Net PnL across the seed pool")
+    print(f" THRESHOLD SWEEP REPORT ({mode_tag})  —  goal: maximise mean OOS Net PnL across the seed pool")
     print(bar)
     header = (f" {'up_thr':>7} {'sig_thr':>8} {'seeds':>6} "
               f"{'mean_NetPnL (VND)':>22} {'mean_Sharpe':>13} {'mean_DD':>10} "
@@ -599,7 +633,7 @@ def _print_sweep_report(sweep_results: list[dict], golden: dict) -> None:
               f"{r['mean_dd']*100:>+9.2f}% {r['total_pred_up']:>14,d} "
               f"{r['mean_up_precision']:>13.4f}{mark}")
     print(bar)
-    print(f" ★ GOLDEN CONFIG  ->  up_threshold={golden['up_threshold']:.2f}  "
+    print(f" ★ GOLDEN CONFIG  ->  {mode_tag}  up_threshold={golden['up_threshold']:.2f}  "
           f"signal_threshold={golden['signal_threshold']:.2f}  "
           f"mean_NetPnL={golden['mean_net_pnl']:+,.0f} VND  "
           f"mean_Sharpe={golden['mean_sharpe']:+.3f}  "
@@ -607,10 +641,12 @@ def _print_sweep_report(sweep_results: list[dict], golden: dict) -> None:
     print(bar + "\n")
 
 
-def _teardown_report(cfg, best, dsr, pbo, n_configs, elapsed):
+def _teardown_report(cfg, best, dsr, pbo, n_configs, elapsed,
+                     mode: str = "tranche", hold_days: int = 30):
     bar = "=" * 70                                     # ASCII — cp1252-safe regardless of wrap
+    mode_tag = mode + (f" (hold={hold_days}d)" if mode == "tranche" else "")
     print(f"\n{bar}\n QUANT ENGINE V4.0 — OOS BACKTEST TEARDOWN REPORT\n{bar}")
-    print(f" Best config        : seed={best['seed']}  ({n_configs} configs tried)")
+    print(f" Best config        : seed={best['seed']}  mode={mode_tag}  ({n_configs} configs tried)")
     print(f" OOS trading days   : {best['n_days']}")
     print(f" Initial capital    : {cfg.initial_capital:,.0f} VND")
     print(f" Final NAV          : {best['final_nav']:,.0f} VND")
@@ -640,7 +676,8 @@ def _teardown_report(cfg, best, dsr, pbo, n_configs, elapsed):
 
 
 def _export_only(cfg: RunConfig, tabular_features: list[str],
-                 trained: list[tuple[int, TabularEnsemble]], macro_hmm) -> None:
+                 trained: list[tuple[int, TabularEnsemble]], macro_hmm,
+                 mode: str = "tranche", hold_days: int = 30) -> None:
     """Repackage the live-bot artifact from the frozen checkpoint WITHOUT running
     the walk-forward backtest.
 
@@ -686,7 +723,8 @@ def _export_only(cfg: RunConfig, tabular_features: list[str],
         "net_pnl": _NA, "total_return": _NA, "net_sharpe": _NA,
         "max_drawdown": _NA, "n_days": 0, "final_nav": _NA,
     }
-    _persist_bot_payload(cfg, tabular_features, golden, best_seed_record, macro_hmm, [])
+    _persist_bot_payload(cfg, tabular_features, golden, best_seed_record, macro_hmm, [],
+                         mode=mode, hold_days=hold_days)
 
     LOGGER.info("=" * 100)
     LOGGER.info(" Export complete. Walk-forward backtest skipped.")
@@ -695,12 +733,19 @@ def _export_only(cfg: RunConfig, tabular_features: list[str],
     LOGGER.info("=" * 100)
 
 
-def _cli() -> tuple[Path, dict, list[float], bool, bool]:
+def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int]:
     p = argparse.ArgumentParser(
         description="V4.0 Fast Evaluator — sweep + DSR/PBO on a frozen training checkpoint.")
     p.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH,
                    help="training checkpoint written by train_models.py")
     # Walk-forward / portfolio knobs (the whole point — iterate freely here).
+    p.add_argument("--mode", choices=("tranche", "grid"), default="tranche",
+                   help="portfolio construction: 'tranche' = staggered AFML cohort book "
+                        "(default; daily inference — first threshold per seed ~15 min), "
+                        "'grid' = legacy concentrated delta-rebalance book")
+    p.add_argument("--hold-days", type=int, default=30,
+                   help="tranche holding period in trading days (per-day net edge "
+                        "peaks at 30; ignored in grid mode)")
     p.add_argument("--liquid-top-n", type=int, default=None, help="VN50 ADV gate (default 50)")
     p.add_argument("--max-positions", type=int, default=None)
     p.add_argument("--rebalance-frequency", type=int, default=None)
@@ -732,10 +777,11 @@ def _cli() -> tuple[Path, dict, list[float], bool, bool]:
     }
     sweep = ([float(x) for x in a.sweep_thresholds.split(",")]
              if a.sweep_thresholds else None)
-    return a.checkpoint, overrides, sweep, (not a.no_save), a.export_only
+    return (a.checkpoint, overrides, sweep, (not a.no_save), a.export_only,
+            a.mode, a.hold_days)
 
 
 if __name__ == "__main__":
-    _ckpt, _overrides, _sweep, _save, _export = _cli()
+    _ckpt, _overrides, _sweep, _save, _export, _mode, _hold = _cli()
     main(_ckpt, eval_overrides=_overrides, sweep_thresholds=_sweep,
-         save_bot_payload=_save, export_only=_export)
+         save_bot_payload=_save, export_only=_export, mode=_mode, hold_days=_hold)
