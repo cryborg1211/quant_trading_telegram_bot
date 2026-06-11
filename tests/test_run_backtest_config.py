@@ -47,6 +47,17 @@ class TestBuildWfConfig:
         assert wf.constraints.target_leverage == 0.95
         assert wf.constraints.long_only is True
 
+    def test_barrier_sigmas_propagate(self) -> None:
+        wf = _build_wf_config(FEATURES, CUTOFF, _cfg(), mode="tranche",
+                              hold_days=30, pt_sigma=3.0, sl_sigma=2.0)
+        assert wf.tranche_pt_sigma == 3.0
+        assert wf.tranche_sl_sigma == 2.0
+
+    def test_barriers_default_off(self) -> None:
+        wf = _build_wf_config(FEATURES, CUTOFF, _cfg())
+        assert wf.tranche_pt_sigma is None
+        assert wf.tranche_sl_sigma is None
+
     def test_price_unit_default_untouched(self) -> None:
         # The thousand-VND scaling must stay active regardless of mode.
         for mode in ("tranche", "grid"):

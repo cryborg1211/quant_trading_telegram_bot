@@ -119,6 +119,11 @@ class TestTrancheMechanics:
         assert len(on_zero[on_zero["side"] == "buy"]) == 0      # no new tranche
         assert len(on_zero[on_zero["side"] == "sell"]) > 0      # expiry still exits
 
+    def test_barriers_disabled_by_default(self, result_and_engine) -> None:
+        _, eng = result_and_engine
+        assert eng.config.tranche_pt_sigma is None
+        assert eng.config.tranche_sl_sigma is None
+
     def test_grid_mode_unaffected(self) -> None:
         cfg = WalkForwardConfig(
             seq_len=1, feature_cols=["feat"],
@@ -129,3 +134,67 @@ class TestTrancheMechanics:
         eng = WalkForwardEngine(cfg, _oracle)
         res = eng.run(_panel())
         assert len(res.equity_curve) == N_DAYS    # smoke: grid path still runs
+
+
+class TestTrancheBarriers:
+    """PT/SL barrier exits — triple-barrier replication inside the cohort book.
+
+    Entry vol falls back to 0.02 (constant-price warmup → zero rolling std),
+    so sl=2.0 → exit at −4%, pt=3.0 → exit at +6%.
+    """
+
+    N = 15
+    HOLD = 10
+    STEP_IDX = 5      # the day prices jump/drop
+
+    def _stepped_panel(self, aaa_mult: float, bbb_mult: float) -> pd.DataFrame:
+        days = pd.bdate_range("2024-01-02", periods=self.N).date
+        frames = []
+        for tk, score, mult in [("AAA", 0.90, aaa_mult), ("BBB", 0.80, bbb_mult),
+                                ("CCC", 0.10, 1.0), ("DDD", 0.45, 1.0)]:
+            px = [PRICE * (mult if i >= self.STEP_IDX else 1.0) for i in range(self.N)]
+            frames.append(pd.DataFrame({
+                "ticker": tk, "date": days,
+                "open": px, "high": px, "low": px, "close": px,
+                "volume": 10_000_000, "feat": score,
+            }))
+        return pd.concat(frames, ignore_index=True)
+
+    def _run(self, panel: pd.DataFrame, **cfg_overrides):
+        cfg = WalkForwardConfig(
+            seq_len=1, feature_cols=["feat"],
+            rebalance_mode="tranche", tranche_hold_days=self.HOLD,
+            max_positions=2, signal_threshold=0.40,
+            liquid_top_n=None, initial_capital=1_000_000_000.0,
+            **cfg_overrides,
+        )
+        eng = WalkForwardEngine(cfg, _oracle)
+        res = eng.run(panel)
+        fills = pd.DataFrame(res.fills)
+        fills["date"] = pd.to_datetime(fills["date"]).dt.date
+        return fills, sorted(panel["date"].unique())
+
+    def test_sl_barrier_exits_early(self) -> None:
+        # AAA drops −6% (beyond the −4% SL) on STEP_IDX; expiry is 10 days out.
+        fills, days = self._run(self._stepped_panel(aaa_mult=0.94, bbb_mult=1.0),
+                                tranche_sl_sigma=2.0, tranche_pt_sigma=3.0)
+        aaa_sells = fills[(fills["ticker"] == "AAA") & (fills["side"] == "sell")]
+        assert len(aaa_sells) > 0
+        assert aaa_sells["date"].min() == days[self.STEP_IDX]
+        # BBB never crossed a barrier → its first sell is the vertical expiry.
+        bbb_sells = fills[(fills["ticker"] == "BBB") & (fills["side"] == "sell")]
+        assert bbb_sells["date"].min() == days[1 + self.HOLD]
+
+    def test_pt_barrier_exits_early(self) -> None:
+        # BBB jumps +6.5% (beyond the +6% PT) on STEP_IDX.
+        fills, days = self._run(self._stepped_panel(aaa_mult=1.0, bbb_mult=1.065),
+                                tranche_sl_sigma=2.0, tranche_pt_sigma=3.0)
+        bbb_sells = fills[(fills["ticker"] == "BBB") & (fills["side"] == "sell")]
+        assert len(bbb_sells) > 0
+        assert bbb_sells["date"].min() == days[self.STEP_IDX]
+
+    def test_no_barriers_holds_through_drop(self) -> None:
+        # Same −6% drop, barriers OFF → no AAA sell until the vertical expiry.
+        fills, days = self._run(self._stepped_panel(aaa_mult=0.94, bbb_mult=1.0))
+        aaa_sells = fills[(fills["ticker"] == "AAA") & (fills["side"] == "sell")]
+        assert aaa_sells["date"].min() == days[1 + self.HOLD]

@@ -44,7 +44,8 @@ CHECKPOINT_PATH = Path("models/saved/v3_training_checkpoint.joblib")
 
 
 def _run_engine(sig_thr: float, rebalance_frequency: int | None = None,
-                tranche: bool = False, hold_days: int = 20) -> tuple:
+                tranche: bool = False, hold_days: int = 20,
+                pt_sigma: float | None = None, sl_sigma: float | None = None) -> tuple:
     ckpt = joblib.load(CHECKPOINT_PATH)
     cfg: RunConfig = ckpt["train_cfg"]
     if rebalance_frequency is not None:
@@ -83,6 +84,8 @@ def _run_engine(sig_thr: float, rebalance_frequency: int | None = None,
         start_trading_date=cutoff,
         rebalance_mode="tranche" if tranche else "grid",
         tranche_hold_days=hold_days,
+        tranche_pt_sigma=pt_sigma,
+        tranche_sl_sigma=sl_sigma,
         constraints=PortfolioConstraints(
             max_weight=cfg.max_weight, long_only=True,
             target_leverage=0.95, target_vol=cfg.target_vol),
@@ -137,9 +140,11 @@ def _fifo_round_trips(fills: pd.DataFrame) -> pd.DataFrame:
 
 
 def main(sig_thr: float, rebalance_frequency: int | None = None,
-         tranche: bool = False, hold_days: int = 20) -> None:
+         tranche: bool = False, hold_days: int = 20,
+         pt_sigma: float | None = None, sl_sigma: float | None = None) -> None:
     configure_logging()
-    result, cfg = _run_engine(sig_thr, rebalance_frequency, tranche, hold_days)
+    result, cfg = _run_engine(sig_thr, rebalance_frequency, tranche, hold_days,
+                              pt_sigma, sl_sigma)
 
     eq = result.equity_curve
     fills = pd.DataFrame(result.fills)
@@ -226,5 +231,10 @@ if __name__ == "__main__":
     p.add_argument("--tranche", action="store_true",
                    help="staggered tranche book instead of grid rebalance")
     p.add_argument("--hold-days", type=int, default=20)
+    p.add_argument("--pt-sigma", type=float, default=None,
+                   help="profit-take barrier in entry-vol multiples (labels: 3.0)")
+    p.add_argument("--sl-sigma", type=float, default=None,
+                   help="stop-loss barrier in entry-vol multiples (labels: 2.0)")
     args = p.parse_args()
-    main(args.sig_thr, args.rebalance_frequency, args.tranche, args.hold_days)
+    main(args.sig_thr, args.rebalance_frequency, args.tranche, args.hold_days,
+         args.pt_sigma, args.sl_sigma)

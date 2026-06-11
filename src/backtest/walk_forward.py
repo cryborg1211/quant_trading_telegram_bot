@@ -144,6 +144,17 @@ class WalkForwardConfig:
     rebalance_mode: str = "grid"
     tranche_hold_days: int = 20
 
+    # ── TRANCHE BARRIER EXITS (triple-barrier replication) ──────────────────
+    # The triple-barrier labels exit at PT (+pt·σ), SL (−sl·σ), or the vertical
+    # barrier — the tranche book's fixed hold only replicates the vertical.
+    # When set, each position records its entry price and entry-time daily vol;
+    # a close beyond entry·(1 + pt·σ) or entry·(1 − sl·σ) flags the position
+    # for exit at that day's ATC (retrying on rejection).  Match the label
+    # convention (RunConfig: tb_pt=3.0, tb_sl=2.0) to trade what the model was
+    # trained to predict.  None ⇒ barrier disabled (pure fixed-hold cohorts).
+    tranche_pt_sigma: float | None = None
+    tranche_sl_sigma: float | None = None
+
     # OOS gate: only place trades on/after this date.  Days before it are still
     # iterated (NAV marked, corporate actions applied, features/cov built from
     # them) so the engine has lookback, but NO trade is initiated until the
@@ -604,7 +615,7 @@ class WalkForwardEngine:
 
         n_fills = n_rej = 0
         for tk, side, qty in orders:
-            filled_qty, rejected = self._place_atc_order(D, ts, tk, side, qty)
+            filled_qty, _px, rejected = self._place_atc_order(D, ts, tk, side, qty)
             if filled_qty > 0:
                 n_fills += 1
             elif rejected:
@@ -614,18 +625,19 @@ class WalkForwardEngine:
 
     def _place_atc_order(
         self, D: date, ts: datetime, tk: str, side: OrderSide, qty: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[int, float, bool]:
         """Place one ATC order through the cost model and book the outcome.
 
         Shared by grid `_execute` and `_tranche_day`.  Returns
-        ``(filled_quantity, was_rejected)`` — ``(0, False)`` means the order
-        was skipped pre-simulation (no print / unaffordable / sub-lot).
+        ``(filled_quantity, filled_price, was_rejected)`` — ``(0, 0.0, False)``
+        means the order was skipped pre-simulation (no print / unaffordable /
+        sub-lot).
         """
         cfg = self.config
         day = self._day_index.get(D, {})
         row = day.get(tk)
         if row is None:
-            return 0, False                            # no print today → cannot trade
+            return 0, 0.0, False                       # no print today → cannot trade
 
         # Cash guard for buys: never spend cash we don't have.  Two layers:
         #   (1) hard skip when cash is already non-positive (the bug fix —
@@ -636,11 +648,11 @@ class WalkForwardEngine:
         if side == OrderSide.BUY:
             unit = row["close"] * (1.0 + cfg.fee_buffer)
             if unit <= 0 or self.cash <= 0:
-                return 0, False
+                return 0, 0.0, False
             affordable = round_down_to_lot(max(0, int(self.cash / unit)), 100)
             qty = min(qty, affordable)
             if qty < 100:
-                return 0, False
+                return 0, 0.0, False
 
         vol = row["vol"]
         if not np.isfinite(vol) or vol <= 0:
@@ -673,51 +685,82 @@ class WalkForwardEngine:
                 "cash_flow": fill.signed_cash_flow,
                 "cost": fill.total_cost, "participation": fill.participation_pct,
             })
-            return int(fill.filled_quantity), False
+            return int(fill.filled_quantity), float(fill.filled_price), False
 
         self.rejections_log.append({
             "date": D.isoformat(), "ticker": tk, "side": side.value,
             "qty": qty, "reason": fill.rejection_reason.value,
         })
-        return 0, True
+        return 0, 0.0, True
 
     # ── 4b. Tranche-mode daily routine ──────────────────────────────────────
     def _tranche_day(self, i: int, D: date) -> tuple[int, int, int]:
         """One day of the staggered-tranche book.
 
-        1. SELL every position of every tranche older than
-           `tranche_hold_days` trading days (retrying daily until empty —
-           halts, band floors, and ATC volume caps just defer the exit).
-        2. BUY today's tranche: NAV/`tranche_hold_days` × P(Bull), split
+        1. Barrier scan (when `tranche_pt_sigma`/`tranche_sl_sigma` set):
+           flag any position whose close has crossed entry·(1 + pt·σ) or
+           entry·(1 − sl·σ) — σ recorded at entry, mirroring the
+           triple-barrier label target.
+        2. SELL every position of every expired tranche (older than
+           `tranche_hold_days`) plus every barrier-flagged position
+           (retrying daily until empty — halts, band floors, and ATC volume
+           caps just defer the exit).
+        3. BUY today's tranche: NAV/`tranche_hold_days` × P(Bull), split
            equally across the day's top `max_positions` names above
            `signal_threshold`.
+
+        Position record: {"qty", "entry_price", "entry_vol", "exit_pending"}.
         """
         cfg = self.config
         ts = datetime.combine(D, dtime(*cfg.atc_session))
+        day = self._day_index.get(D, {})
         n_orders = n_fills = n_rej = 0
 
-        # 1. Liquidate expired tranches (sells first → frees cash for buys).
+        # 1. Barrier scan — PT/SL exits ahead of the vertical barrier.
+        if cfg.tranche_pt_sigma is not None or cfg.tranche_sl_sigma is not None:
+            for tranche in self._tranches:
+                for tk, pos in tranche["positions"].items():
+                    if pos["exit_pending"]:
+                        continue
+                    row = day.get(tk)
+                    if row is None or pos["entry_price"] <= 0:
+                        continue
+                    ret = row["close"] / pos["entry_price"] - 1.0
+                    sigma = pos["entry_vol"]
+                    hit_pt = (cfg.tranche_pt_sigma is not None
+                              and ret >= cfg.tranche_pt_sigma * sigma)
+                    hit_sl = (cfg.tranche_sl_sigma is not None
+                              and ret <= -cfg.tranche_sl_sigma * sigma)
+                    if hit_pt or hit_sl:
+                        pos["exit_pending"] = True
+
+        # 2. Exits (sells first → frees cash for buys): expired tranches in
+        #    full, plus barrier-flagged positions in unexpired tranches.
         for tranche in self._tranches:
-            if i - tranche["entry_idx"] < cfg.tranche_hold_days:
-                continue
-            for tk, qty in list(tranche["positions"].items()):
-                if qty < 1:
+            expired = (i - tranche["entry_idx"]) >= cfg.tranche_hold_days
+            for tk, pos in list(tranche["positions"].items()):
+                if not (expired or pos["exit_pending"]):
+                    continue
+                if pos["qty"] < 1:
                     del tranche["positions"][tk]
                     continue
                 n_orders += 1
-                filled, rejected = self._place_atc_order(D, ts, tk, OrderSide.SELL, qty)
+                filled, _px, rejected = self._place_atc_order(
+                    D, ts, tk, OrderSide.SELL, pos["qty"])
                 if filled > 0:
                     n_fills += 1
-                    remaining = qty - filled
+                    remaining = pos["qty"] - filled
                     if remaining > 0:
-                        tranche["positions"][tk] = remaining   # ATC cap → finish tomorrow
+                        pos["qty"] = remaining           # ATC cap → finish tomorrow
+                        pos["exit_pending"] = True
                     else:
                         del tranche["positions"][tk]
                 elif rejected:
-                    n_rej += 1                                  # retry tomorrow
+                    n_rej += 1                           # retry tomorrow
+                    pos["exit_pending"] = True
         self._tranches = [t for t in self._tranches if t["positions"]]
 
-        # 2. Today's tranche.
+        # 3. Today's tranche.
         p_up, tickers = self._inference(D)
         p_up, tickers = self._apply_liquidity_filter(D, p_up, tickers)
         if len(tickers) == 0:
@@ -737,8 +780,7 @@ class WalkForwardEngine:
             return n_orders, n_fills, n_rej
         per_name = budget / len(picks)
 
-        day = self._day_index.get(D, {})
-        positions: dict[str, int] = {}
+        positions: dict[str, dict] = {}
         for tk in picks:
             row = day.get(tk)
             if row is None or row["close"] <= 0:
@@ -747,10 +789,19 @@ class WalkForwardEngine:
             if qty < 100:
                 continue
             n_orders += 1
-            filled, rejected = self._place_atc_order(D, ts, tk, OrderSide.BUY, qty)
+            filled, px, rejected = self._place_atc_order(D, ts, tk, OrderSide.BUY, qty)
             if filled > 0:
                 n_fills += 1
-                positions[tk] = positions.get(tk, 0) + filled
+                vol = row["vol"]
+                if not np.isfinite(vol) or vol <= 0:
+                    vol = 0.02                           # fallback daily vol
+                if tk in positions:
+                    positions[tk]["qty"] += filled
+                else:
+                    positions[tk] = {
+                        "qty": filled, "entry_price": px,
+                        "entry_vol": float(vol), "exit_pending": False,
+                    }
             elif rejected:
                 n_rej += 1
         if positions:
