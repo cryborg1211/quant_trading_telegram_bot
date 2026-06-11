@@ -2,7 +2,7 @@
 
 **Date:** 12-06-26
 **Complexity:** Simple
-**Status:** ⏳ PLANNED
+**Status:** ✅ COMPLETE — implemented in `67e3e1f`; full-sweep validation recorded in `process/general-plans/reports/tranche_sweep_validation_12-06-26.md`
 
 ## Overview
 
