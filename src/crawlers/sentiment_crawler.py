@@ -123,12 +123,17 @@ class SentimentCrawler:
         tickers = self._active_tickers(limit=max_tickers or CONFIG.sentiment.max_tickers)
 
         LOGGER.info("[SentimentCrawler] Crawl window: %s..%s; tickers=%s", start_date, end_date, len(tickers))
+        existing_urls = self._existing_urls()
         items = []
         items.extend(self._fetch_rss_items(start_date=start_date, end_date=end_date))
-        items.extend(self._fetch_gnews_items(tickers=tickers, start_date=start_date, end_date=end_date))
+        items.extend(
+            self._fetch_gnews_items(
+                tickers=tickers, start_date=start_date, end_date=end_date,
+                skip_urls=existing_urls,
+            )
+        )
 
         deduped = self._dedupe(items)
-        existing_urls = self._existing_urls()
         new_items = [
             item for item in deduped
             if item.url and item.url not in existing_urls
@@ -208,27 +213,59 @@ class SentimentCrawler:
                                 is_market_wide=True,
                             )
                         )
-                LOGGER.info("[SentimentCrawler] RSS %s: %s entries scanned.", source, len(parsed.entries))
+                if parsed.entries:
+                    LOGGER.info("[SentimentCrawler] RSS %s: %s entries scanned.", source, len(parsed.entries))
+                else:
+                    LOGGER.warning("[SentimentCrawler] RSS %s returned 0 entries — feed may be dead/blocked: %s", source, feed_url)
             except Exception as exc:
                 LOGGER.warning("[SentimentCrawler] RSS %s failed: %s", source, exc)
         return items
 
-    def _fetch_gnews_items(self, tickers: Iterable[str], start_date: date, end_date: date) -> list[NewsItem]:
+    # Wall-clock budget for the GNews loop. URL decoding sleeps ~1s/article and
+    # full-article fetches add several seconds each — without a deadline the
+    # loop can silently eat 5+ minutes of the EOD pipeline.
+    GNEWS_BUDGET_SECONDS = 180
+
+    def _fetch_gnews_items(
+        self,
+        tickers: Iterable[str],
+        start_date: date,
+        end_date: date,
+        skip_urls: set[str] | None = None,
+    ) -> list[NewsItem]:
         if GNews is None:
             LOGGER.warning("[SentimentCrawler] gnews missing. Skipping ticker GNews sentiment.")
             return []
 
+        skip_urls = skip_urls or set()
         client = GNews(language="vi", country="VN", max_results=CONFIG.sentiment.gnews_max_results)
         items = []
+        loop_start = time.monotonic()
         for ticker in tickers:
+            elapsed = time.monotonic() - loop_start
+            if elapsed > self.GNEWS_BUDGET_SECONDS:
+                LOGGER.warning(
+                    "[SentimentCrawler] GNews budget exhausted (%.0fs > %ss) — stopping at %s.",
+                    elapsed, self.GNEWS_BUDGET_SECONDS, ticker,
+                )
+                break
             query = f'"{ticker}" chứng khoán OR cổ phiếu site:cafef.vn OR site:vietstock.vn'
+            t0 = time.monotonic()
             try:
                 results = client.get_news(query) or []
+                kept = 0
                 for result in results:
-                    title = self._clean_text(result.get("title", ""))
-                    url = self._decode_google_url(result.get("url", ""))
+                    # Cheap filters FIRST — date and title — so we never pay the
+                    # ~1s Google-URL decode or the full-article download for
+                    # stale or already-scored entries.
                     published = self._parse_gnews_date(result.get("published date")) or end_date
                     if not (start_date <= published <= end_date):
+                        continue
+                    title = self._clean_text(result.get("title", ""))
+                    if not title:
+                        continue
+                    url = self._decode_google_url(result.get("url", ""))
+                    if not url or url in skip_urls:
                         continue
                     text = title
                     if hasattr(client, "get_full_article"):
@@ -238,8 +275,12 @@ class SentimentCrawler:
                                 text = article.text[: CONFIG.sentiment.article_char_limit]
                         except Exception:
                             pass
-                    if title and url:
-                        items.append(NewsItem(date=published, title=title, url=url, text=text, ticker=ticker))
+                    items.append(NewsItem(date=published, title=title, url=url, text=text, ticker=ticker))
+                    kept += 1
+                LOGGER.info(
+                    "[SentimentCrawler] GNews %s: kept %s/%s (%.1fs).",
+                    ticker, kept, len(results), time.monotonic() - t0,
+                )
                 time.sleep(CONFIG.sentiment.gnews_sleep_seconds)
             except Exception as exc:
                 LOGGER.warning("[SentimentCrawler] GNews %s failed: %s", ticker, exc)
