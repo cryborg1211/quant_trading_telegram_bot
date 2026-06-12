@@ -49,7 +49,7 @@ def test_daily_inference_happy_path(
     mock_a360_cls.return_value = _mock_alpha360()
 
     def predict_side_effect(df, horizon):
-        if horizon == 5:
+        if horizon == 20:  # PRIMARY dispatch horizon (T+3 secondary returns empty)
             return (
                 {"VCB": [0.1, 0.2, 0.70], "BID": [0.1, 0.25, 0.65], "VHM": [0.15, 0.25, 0.60]},
                 {"pnl_threshold_tau": 0.45},
@@ -101,7 +101,7 @@ def test_daily_inference_fallback_path(
     mock_a360_cls.return_value = _mock_alpha360()
 
     def predict_side_effect(df, horizon):
-        if horizon == 5:
+        if horizon == 20:  # PRIMARY dispatch horizon
             return (
                 {"VCB": [0.3, 0.4, 0.30], "BID": [0.35, 0.37, 0.28], "VHM": [0.4, 0.35, 0.25]},
                 {"pnl_threshold_tau": 0.45},
@@ -138,7 +138,7 @@ def test_daily_inference_rescue_loop_invoked(
     mock_a360_cls.return_value = _mock_alpha360()
 
     def predict_side_effect(df, horizon):
-        if horizon == 5:
+        if horizon == 20:  # PRIMARY dispatch horizon
             return (
                 {
                     "VCB": [0.1, 0.2, 0.70],

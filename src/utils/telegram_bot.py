@@ -119,8 +119,7 @@ EMPTY_PORTFOLIO_MESSAGE = (
 HELP_TEXT = (
     "🤖 <b>TRỢ LÝ ĐẦU TƯ — DANH SÁCH LỆNH</b>\n"
     "\n"
-    "<b>/suggest_buy5</b> — Khuyến nghị MUA T+5 (half-Kelly sizing).\n"
-    "<b>/suggest_buy20</b> — Khuyến nghị MUA T+20 (half-Kelly sizing).\n"
+    "<b>/suggest_buy20</b> — Khuyến nghị MUA T+20 (tranche sizing).\n"
     "🔴 <b>/suggest_sell</b> — Đánh giá NÊN BÁN hay GIỮ danh mục của bạn.\n"
     "⚖️ <b>/rebalance</b> — Tư vấn cơ cấu lại danh mục hiện tại.\n"
     "🔍 <b>/verify</b> <i>[Mã]</i> — Soi nhanh 1 cổ phiếu "
@@ -425,7 +424,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _suggest_buy_dispatch(update: Update, horizon: int) -> None:
-    """Shared backend for /suggest_buy5 + /suggest_buy20.
+    """Backend for /suggest_buy20 (T+5/T+3 short horizon is /verify-only now).
 
     Posts ONE minimal loading message (so the bot doesn't look dead during the
     1–2 min inference), then replaces/deletes it with the final cards.  NO
@@ -512,13 +511,8 @@ async def _suggest_buy_dispatch(update: Update, horizon: int) -> None:
     await _send_or_reply_chunks(update, wait_msg, _split_html_report(report_html))
 
 
-async def suggest_buy5_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
-    """T+5 BUY recommendations with half-Kelly sizing."""
-    await _suggest_buy_dispatch(update, horizon=5)
-
-
 async def suggest_buy20_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
-    """T+20 BUY recommendations with half-Kelly sizing."""
+    """T+20 BUY recommendations with tranche cohort sizing."""
     await _suggest_buy_dispatch(update, horizon=20)
 
 
@@ -1230,8 +1224,7 @@ async def msg_id2_command(
 # The canonical command list pushed to Telegram via set_my_commands on startup.
 # This populates the "/" autocomplete menu in every chat.
 _BOT_COMMANDS: list[BotCommand] = [
-    BotCommand("suggest_buy5", "Khuyến nghị MUA T+5 — Kelly sizing"),
-    BotCommand("suggest_buy20", "Khuyến nghị MUA T+20 — Kelly sizing"),
+    BotCommand("suggest_buy20", "Khuyến nghị MUA T+20 — tranche sizing"),
     BotCommand("suggest_sell", "Lấy khuyến nghị BÁN/HOLD cho danh mục cá nhân"),
     BotCommand("rebalance", "AI tư vấn cơ cấu danh mục hiện tại"),
     BotCommand("verify", "Kiểm định nhanh 1 cổ phiếu (VD: /verify HPG)"),
@@ -1326,20 +1319,14 @@ def build_application() -> Application:
     # Hyphens are NOT valid in slash commands. Canonical commands use the
     # underscore form; the hyphen MessageHandler regexes are fallbacks for
     # users typing the hyphenated forms manually.
-    app.add_handler(CommandHandler("suggest_buy5",  suggest_buy5_command))
     app.add_handler(CommandHandler("suggest_buy20", suggest_buy20_command))
-    app.add_handler(
-        MessageHandler(
-            filters.Regex(r"^/suggest-buy5(@\w+)?(\s|$)"),
-            suggest_buy5_command,
-        )
-    )
     app.add_handler(
         MessageHandler(
             filters.Regex(r"^/suggest-buy20(@\w+)?(\s|$)"),
             suggest_buy20_command,
         )
     )
+    # /suggest_buy5 retired — the short horizon (T+3) is /verify-only now.
 
     # --- Phase 3 ---
     app.add_handler(CommandHandler("add", add_portfolio_command))

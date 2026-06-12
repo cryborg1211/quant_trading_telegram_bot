@@ -41,10 +41,15 @@ except ImportError:  # pragma: no cover
     genai_types = None  # type: ignore[assignment]
 
 
+# Probed live 12-06-2026. cafef.vn/*.rss returns 502 (edge-blocked) and
+# vietstock.vn/rss/chung-khoan.rss returns 200 with 0 items — both dropped.
 RSS_FEEDS = {
-    "cafef": "https://cafef.vn/tin-moi.rss",
-    "vietstock": "https://vietstock.vn/rss/chung-khoan.rss",
+    "vietstock_stocks": "https://vietstock.vn/830/chung-khoan/co-phieu.rss",
+    "vietstock_corporate": "https://vietstock.vn/737/doanh-nghiep/hoat-dong-kinh-doanh.rss",
+    "vietstock_macro": "https://vietstock.vn/761/kinh-te/vi-mo.rss",
+    "vneconomy_stocks": "https://vneconomy.vn/chung-khoan.rss",
     "tinnhanhchungkhoan": "https://www.tinnhanhchungkhoan.vn/rss/chung-khoan-7.rss",
+    "tnck_corporate": "https://www.tinnhanhchungkhoan.vn/rss/doanh-nghiep-37.rss",
 }
 
 DEFAULT_PROMPT = """

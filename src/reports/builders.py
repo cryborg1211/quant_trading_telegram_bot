@@ -123,6 +123,11 @@ _MR_SELL_VETO = (
     "này!]</b>"
 )
 
+# SHORT horizon rendered in report copy ("Đánh giá xu hướng (N ngày tới)").
+# The `_5d`-named vars/labels below mean "short horizon" — the artifact behind
+# them is T+3 since the 12-06-26 retire of the T+5 model (verify-only role).
+SHORT_HORIZON_DAYS: int = 3
+
 # Class-label -> display text mappings for the verify report.
 _VERIFY_5D_PRED_LABELS: dict[int, str] = {
     0: "🔴 Giảm (DOWN)",
@@ -404,7 +409,7 @@ def _build_sell_hold_report(
             f"\U0001f4cc <b>{html.escape(ticker)}</b> — giá hiện tại {html.escape(price_str)}\n"
             f"{veto_line}"
             f"• <b>Khuyến nghị:</b> {verdict}\n"
-            f"• <b>Đánh giá xu hướng (5 ngày tới):</b> Cửa Tăng "
+            f"• <b>Đánh giá xu hướng ({SHORT_HORIZON_DAYS} ngày tới):</b> Cửa Tăng "
             f"<b>{confidence_5d}%</b>\n"
             f"• \U0001f3af <b>Mục tiêu chốt lời:</b> {target_str}\n"
             f"• \U0001f6e1️ <b>Ngưỡng cắt lỗ:</b> {stop_str}\n"
@@ -500,10 +505,10 @@ def _build_verify_report(
         f"\U0001f4c5 <b>Ngày:</b> {datetime.now().strftime('%d/%m/%Y')}\n"
         f"══════════════════════════════\n\n"
         f"\U0001f4b5 <b>Giá hiện tại:</b> {html.escape(price_str)}\n\n"
-        f"\U0001f4ca <b>Đánh giá Xu hướng (5 ngày tới)</b>\n"
+        f"\U0001f4ca <b>Đánh giá Xu hướng ({SHORT_HORIZON_DAYS} ngày tới)</b>\n"
         f"• Cửa Tăng: <b>{p_up * 100:.1f}%</b> | Đi Ngang: {p_side * 100:.1f}% "
         f"| Cửa Giảm: {p_down * 100:.1f}%\n"
-        f"• Nhận định 5 ngày: {pred_5d_label}\n"
+        f"• Nhận định {SHORT_HORIZON_DAYS} ngày: {pred_5d_label}\n"
         f"• Nhận định 20 ngày: {pred_20d_label} ({confidence_20d}%)\n\n"
         f"{_mr_state_line(mr_state)}\n\n"
         f"\U0001f4f0 <b>Tin tức &amp; Tâm lý</b>\n"

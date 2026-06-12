@@ -40,9 +40,11 @@ from src.models.quant_agent_arbitrator import (
     scrape_centralized_news,
 )
 from src.trading.portfolio_manager import PortfolioManager
+from src.trading import signal_ledger
 from src.utils.telegram_alerter import TelegramBot, format_source_links
 from src.reports.builders import (
     FEATURE_HUMAN_NAMES,
+    SHORT_HORIZON_DAYS,
     _MACRO_INNER_NAMES,
     _NUMERIC_SUFFIX_RE,
     _MACRO_PREFIX_RE,
@@ -285,9 +287,13 @@ def mr_score_tickers(tickers: list[str]) -> dict[str, dict[str, Any]]:
 # (the artifact filename embeds the horizon to prevent cross-horizon overwrite).
 # Loader is cached per horizon so the bot keeps a hot in-memory copy of each.
 _V3_BUNDLE_PATHS: dict[int, Path] = {
-    5:  Path("models/saved/v3_ensemble_5d.joblib"),
+    3:  Path("models/saved/v3_ensemble_3d.joblib"),
+    5:  Path("models/saved/v3_ensemble_5d.joblib"),   # retired short horizon (kept loadable)
     20: Path("models/saved/v3_ensemble_20d.joblib"),
 }
+# Short horizon = /verify-only cross-check model (T+3). The daily broadcast
+# dispatches the T+20 tranche book; the short model never drives sizing.
+SHORT_HORIZON: int = SHORT_HORIZON_DAYS
 # Legacy fallback for the un-suffixed bundle from V3.0 runs.
 _V3_BUNDLE_LEGACY_FALLBACK = Path("models/saved/v3_ensemble.joblib")
 _V3_BOT_CACHE: dict[int, V3BotInference] = {}
@@ -518,7 +524,7 @@ def predict_v3_horizon(latest_df: pd.DataFrame, horizon: int = 5) -> tuple[
 # 5-day window elapses.
 
 _RL_UP_CONFIDENCE_THRESHOLD: float = 0.6  # only log strong UP predictions
-_RL_HORIZON_DAYS: int = 5                 # match the model's 5d horizon
+_RL_HORIZON_DAYS: int = 20                # match the PRIMARY dispatch model (T+20)
 
 
 def _log_rl_predictions(
@@ -544,7 +550,7 @@ def _log_rl_predictions(
             continue
         features_json = json.dumps(
             {
-                "model": "stacking_gbdt_5d",
+                "model": f"stacking_gbdt_{_RL_HORIZON_DAYS}d",
                 "p_up": round(float(probs[2]), 4),
                 "top_drivers": top_pos_features_text,
             },
@@ -759,7 +765,7 @@ def daily_inference(
     window_rows: int = 120,
     max_candidates: int = 6,
     broadcast: bool = True,
-    horizon: int = 5,
+    horizon: int = 20,
 ) -> str:
     """Daily trading path. No crawling. No full Alpha360 parquet load.
 
@@ -803,9 +809,9 @@ def daily_inference(
     # SECONDARY horizon = arbitrator cross-check ONLY; it must NEVER abort the
     # PRIMARY command.  If the OTHER brain's artifact is missing or version-
     # mismatched, degrade to an empty dict (evaluate_trades_batch falls back to
-    # the primary probs per-ticker).  This is the fix for /suggest_buy5 dying
-    # with "horizon=20 not found" when only the T+5 model was trained.
-    _secondary_h = 20 if int(horizon) == 5 else 5
+    # the primary probs per-ticker).  Short horizon = T+3 (verify-only model);
+    # it serves here purely as the arbitrator's second opinion.
+    _secondary_h = 20 if int(horizon) == SHORT_HORIZON else SHORT_HORIZON
     try:
         stacking_predictions_20d, _, _, _, _ = predict_v3_horizon(latest_df, _secondary_h)
     except (FileNotFoundError, RuntimeError) as exc:
@@ -1120,7 +1126,7 @@ def run_trade_execution(
     latest_df: Any,
     xgb_model_5d: Any,
     selected_features_5d: list[str],
-    horizon: int = 5,
+    horizon: int = 20,
     broadcast: bool = True,
     event_overrides: dict | None = None,
 ) -> str:
@@ -1223,6 +1229,12 @@ def run_trade_execution(
         sent = len(dispatched_signals)
         LOGGER.info("Telegram alerts dispatched: %s (broadcast=%s)", sent, broadcast)
 
+        # Tranche exit ledger: book the dispatched cohort so full_pipeline can
+        # alert when its hold horizon elapses.  Broadcast-only — interactive
+        # /suggest_buy previews are not committed positions.
+        if broadcast and dispatched_signals:
+            signal_ledger.record_dispatch(dispatched_signals, _strategy, int(horizon))
+
     except Exception:
         LOGGER.exception("Error during trade execution")
         return _build_combined_report(dispatched_signals)
@@ -1291,12 +1303,12 @@ def inference_for_holdings(
     # held set first, or the `_xsz` ranks degenerate); the predictions dict is
     # keyed by ticker, so the arbitrator / exec-price / MR steps below read off
     # `present`.  SECONDARY horizon (20d) is arbitrator cross-check only → non-fatal.
-    stacking_predictions_5d, _, _, _, _ = predict_v3_horizon(latest_df, 5)
+    stacking_predictions_5d, _, _, _, _ = predict_v3_horizon(latest_df, SHORT_HORIZON)
     try:
         stacking_predictions_20d, _, _, _, _ = predict_v3_horizon(latest_df, 20)
     except (FileNotFoundError, RuntimeError) as exc:
-        LOGGER.warning("[/suggest_sell] T+20 cross-check unavailable (%s) — using 5d only.",
-                       exc.__class__.__name__)
+        LOGGER.warning("[/suggest_sell] T+20 cross-check unavailable (%s) — using T+%d only.",
+                       exc.__class__.__name__, SHORT_HORIZON)
         stacking_predictions_20d = {}
     horizon_predictions = {"5d": stacking_predictions_5d, "20d": stacking_predictions_20d}
 
@@ -1385,11 +1397,11 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
     # universe so the cross-sectional `_xsz` ranks are non-degenerate.  The
     # predictions dict below is keyed by ticker, so we slice the RESULT instead.
 
-    # --- Step 2: Stacking GBDT inference (5d primary + 20d optional cross-check) ---
+    # --- Step 2: Stacking GBDT inference (T+3 short primary + 20d cross-check) ---
     try:
-        stacking_5d, _, _, _, _ = predict_v3_horizon(latest_df, 5)
+        stacking_5d, _, _, _, _ = predict_v3_horizon(latest_df, SHORT_HORIZON)
     except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("[/verify] 5d inference failed for %s.", ticker)
+        LOGGER.exception("[/verify] T+%d inference failed for %s.", SHORT_HORIZON, ticker)
         return (
             f"⚠️ Lỗi mô hình Stacking GBDT cho <b>{html.escape(ticker)}</b>: "
             f"<code>{html.escape(str(exc))}</code>"
@@ -1399,8 +1411,8 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
     try:
         stacking_20d, _, _, _, _ = predict_v3_horizon(latest_df, 20)
     except (FileNotFoundError, RuntimeError) as exc:
-        LOGGER.warning("[/verify] T+20 cross-check unavailable for %s (%s) — 5d only.",
-                       ticker, exc.__class__.__name__)
+        LOGGER.warning("[/verify] T+20 cross-check unavailable for %s (%s) — T+%d only.",
+                       ticker, exc.__class__.__name__, SHORT_HORIZON)
         stacking_20d = {}
 
     if ticker not in stacking_5d:
@@ -1497,7 +1509,7 @@ def rebalance_portfolio(user_id: str, window_rows: int = 120) -> str:
 
     # Predict over the FULL universe (correct cross-section), then read off the
     # held names — do NOT filter latest_df to `present` before inference.
-    stacking_predictions_5d, _, _, _, _ = predict_v3_horizon(latest_df, 5)
+    stacking_predictions_5d, _, _, _, _ = predict_v3_horizon(latest_df, SHORT_HORIZON)
     live_prices = _get_live_exec_prices(latest_df, present)
 
     holdings_context: list[dict] = []
@@ -1522,14 +1534,15 @@ def rebalance_portfolio(user_id: str, window_rows: int = 120) -> str:
 
 
 def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> None:
-    """End-of-day pipeline: OHLCV crawl → LLM sentiment → inference.
+    """End-of-day pipeline: OHLCV crawl → LLM sentiment → inference → exit alerts.
 
     A single `--task full_pipeline` runs the full EOD sequence so the bot is
     primed for tomorrow's session:
       1. ingest the day's HOSE OHLCV (market-hour guarded; `force_crawl` bypasses;
          `days_back` limits to the last N days — e.g. 1 for previous-day-only);
       2. refresh daily LLM news sentiment;
-      3. run the daily inference (T+5 Top-3 broadcast).
+      3. run the daily inference (T+20 tranche Top-3 broadcast);
+      4. alert tranche cohorts whose hold horizon has elapsed (signal ledger).
 
     Step 1 is the ONLY OHLCV ingestion entrypoint in the bot/CLI; the V4 backtest
     engine (train_models.py / run_backtest.py) reads the populated store and never
@@ -1548,10 +1561,50 @@ def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> No
         sentiment_df = update_daily_sentiment(db_path="data/quant_v6_core.duckdb")
         LOGGER.info("Fetched %s sentiment records.", len(sentiment_df))
 
-    # 3. Run the daily inference (T+5 Top-3 broadcast). The V4 serve path
-    #    recomputes features from raw OHLCV via load_live_ohlcv_window; there is
-    #    no Alpha360 feature-matrix build (that path was retired entirely).
+    # 3. Run the daily inference (T+20 tranche Top-3 broadcast). The V4 serve
+    #    path recomputes features from raw OHLCV via load_live_ohlcv_window;
+    #    there is no Alpha360 feature-matrix build (that path was retired).
     daily_inference()
+
+    # 4. Tranche exit alerts — cohorts dispatched hold_days trading sessions
+    #    ago are due for ATC liquidation per the strategy contract.
+    with timed_step("Tranche exit-due check (signal ledger)"):
+        notify_tranche_exits()
+
+
+def notify_tranche_exits() -> int:
+    """Alert (then close) every ledgered signal whose hold horizon elapsed.
+
+    Mirrors the backtest exit rule: a cohort dispatched on day D with
+    hold_days=H liquidates at the close of trading session D+H. Returns the
+    number of signals alerted. Never raises — the EOD pipeline must not die
+    on an alerting hiccup.
+    """
+    try:
+        due = signal_ledger.check_exits_due()
+        if not due:
+            LOGGER.info("[SignalLedger] No tranche exits due today.")
+            return 0
+
+        lines = [
+            f"⏰ <b>ĐẾN HẠN THOÁT VỊ THẾ (tranche)</b>\n"
+            f"{datetime.now().strftime('%d/%m/%Y')} — các mã dưới đây đã đủ số phiên nắm giữ.\n"
+            f"Quy tắc chiến lược: <b>thoát ATC phiên hôm nay</b>.\n"
+        ]
+        for d in due:
+            disp = d["dispatch_date"]
+            disp_str = disp.strftime("%d/%m/%Y") if hasattr(disp, "strftime") else str(disp)
+            lines.append(
+                f"• <b>{html.escape(str(d['ticker']))}</b> — vào {disp_str}, "
+                f"đủ {int(d['hold_days'])} phiên (đã qua {int(d['sessions_elapsed'])})"
+            )
+        TelegramBot().send_text_alert("\n".join(lines), label="tranche_exit")
+        signal_ledger.mark_closed(due)
+        LOGGER.info("[SignalLedger] Exit alerts sent + closed: %s", len(due))
+        return len(due)
+    except Exception:  # noqa: BLE001
+        LOGGER.exception("[SignalLedger] notify_tranche_exits failed.")
+        return 0
 
 
 def parse_args() -> argparse.Namespace:

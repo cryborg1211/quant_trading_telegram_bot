@@ -133,6 +133,24 @@ def latest_close(ticker: str, conn: Any | None = None) -> float | None:
         return None
 
 
+def trading_dates_after(ref_date: Any, conn: Any | None = None) -> list[Any]:
+    """DISTINCT trading dates STRICTLY AFTER ``ref_date``, sorted ASC.
+
+    Cross-ticker → globs all shards. Used by the dispatched-signal ledger to
+    count elapsed trading sessions (NOT calendar days) since a dispatch."""
+    try:
+        with _conn_ctx(conn) as c:
+            rows = c.execute(
+                f"SELECT DISTINCT CAST(date AS DATE) AS d FROM {_glob_source()} "
+                "WHERE date > CAST(? AS DATE) ORDER BY d",
+                [ref_date],
+            ).fetchall()
+        return [r[0] for r in rows if r and r[0] is not None]
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("price_lookup.trading_dates_after(%s) failed: %s", ref_date, exc)
+        return []
+
+
 def top_tickers_by_volume(limit: int, lookback_days: int = 10, conn: Any | None = None) -> list[str]:
     """Top-``limit`` tickers by summed volume over the last ``lookback_days``
     days of available data — most-liquid names first. Cross-ticker → globs all
