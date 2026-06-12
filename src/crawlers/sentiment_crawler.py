@@ -96,6 +96,10 @@ class NewsItem:
 class SentimentCrawler:
     """Daily Vietnamese market/news sentiment crawler -> hist_sentiment_llm_labeled."""
 
+    # Hard budget guard: Gemini scoring is paid per article — the crawler must
+    # NEVER backfill deep history regardless of config/DB state. 3 days max.
+    MAX_LOOKBACK_DAYS = 3
+
     def __init__(
         self,
         db_path: str | None = None,
@@ -125,7 +129,12 @@ class SentimentCrawler:
 
         deduped = self._dedupe(items)
         existing_urls = self._existing_urls()
-        new_items = [item for item in deduped if item.url and item.url not in existing_urls]
+        new_items = [
+            item for item in deduped
+            if item.url and item.url not in existing_urls
+            and not self._is_covered_warrant(item.ticker)
+            and start_date <= item.date <= end_date
+        ]
 
         if not new_items:
             LOGGER.info("[SentimentCrawler] No new sentiment articles found.")
@@ -146,24 +155,32 @@ class SentimentCrawler:
                 else CONFIG.sentiment.rss_lookback_weekday_days
             )
 
-        fallback = today - timedelta(days=lookback_days)
-        try:
-            # No `read_only=True` — DuckDB rejects mixed-config connections to
-            # the same file in one process (see db_engine.py docstring).
-            with duckdb.connect(self.db_path) as conn:
-                row = conn.execute("SELECT MAX(CAST(date AS DATE)) FROM hist_sentiment_llm_labeled").fetchone()
-                max_dt = row[0] if row else None
-            if max_dt:
-                return min(max_dt, fallback)
-        except Exception:
-            pass
-        return fallback
+        # Hard safeguard: clamp to [1, MAX_LOOKBACK_DAYS]. The old path took
+        # min(MAX(date) in DB, fallback) which triggered deep historical
+        # backfills (and Gemini bills) whenever the table had a stale gap.
+        lookback_days = max(1, min(int(lookback_days), self.MAX_LOOKBACK_DAYS))
+        return today - timedelta(days=lookback_days)
+
+    @staticmethod
+    def _is_covered_warrant(ticker: str | None) -> bool:
+        # Standard HOSE covered-warrant format: 'C' + underlying + maturity code,
+        # exactly 8 chars (e.g. CHPG2613, CVPB2210). No news value, never traded
+        # by this system — scoring them burns Gemini budget for nothing.
+        if not ticker:
+            return False
+        t = str(ticker).strip().upper()
+        return len(t) == 8 and t.startswith("C")
 
     def _active_tickers(self, limit: int) -> list[str]:
         # Most-liquid names by recent volume, read from the FRESH parquet vintage
         # (stock_ohlcv was retired). price_lookup opens its own in-memory
         # connection, so no DuckDB *file* handle is taken here.
-        return price_lookup.top_tickers_by_volume(limit=limit, lookback_days=10)
+        raw = price_lookup.top_tickers_by_volume(limit=limit, lookback_days=10)
+        tickers = [t for t in raw if not self._is_covered_warrant(t)]
+        dropped = len(raw) - len(tickers)
+        if dropped:
+            LOGGER.info("[SentimentCrawler] Filtered %s covered warrants from ticker list.", dropped)
+        return tickers
 
     def _fetch_rss_items(self, start_date: date, end_date: date) -> list[NewsItem]:
         if feedparser is None:
@@ -327,8 +344,13 @@ class SentimentCrawler:
 
         sentiment = max(-1.0, min(1.0, float(score["sentiment_score"])))
         magnitude = max(0.0, min(1.0, float(score["magnitude"])))
+        # Market-wide RSS items carry no ticker — use the MARKET_WIDE sentinel
+        # (same label the LLM prompt uses) so the NOT NULL filter in
+        # _append_rows keeps them instead of dropping every RSS row.
+        ticker = (item.ticker or "").strip().upper() or ("MARKET_WIDE" if item.is_market_wide else None)
         return {
             "date": pd.Timestamp(item.date),
+            "ticker": ticker,
             "title": item.title[:1000],
             "sentiment_score": sentiment,
             "magnitude": magnitude,
@@ -343,11 +365,30 @@ class SentimentCrawler:
         if df.empty:
             return
         df = df.replace({"NaN": None, "nan": None})
+
+        # Constraint guard: drop rows with NULL / NaN / empty ticker BEFORE the
+        # insert — they violate the table constraint and crash the pipeline.
+        before = len(df)
+        ticker_str = df["ticker"].astype(str).str.strip()
+        df = df[
+            df["ticker"].notna()
+            & (ticker_str != "")
+            & (~ticker_str.str.lower().isin({"nan", "none", "null"}))
+        ]
+        if len(df) < before:
+            LOGGER.warning(
+                "[SentimentCrawler] Dropped %s rows with NULL/empty ticker before insert.",
+                before - len(df),
+            )
+        if df.empty:
+            return
+
         with duckdb.connect(self.db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS hist_sentiment_llm_labeled (
                     date TIMESTAMP,
+                    ticker VARCHAR,
                     title VARCHAR,
                     sentiment_score DOUBLE,
                     magnitude DOUBLE,
@@ -359,6 +400,8 @@ class SentimentCrawler:
                 )
                 """
             )
+            # Legacy tables predate the ticker column — BY NAME insert needs it.
+            conn.execute("ALTER TABLE hist_sentiment_llm_labeled ADD COLUMN IF NOT EXISTS ticker VARCHAR")
             conn.execute("INSERT INTO hist_sentiment_llm_labeled BY NAME SELECT * FROM df")
 
 
