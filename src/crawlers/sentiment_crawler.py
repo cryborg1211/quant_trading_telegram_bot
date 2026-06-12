@@ -41,9 +41,18 @@ except ImportError:  # pragma: no cover
     genai_types = None  # type: ignore[assignment]
 
 
-# Probed live 12-06-2026. cafef.vn/*.rss returns 502 (edge-blocked) and
-# vietstock.vn/rss/chung-khoan.rss returns 200 with 0 items — both dropped.
+# Probed live 12-06-2026. cafef.vn native *.rss returns 502 for every path
+# (origin broken behind their CDN) and vietstock.vn/rss/chung-khoan.rss is an
+# empty 200 — both sources are restored through Google News RSS site-scoped
+# proxies (when:2d keeps them inside the crawl window; links are
+# news.google.com redirects, which still resolve to the article).
 RSS_FEEDS = {
+    "cafef_gnews": ("https://news.google.com/rss/search?"
+                    "q=site%3Acafef.vn%20ch%E1%BB%A9ng%20kho%C3%A1n%20when%3A2d"
+                    "&hl=vi&gl=VN&ceid=VN:vi"),
+    "vietstock_gnews": ("https://news.google.com/rss/search?"
+                        "q=site%3Avietstock.vn%20ch%E1%BB%A9ng%20kho%C3%A1n%20when%3A2d"
+                        "&hl=vi&gl=VN&ceid=VN:vi"),
     "vietstock_stocks": "https://vietstock.vn/830/chung-khoan/co-phieu.rss",
     "vietstock_corporate": "https://vietstock.vn/737/doanh-nghiep/hoat-dong-kinh-doanh.rss",
     "vietstock_macro": "https://vietstock.vn/761/kinh-te/vi-mo.rss",
@@ -104,6 +113,10 @@ class SentimentCrawler:
     # Hard budget guard: Gemini scoring is paid per article — the crawler must
     # NEVER backfill deep history regardless of config/DB state. 3 days max.
     MAX_LOOKBACK_DAYS = 3
+    # Per-feed cap: the Google News proxies return up to 100 items/feed; every
+    # NEW item is one Gemini call. Feeds are newest-first, so the cap keeps the
+    # freshest slice.
+    RSS_MAX_ITEMS_PER_FEED = 30
 
     def __init__(
         self,
@@ -201,7 +214,10 @@ class SentimentCrawler:
         for source, feed_url in RSS_FEEDS.items():
             try:
                 parsed = feedparser.parse(feed_url)
+                kept = 0
                 for entry in parsed.entries:
+                    if kept >= self.RSS_MAX_ITEMS_PER_FEED:
+                        break
                     published = self._parse_entry_date(entry)
                     if published and not (start_date <= published <= end_date):
                         continue
@@ -218,8 +234,10 @@ class SentimentCrawler:
                                 is_market_wide=True,
                             )
                         )
+                        kept += 1
                 if parsed.entries:
-                    LOGGER.info("[SentimentCrawler] RSS %s: %s entries scanned.", source, len(parsed.entries))
+                    LOGGER.info("[SentimentCrawler] RSS %s: kept %s/%s entries.",
+                                source, kept, len(parsed.entries))
                 else:
                     LOGGER.warning("[SentimentCrawler] RSS %s returned 0 entries — feed may be dead/blocked: %s", source, feed_url)
             except Exception as exc:
@@ -333,13 +351,25 @@ class SentimentCrawler:
 
     @staticmethod
     def _dedupe(items: list[NewsItem]) -> list[NewsItem]:
-        seen = set()
+        # URL dedupe first, then normalized-title dedupe: the Google News
+        # proxy feeds and the native feeds carry the SAME article under
+        # different URLs (news.google.com redirect vs real link) — without the
+        # title pass each duplicate costs one extra Gemini call.  Google News
+        # appends " - <Source>" to titles; strip it before normalizing.
+        seen_urls: set[str] = set()
+        seen_titles: set[str] = set()
         out = []
         for item in items:
             key = item.url.strip().lower()
-            if not key or key in seen:
+            if not key or key in seen_urls:
                 continue
-            seen.add(key)
+            title_norm = re.sub(r"\s+-\s+[^-]{2,40}$", "", item.title).strip().lower()
+            title_norm = re.sub(r"\s+", " ", title_norm)
+            if title_norm and title_norm in seen_titles:
+                continue
+            seen_urls.add(key)
+            if title_norm:
+                seen_titles.add(title_norm)
             out.append(item)
         return out
 

@@ -101,3 +101,48 @@ class TestExitsDue:
     def test_empty_ledger(self, db_path) -> None:
         assert signal_ledger.check_exits_due(db_path) == []
         assert signal_ledger.mark_closed([], db_path) == 0
+
+
+class TestListOpen:
+    def test_remaining_sessions(self, db_path, monkeypatch) -> None:
+        d0 = date(2026, 6, 1)
+        signal_ledger.record_dispatch(_SIGNALS, _STRATEGY, 20, db_path, today=d0)
+        sessions = _calendar(d0, 5)
+        monkeypatch.setattr(
+            signal_ledger.price_lookup, "trading_dates_after", lambda ref, conn=None: sessions)
+        rows = signal_ledger.list_open(db_path, today=sessions[0])
+        assert len(rows) == 2
+        assert all(r["sessions_elapsed"] == 1 and r["sessions_remaining"] == 2 for r in rows)
+
+    def test_exits_report_formatting(self, db_path, monkeypatch) -> None:
+        from src.utils.telegram_bot import _build_exits_report
+        d0 = date(2026, 6, 1)
+        signal_ledger.record_dispatch(_SIGNALS, _STRATEGY, 20, db_path, today=d0)
+        sessions = _calendar(d0, 5)
+        monkeypatch.setattr(
+            signal_ledger.price_lookup, "trading_dates_after", lambda ref, conn=None: sessions)
+
+        msg = _build_exits_report(signal_ledger.list_open(db_path, today=sessions[0]))
+        assert "HPG" in msg and "FPT" in msg
+        assert "1/3 phiên" in msg and "còn <b>2</b> phiên" in msg
+
+        due_msg = _build_exits_report(signal_ledger.list_open(db_path, today=sessions[4]))
+        assert "ĐẾN HẠN" in due_msg
+
+        assert "Không có vị thế" in _build_exits_report([])
+
+
+class TestRssDedupe:
+    def test_title_dedupe_across_sources(self) -> None:
+        from src.crawlers.sentiment_crawler import NewsItem, SentimentCrawler
+        items = [
+            NewsItem(date=date(2026, 6, 1), title="HPG tăng trần phiên sáng",
+                     url="https://vietstock.vn/abc", text="t"),
+            NewsItem(date=date(2026, 6, 1), title="HPG tăng trần phiên sáng - Vietstock",
+                     url="https://news.google.com/xyz", text="t"),
+            NewsItem(date=date(2026, 6, 1), title="Tin khác hoàn toàn",
+                     url="https://cafef.vn/def", text="t"),
+        ]
+        out = SentimentCrawler._dedupe(items)
+        assert len(out) == 2
+        assert {i.url for i in out} == {"https://vietstock.vn/abc", "https://cafef.vn/def"}

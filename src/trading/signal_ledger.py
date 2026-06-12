@@ -110,22 +110,21 @@ def record_dispatch(
     return len(rows)
 
 
-def check_exits_due(db_path: str | None = None, today: date | None = None) -> list[dict]:
-    """OPEN signals whose hold horizon has elapsed in TRADING sessions.
+def list_open(db_path: str | None = None, today: date | None = None) -> list[dict]:
+    """Every OPEN signal with its elapsed trading-session count.
 
-    A signal dispatched on D with hold_days=H is due once the fresh parquet
-    calendar contains >= H trading dates strictly after D (mirrors the
-    backtest engine, which exits the cohort at the close of session D+H).
+    Sessions are counted on the fresh parquet calendar (NOT calendar days),
+    mirroring the backtest engine's day indexing. Sorted oldest-first.
     """
     try:
         with _connect(db_path) as conn:
             ensure_table(conn)
             open_rows = conn.execute(
                 f"SELECT ticker, dispatch_date, horizon, hold_days, weight "
-                f"FROM {TABLE} WHERE status = 'OPEN'"
+                f"FROM {TABLE} WHERE status = 'OPEN' ORDER BY dispatch_date, ticker"
             ).fetchall()
     except Exception:  # noqa: BLE001
-        LOGGER.exception("[SignalLedger] check_exits_due read failed.")
+        LOGGER.exception("[SignalLedger] list_open read failed.")
         return []
 
     if not open_rows:
@@ -133,23 +132,31 @@ def check_exits_due(db_path: str | None = None, today: date | None = None) -> li
 
     min_dispatch = min(r[1] for r in open_rows)
     sessions = price_lookup.trading_dates_after(min_dispatch)
-    if not sessions:
-        return []
-
     today = today or datetime.now().date()
-    due: list[dict] = []
+
+    out: list[dict] = []
     for ticker, d0, horizon, hold_days, weight in open_rows:
         elapsed = sum(1 for s in sessions if d0 < s <= today)
-        if elapsed >= int(hold_days):
-            due.append({
-                "ticker": str(ticker),
-                "dispatch_date": d0,
-                "horizon": int(horizon) if horizon is not None else None,
-                "hold_days": int(hold_days),
-                "weight": float(weight or 0.0),
-                "sessions_elapsed": elapsed,
-            })
-    return due
+        out.append({
+            "ticker": str(ticker),
+            "dispatch_date": d0,
+            "horizon": int(horizon) if horizon is not None else None,
+            "hold_days": int(hold_days),
+            "weight": float(weight or 0.0),
+            "sessions_elapsed": elapsed,
+            "sessions_remaining": max(0, int(hold_days) - elapsed),
+        })
+    return out
+
+
+def check_exits_due(db_path: str | None = None, today: date | None = None) -> list[dict]:
+    """OPEN signals whose hold horizon has elapsed in TRADING sessions.
+
+    A signal dispatched on D with hold_days=H is due once the fresh parquet
+    calendar contains >= H trading dates strictly after D (mirrors the
+    backtest engine, which exits the cohort at the close of session D+H).
+    """
+    return [r for r in list_open(db_path, today) if r["sessions_elapsed"] >= r["hold_days"]]
 
 
 def mark_closed(

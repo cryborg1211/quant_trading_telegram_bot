@@ -119,10 +119,11 @@ EMPTY_PORTFOLIO_MESSAGE = (
 HELP_TEXT = (
     "🤖 <b>TRỢ LÝ ĐẦU TƯ — DANH SÁCH LỆNH</b>\n"
     "\n"
-    "<b>/suggest_buy20</b> — Khuyến nghị MUA T+20 (tranche sizing).\n"
+    "<b>/suggest_buy20</b> — Khuyến nghị MUA T+20 (tranche, nắm giữ ~30 phiên).\n"
+    "📒 <b>/exits</b> — Vị thế tranche đang mở + số phiên còn lại.\n"
     "🔴 <b>/suggest_sell</b> — Đánh giá NÊN BÁN hay GIỮ danh mục của bạn.\n"
     "⚖️ <b>/rebalance</b> — Tư vấn cơ cấu lại danh mục hiện tại.\n"
-    "🔍 <b>/verify</b> <i>[Mã]</i> — Soi nhanh 1 cổ phiếu "
+    "🔍 <b>/verify</b> <i>[Mã]</i> — Soi nhanh 1 cổ phiếu, mô hình T+3 &amp; T+20 "
     "(VD: <code>/verify HPG</code>).\n"
     "➕ <b>/add</b> <i>[Mã] [Số lượng] [Giá]</i> — Thêm cổ phiếu vào danh mục "
     "(VD: <code>/add VNE 1000 32.5</code>).\n"
@@ -774,8 +775,61 @@ async def suggest_sell_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_or_reply_chunks(update, wait_msg, _split_html_report(report_html))
 
 
+def _build_exits_report(rows: list[dict]) -> str:
+    """HTML report for /exits — open tranche cohorts + sessions remaining.
+
+    Pure formatter (unit-testable). `rows` is `signal_ledger.list_open()`
+    output: ticker, dispatch_date, hold_days, weight, sessions_elapsed,
+    sessions_remaining.
+    """
+    header = (
+        f"📒 <b>VỊ THẾ TRANCHE ĐANG MỞ</b>\n"
+        f"📅 {datetime.now().strftime('%d/%m/%Y')}\n"
+        f"══════════════════════════════"
+    )
+    if not rows:
+        return (f"{header}\n\n<i>Không có vị thế tranche nào đang mở. "
+                f"Tín hiệu mới sẽ được ghi sổ khi mô hình T+20 phát lệnh.</i>")
+
+    lines = []
+    for r in rows:
+        disp = r.get("dispatch_date")
+        disp_str = disp.strftime("%d/%m/%Y") if hasattr(disp, "strftime") else str(disp)
+        weight_pct = float(r.get("weight") or 0.0) * 100
+        remaining = int(r.get("sessions_remaining", 0))
+        status = ("⏰ <b>ĐẾN HẠN — thoát ATC hôm nay</b>" if remaining <= 0
+                  else f"còn <b>{remaining}</b> phiên")
+        lines.append(
+            f"• <b>{html.escape(str(r['ticker']))}</b> — vào {disp_str} "
+            f"({weight_pct:.1f}% NAV), đã {int(r['sessions_elapsed'])}/{int(r['hold_days'])} phiên, "
+            f"{status}"
+        )
+    return f"{header}\n\n" + "\n".join(lines)
+
+
+async def exits_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
+    """List open tranche cohorts from the dispatched-signal ledger."""
+    if update.message is None:
+        return
+    _log_request("/exits", update)
+    await _audit_log_async(user_id=_extract_user_id(update), command="exits")
+
+    try:
+        from src.trading import signal_ledger  # noqa: PLC0415
+        rows = await asyncio.to_thread(signal_ledger.list_open)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("/exits: ledger read failed")
+        await update.message.reply_text(
+            f"❌ <b>Lỗi đọc sổ lệnh:</b> <code>{html.escape(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await update.message.reply_text(_build_exits_report(rows), parse_mode=ParseMode.HTML)
+
+
 async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Run ad-hoc 5d quant + LLM-sentiment analysis on a single ticker.
+    """Run ad-hoc short-horizon (T+3) quant + LLM-sentiment analysis on a single ticker.
 
     Use case: a user hears a rumor / sees news and wants instant verification
     before manually trading. Output combines the 5d Stacking GBDT prediction
@@ -1224,10 +1278,11 @@ async def msg_id2_command(
 # The canonical command list pushed to Telegram via set_my_commands on startup.
 # This populates the "/" autocomplete menu in every chat.
 _BOT_COMMANDS: list[BotCommand] = [
-    BotCommand("suggest_buy20", "Khuyến nghị MUA T+20 — tranche sizing"),
+    BotCommand("suggest_buy20", "Khuyến nghị MUA T+20 — tranche ~30 phiên"),
+    BotCommand("exits", "Vị thế tranche đang mở + số phiên còn lại"),
     BotCommand("suggest_sell", "Lấy khuyến nghị BÁN/HOLD cho danh mục cá nhân"),
     BotCommand("rebalance", "AI tư vấn cơ cấu danh mục hiện tại"),
-    BotCommand("verify", "Kiểm định nhanh 1 cổ phiếu (VD: /verify HPG)"),
+    BotCommand("verify", "Kiểm định nhanh 1 cổ phiếu — T+3 & T+20 (VD: /verify HPG)"),
     BotCommand("add", "Thêm cổ phiếu vào danh mục (VD: /add VNE 1000 32.5)"),
     BotCommand("remove", "Xóa cổ phiếu khỏi danh mục (VD: /remove VNE)"),
     BotCommand("audit_weekly", "Hậu kiểm /verify & /add trong 7 ngày qua"),
@@ -1339,6 +1394,7 @@ def build_application() -> Application:
         )
     )
     app.add_handler(CommandHandler("news", news_command))
+    app.add_handler(CommandHandler("exits", exits_command))
     app.add_handler(CommandHandler("verify", verify_command))
     app.add_handler(CommandHandler("feedback", feedback_command))
     # Admin-only announcement channel — intentionally NOT in _BOT_COMMANDS
