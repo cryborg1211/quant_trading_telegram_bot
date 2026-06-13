@@ -26,10 +26,16 @@ data/ohlcv_*.parquet
 data/macro_daily.parquet
 data/alpha360_features.parquet
 models/stacking/
+# Auto-saved timestamped model backups (churn — regenerated every retrain, "do not index")
+models/saved/backups/
 
 # --- Logs ---
 logs/
 *.log
+.claude/hooks/.logs/
+
+# --- Local scratch space (throwaway) ---
+scratch/
 
 # --- IDE ---
 .idea/
