@@ -230,8 +230,8 @@ stock_price_v3/
 
 **Active refactoring (V4.1 Structural Debt program):**
 - Phase 1 COMPLETE: `daily_inference` decomposed (271→169 lines) into `_select_candidates()`, `_rescue_loop()`, `_dispatch_signals()`. Report builders (10 functions + 11 constants) extracted to `src/reports/builders.py`. 21 new tests added.
-- Phase 2 NEXT: Automated feature-schema hashing to replace manual `FEATURE_RECIPE_VERSION`
-- Phase 3: Hub-node test coverage
+- Phase 2 COMPLETE (2026-06-13): Automated feature-schema hashing live (`src/utils/schema_hash.py`); `FEATURE_RECIPE_VERSION` computed via `compute_feature_schema_hash(...)` (recipe `v2-sha8:53b5bd85`), replacing the manual `"v1.1"` string.
+- Phase 3 NEXT: Hub-node test coverage (`run_backtest.main`, `triple_barrier_pipeline`, `TabularEnsemble.fit`, `VNCostModel.simulate`)
 
 **Deprecated:** `alpha360_generator.py` is gutted in V4.0 — system is purely tabular.
 
@@ -257,7 +257,7 @@ stock_price_v3/
 
 | Feature | Folder | Status |
 |---|---|---|
-| V4.1 Structural Debt | `process/features/v4-1-structural-debt/` | in-progress (Phase 1 done, Phase 2 next) |
+| V4.1 Structural Debt | `process/features/v4-1-structural-debt/` | in-progress (Phase 1+2 done, Phase 3 next) |
 
 ## Code-Review-Graph MCP
 

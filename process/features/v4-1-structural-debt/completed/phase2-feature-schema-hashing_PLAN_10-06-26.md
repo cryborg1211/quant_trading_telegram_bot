@@ -2,7 +2,7 @@
 **Plan type:** COMPLEX (multi-file, system-wide parity enforcement)
 **Feature:** v4-1-structural-debt
 **Created:** 2026-06-10
-**Status:** READY FOR EXECUTE
+**Status:** SHIPPED 2026-06-13 — `src/utils/schema_hash.py` live; `FEATURE_RECIPE_VERSION` now computed via `compute_feature_schema_hash(...)` (recipe `v2-sha8:53b5bd85`). The hash caught the drift that forced the 13-06 retrain.
 
 ---
 
