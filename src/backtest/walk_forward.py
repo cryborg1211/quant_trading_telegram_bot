@@ -74,6 +74,11 @@ from src.portfolio.construction import (
     kelly_optimize,
     mean_variance_optimize,
 )
+from src.trading.regime_policy import (
+    NO_TRADE_REGIMES,
+    PENALTY_REGIMES,
+    REGIME_PENALTY_FACTOR,
+)
 
 LOGGER = logging.getLogger("backtest.walk_forward")
 
@@ -154,6 +159,19 @@ class WalkForwardConfig:
     # trained to predict.  None ⇒ barrier disabled (pure fixed-hold cohorts).
     tranche_pt_sigma: float | None = None
     tranche_sl_sigma: float | None = None
+
+    # ── REGIME-CONDITIONAL SIZING ────────────────────────────────────────────
+    # When True, per-name allocations inside each tranche are modulated by the
+    # ticker's `market_regime` (0-7, from build_regime_features), mirroring the
+    # serve-path src/bot/sizing.py policy (single source: regime_policy.py):
+    #   NO_TRADE_REGIMES {0,7} → exclude the name from that day's cohort;
+    #   PENALTY_REGIMES  {1,6} → multiply its per-name notional by
+    #                            REGIME_PENALTY_FACTOR (0.5×); freed half stays cash.
+    # An absolute REGIME_PENALTY_CAP×NAV cap is inert at tranche scale
+    # (per_name ≈ nav/(H·picks) ≈ 0.7% NAV ≪ 10% NAV), so the engine mirrors the
+    # serve INTENT via the scale-invariant factor instead. Default False ⇒ no
+    # allocation change (existing behaviour byte-for-byte).
+    use_regime_sizing: bool = False
 
     # OOS gate: only place trades on/after this date.  Days before it are still
     # iterated (NAV marked, corporate actions applied, features/cov built from
@@ -387,13 +405,19 @@ class WalkForwardEngine:
         self._day_index: dict[date, dict[str, dict]] = {}
         for tk, g in self.ticker_frames.items():
             for row in g.itertuples(index=False):
-                self._day_index.setdefault(row.date, {})[tk] = {
+                row_dict = {
                     "open": row.open, "high": row.high, "low": row.low,
                     "close": row.close, "volume": row.volume,
                     "ref_price": row.ref_price, "vol": row.vol,
                     "adv20": row.adv20,
                     "exchange": row.exchange,
                 }
+                # Per-ticker regime label (only present when the panel was built
+                # with build_regime_features). Used by regime-conditional sizing;
+                # absent in minimal test panels → safe `.get(...)` fallback.
+                if hasattr(row, "market_regime"):
+                    row_dict["market_regime"] = int(row.market_regime)
+                self._day_index.setdefault(row.date, {})[tk] = row_dict
 
         # Sector map (optional column)
         if "sector" in pdf.columns:
@@ -778,6 +802,10 @@ class WalkForwardEngine:
         budget = min(budget, max(self.cash, 0.0) / (1.0 + cfg.fee_buffer))
         if budget <= 0:
             return n_orders, n_fills, n_rej
+        # per_name divides the budget across the FULL cohort slot count. Under
+        # regime sizing, a skipped/penalised name's share is NOT redistributed to
+        # survivors — it stays as cash (smaller tranche on bad days = the
+        # DD-reducing behaviour). So the denominator stays `len(picks)`.
         per_name = budget / len(picks)
 
         positions: dict[str, dict] = {}
@@ -785,7 +813,20 @@ class WalkForwardEngine:
             row = day.get(tk)
             if row is None or row["close"] <= 0:
                 continue
-            qty = round_down_to_lot(int(per_name / row["close"]), 100)
+            # Regime-conditional sizing (mirrors serve-path src/bot/sizing.py via
+            # the shared regime_policy constants):
+            #   NO_TRADE {0,7} → skip (its per_name share stays cash);
+            #   PENALTY  {1,6} → 0.5× notional (the freed half stays cash).
+            # market_regime is absent on minimal panels → `.get` returns None → no-op.
+            notional = per_name
+            if cfg.use_regime_sizing:
+                regime = row.get("market_regime")
+                if regime is not None:
+                    if regime in NO_TRADE_REGIMES:
+                        continue
+                    if regime in PENALTY_REGIMES:
+                        notional = per_name * REGIME_PENALTY_FACTOR
+            qty = round_down_to_lot(int(notional / row["close"]), 100)
             if qty < 100:
                 continue
             n_orders += 1

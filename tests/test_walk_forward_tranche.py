@@ -135,6 +135,35 @@ class TestTrancheMechanics:
         res = eng.run(_panel())
         assert len(res.equity_curve) == N_DAYS    # smoke: grid path still runs
 
+    def test_no_trade_regime_excludes_from_picks_on_that_day(self) -> None:
+        # AAA is in a NO_TRADE regime (0 = Freeze) on ONE day only; with regime
+        # sizing on it must be skipped that day but bought on its normal days.
+        days = pd.bdate_range("2024-01-02", periods=N_DAYS).date
+        block_day = days[8]
+        frames = []
+        for tk, score in SCORES.items():
+            regimes = ([0 if d == block_day else 2 for d in days]
+                       if tk == "AAA" else [2] * N_DAYS)
+            frames.append(pd.DataFrame({
+                "ticker": tk, "date": days,
+                "open": PRICE, "high": PRICE, "low": PRICE, "close": PRICE,
+                "volume": 10_000_000, "feat": score, "market_regime": regimes,
+            }))
+        panel = pd.concat(frames, ignore_index=True)
+        cfg = WalkForwardConfig(
+            seq_len=1, feature_cols=["feat"],
+            rebalance_mode="tranche", tranche_hold_days=HOLD,
+            max_positions=2, signal_threshold=0.40,
+            liquid_top_n=None, initial_capital=1_000_000_000.0,
+            use_regime_sizing=True,
+        )
+        res = WalkForwardEngine(cfg, _oracle).run(panel)
+        fills = pd.DataFrame(res.fills)
+        aaa_buy_days = set(fills[(fills["ticker"] == "AAA")
+                                 & (fills["side"] == "buy")]["date"])
+        assert block_day not in aaa_buy_days       # skipped on its Freeze day
+        assert len(aaa_buy_days) > 0               # bought on normal days
+
 
 class TestTrancheBarriers:
     """PT/SL barrier exits — triple-barrier replication inside the cohort book.

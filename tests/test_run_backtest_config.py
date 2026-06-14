@@ -58,6 +58,14 @@ class TestBuildWfConfig:
         assert wf.tranche_pt_sigma is None
         assert wf.tranche_sl_sigma is None
 
+    def test_regime_sizing_propagates(self) -> None:
+        wf = _build_wf_config(FEATURES, CUTOFF, _cfg(), use_regime_sizing=True)
+        assert wf.use_regime_sizing is True
+
+    def test_regime_sizing_default_off(self) -> None:
+        wf = _build_wf_config(FEATURES, CUTOFF, _cfg())
+        assert wf.use_regime_sizing is False
+
     def test_price_unit_default_untouched(self) -> None:
         # The thousand-VND scaling must stay active regardless of mode.
         for mode in ("tranche", "grid"):

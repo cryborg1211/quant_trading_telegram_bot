@@ -23,6 +23,19 @@ def test_config_locked():
     assert BUY_THRESHOLD == 0.50
 
 
+def test_regime_constants_from_shared_module():
+    # sizing.py re-exports the regime overrides from the single-source module;
+    # the backtest engine imports the SAME objects, so they cannot drift.
+    import src.bot.sizing as sz
+    from src.trading import regime_policy as rp
+    assert sz.NO_TRADE_REGIMES is rp.NO_TRADE_REGIMES
+    assert sz.PENALTY_REGIMES is rp.PENALTY_REGIMES
+    assert sz.REGIME_PENALTY_CAP == rp.REGIME_PENALTY_CAP
+    assert sz.STRONG_TREND_REGIME == rp.STRONG_TREND_REGIME
+    # The tranche penalty multiplier is exactly the serve-path cap shrink ratio.
+    assert rp.REGIME_PENALTY_FACTOR == rp.REGIME_PENALTY_CAP / DEFAULT_NAV_CAP == 0.5
+
+
 def test_weight_curve():
     # R=2.0, half-Kelly, 20% cap → w = min(max(0, 0.75p - 0.25), 0.20)
     assert suggested_weight(0.30) == 0.0                  # below break-even (p<1/3)

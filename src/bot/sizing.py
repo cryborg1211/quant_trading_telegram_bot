@@ -9,6 +9,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
+# Market-regime override constants live in the shared single-source module so the
+# serve path (here) and the backtest engine (walk_forward._tranche_day) can never
+# drift. Re-exported below for backward-compatible `from src.bot.sizing import ...`.
+from src.trading.regime_policy import (
+    NO_TRADE_REGIMES,
+    PENALTY_REGIMES,
+    REGIME_PENALTY_CAP,
+    STRONG_TREND_REGIME,
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Defaults — single source of truth for V3.2 Kelly sizing
 # ─────────────────────────────────────────────────────────────────────────────
@@ -27,10 +37,8 @@ DEFAULT_TOP_N          = 5
 
 # ── Market-regime structural overrides (rule-based; applied BEFORE Kelly) ─────
 # `market_regime` is the integer 0–7 from src/features/market_regime.py.
-NO_TRADE_REGIMES: frozenset[int] = frozenset({0, 7})   # 0 Freeze, 7 Liquidity Sweep → stand aside
-PENALTY_REGIMES:  frozenset[int] = frozenset({1, 6})   # 1 Squeeze, 6 Choppy → harsh ceiling
-REGIME_PENALTY_CAP: float = 0.10                        # ≤10% NAV in the penalty regimes
-STRONG_TREND_REGIME: int = 3                            # 3 Strong Trend → full Kelly up to `cap`
+# NO_TRADE_REGIMES, PENALTY_REGIMES, REGIME_PENALTY_CAP, STRONG_TREND_REGIME are
+# imported above from src.trading.regime_policy (single source of truth).
 
 
 @dataclass(frozen=True)

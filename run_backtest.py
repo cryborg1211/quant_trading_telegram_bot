@@ -77,7 +77,8 @@ REQUIRED_CKPT_KEYS = ("ensembles", "tabular_features", "cutoff", "train_cfg")
 def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
                      mode: str = "tranche", hold_days: int = 30,
                      pt_sigma: float | None = None,
-                     sl_sigma: float | None = None) -> WalkForwardConfig:
+                     sl_sigma: float | None = None,
+                     use_regime_sizing: bool = False) -> WalkForwardConfig:
     """Pure WalkForwardConfig builder — extracted from `run_oos` so the
     mode/hold-days plumbing is unit-testable without running the engine.
 
@@ -97,6 +98,7 @@ def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
         tranche_hold_days=hold_days,
         tranche_pt_sigma=pt_sigma,
         tranche_sl_sigma=sl_sigma,
+        use_regime_sizing=use_regime_sizing,
         constraints=PortfolioConstraints(
             max_weight=cfg.max_weight, long_only=True,
             target_leverage=0.95, target_vol=cfg.target_vol),
@@ -110,7 +112,8 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
             inference_cache: dict | None = None,
             mode: str = "tranche", hold_days: int = 30,
             pt_sigma: float | None = None,
-            sl_sigma: float | None = None) -> pd.DataFrame:
+            sl_sigma: float | None = None,
+            use_regime_sizing: bool = False) -> pd.DataFrame:
     """Walk-forward OOS using the pure-tabular ensemble oracle.
 
     The engine builds (n, 1, F) single-bar tensors internally (seq_len=1) and the
@@ -133,7 +136,7 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
     sub = panel.filter(pl.col("date") >= buf_start)
 
     wf_cfg = _build_wf_config(tabular_features, cutoff, cfg, mode, hold_days,
-                              pt_sigma, sl_sigma)
+                              pt_sigma, sl_sigma, use_regime_sizing)
     eng = WalkForwardEngine(wf_cfg, oracle)
     # Soft HMM regime scaling: P(Bull) multiplies the daily target weights.
     result = eng.run(sub, corporate_actions=corporate_actions, p_bull_series=p_bull_series,
@@ -294,7 +297,8 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
          mode: str = "tranche",
          hold_days: int = 30,
          pt_sigma: float | None = None,
-         sl_sigma: float | None = None) -> None:
+         sl_sigma: float | None = None,
+         use_regime_sizing: bool = False) -> None:
     configure_logging()
     t_start = time.perf_counter()
     sweep_thresholds = list(sweep_thresholds or DEFAULT_SWEEP_THRESHOLDS)
@@ -383,7 +387,8 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
                                  cutoff, cfg, p_bull_series=p_bull_series,
                                  inference_cache=seed_inference_caches[seed],
                                  mode=mode, hold_days=hold_days,
-                                 pt_sigma=pt_sigma, sl_sigma=sl_sigma)
+                                 pt_sigma=pt_sigma, sl_sigma=sl_sigma,
+                                 use_regime_sizing=use_regime_sizing)
                     m = equity_metrics(eq, cfg.initial_capital)
                     # Inline UP-precision @thr (no log spam)
                     if len(Xte_all) > 0:
@@ -748,7 +753,7 @@ def _export_only(cfg: RunConfig, tabular_features: list[str],
     LOGGER.info("=" * 100)
 
 
-def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None, float | None]:
+def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None, float | None, bool]:
     p = argparse.ArgumentParser(
         description="V4.0 Fast Evaluator — sweep + DSR/PBO on a frozen training checkpoint.")
     p.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH,
@@ -767,6 +772,9 @@ def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
     p.add_argument("--tranche-sl", type=float, default=None,
                    help="tranche stop-loss barrier in entry-vol multiples "
                         "(labels use 2.0; default off)")
+    p.add_argument("--regime-sizing", action="store_true", default=False,
+                   help="enable per-ticker regime-conditional sizing in the tranche engine "
+                        "(mirrors src/bot/sizing.py NO_TRADE/PENALTY logic; default off)")
     p.add_argument("--liquid-top-n", type=int, default=None, help="VN50 ADV gate (default 50)")
     p.add_argument("--max-positions", type=int, default=None)
     p.add_argument("--rebalance-frequency", type=int, default=None)
@@ -799,12 +807,12 @@ def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
     sweep = ([float(x) for x in a.sweep_thresholds.split(",")]
              if a.sweep_thresholds else None)
     return (a.checkpoint, overrides, sweep, (not a.no_save), a.export_only,
-            a.mode, a.hold_days, a.tranche_pt, a.tranche_sl)
+            a.mode, a.hold_days, a.tranche_pt, a.tranche_sl, a.regime_sizing)
 
 
 if __name__ == "__main__":
     (_ckpt, _overrides, _sweep, _save, _export,
-     _mode, _hold, _pt, _sl) = _cli()
+     _mode, _hold, _pt, _sl, _regime) = _cli()
     main(_ckpt, eval_overrides=_overrides, sweep_thresholds=_sweep,
          save_bot_payload=_save, export_only=_export, mode=_mode, hold_days=_hold,
-         pt_sigma=_pt, sl_sigma=_sl)
+         pt_sigma=_pt, sl_sigma=_sl, use_regime_sizing=_regime)
