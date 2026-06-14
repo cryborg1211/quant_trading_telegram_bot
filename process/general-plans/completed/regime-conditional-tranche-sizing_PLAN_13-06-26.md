@@ -3,7 +3,7 @@
 **Classification:** COMPLEX (multi-file, parity enforcement, A/B eval harness)
 **Date:** 13-06-26
 **Author:** vc-plan-agent
-**Status:** READY FOR EXECUTE
+**Status:** SHIPPED 2026-06-14 (commit 77c1412). A/B GOLDEN: MaxDD −23.32%→−16.88%, Sharpe +0.734→+0.876, Net +46.21%→+42.17%, DSR 0.345→0.447 (still <0.95). Default-OFF `--regime-sizing` flag. Serve parity follow-up: serve-regime-sizing_PLAN_14-06-26 (SHIPPED).
 
 ---
 

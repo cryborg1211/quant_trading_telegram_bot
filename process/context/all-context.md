@@ -1,6 +1,6 @@
 # Quant Engine V4.0 - All Context
 
-Last updated: 2026-06-10
+Last updated: 2026-06-14
 
 This file is the root context entrypoint for the repo.
 
@@ -214,9 +214,11 @@ stock_price_v3/
 
 **Architecture style:** Pure functions + procedural orchestration. No deep OOP inheritance trees. Prefer extracting pure functions over adding class methods.
 
-**Feature recipe versioning:** `FEATURE_RECIPE_VERSION` in `src/backtest/pipeline.py` (currently `"v1.1"`). Hard gate — serve-path checks match at load time. Any feature engineering change requires: bump version → full retrain.
+**Feature recipe versioning:** `FEATURE_RECIPE_VERSION` in `src/backtest/pipeline.py` (computed via `compute_feature_schema_hash(...)`, currently `v2-sha8:53b5bd85`). Hard gate — serve-path checks match at load time. Any feature engineering change requires: bump version (auto via the schema hash) → full retrain.
 
-**Backtest portfolio construction:** `run_backtest.py` defaults to `--mode tranche --hold-days 30` (staggered AFML cohort book: daily deploy NAV/H into top-`max_positions` names, hold exactly H trading days). Legacy `--mode grid` (concentrated delta-rebalance) is structurally unfit for this signal — its ~45 correlated entry dates let market beta dominate. Price-scale rule: parquet OHLCV is in thousands of VND; the engine converts to absolute VND via `WalkForwardConfig.price_unit_vnd` — any new code feeding parquet prices into `VNCostModel` must do the same. Bot payload carries an additive `strategy` dict (mode/hold_days/signal_threshold); serve path does not consume it yet (Phase 2).
+**Backtest portfolio construction:** `run_backtest.py` defaults to `--mode tranche --hold-days 30` (staggered AFML cohort book: daily deploy NAV/H into top-`max_positions` names, hold exactly H trading days). Legacy `--mode grid` (concentrated delta-rebalance) is structurally unfit for this signal — its ~45 correlated entry dates let market beta dominate. Price-scale rule: parquet OHLCV is in thousands of VND; the engine converts to absolute VND via `WalkForwardConfig.price_unit_vnd` — any new code feeding parquet prices into `VNCostModel` must do the same. Bot payload carries a `strategy` dict (mode/hold_days/signal_threshold); serve consumes it via `_tranche_signal_fields` (tranche cohort weight `1/(hold_days×n_picks)`).
+
+**Regime-conditional sizing (DD control):** Both backtest and serve apply the market-regime policy from `src/trading/regime_policy.py` — the single source of truth for `NO_TRADE_REGIMES {0,7}` (skip the name, weight stays cash), `PENALTY_REGIMES {1,6}` (× `REGIME_PENALTY_FACTOR` = 0.5 = `REGIME_PENALTY_CAP/DEFAULT_NAV_CAP`), and `STRONG_TREND_REGIME {3}`; imported by both `src/bot/sizing.py` (serve) and `src/backtest/walk_forward.py` (backtest). **Backtest:** opt-in via `--regime-sizing` / `WalkForwardConfig.use_regime_sizing` (default OFF). **Serve:** `main._dispatch_signals` applies it in the non-event-override branch (regime read per-ticker from the `_LATEST_REGIME_BY_TICKER` cache; event overrides keep precedence), gated by `CONFIG.trading.regime_sizing_enabled` (default **ON**, settings.json kill-switch). A/B (2026-06-14, T+20 GOLDEN): MaxDD −23.3%→−16.9%, Sharpe +0.73→+0.88, Net +46%→+42%, DSR 0.35→0.45 (still <0.95 → stays paper-only). No feature-recipe change, no retrain. PENALTY uses a 0.5× *multiplier* (not the absolute `REGIME_PENALTY_CAP`) because tranche per-name (~0.7% NAV) is far below the 10% cap.
 
 **Telegram formatting:** Strict 4096-char limit. HTML mode with careful tag closure. Long reports split into multiple messages.
 
