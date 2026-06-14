@@ -50,7 +50,7 @@ Use this file when you need to:
 
 ### Use `pytest` for everything
 
-- All 158 tests run through pytest
+- All 228 tests run through pytest
 - `pytest -q` for quick output (default via `pytest.ini`)
 - No separate test runners, no browser tests, no e2e framework
 - Tests use in-memory DuckDB and stubs — no external services needed
@@ -67,7 +67,7 @@ Unless the task clearly needs a different path:
 
 | Scope | Command | Notes |
 |---|---|---|
-| Full suite | `pytest -q` | 158 tests, all in-memory |
+| Full suite | `pytest -q` | 228 tests, all in-memory |
 | Single file | `pytest -q tests/test_<name>.py` | targeted verification |
 | Single test | `pytest -q tests/test_<name>.py::test_<func>` | surgical |
 | Verbose | `pytest -v` | full test names + pass/fail |

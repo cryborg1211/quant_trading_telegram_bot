@@ -62,7 +62,7 @@ For most substantial tasks:
 | Group | Entry point | Scope |
 |---|---|---|
 | `planning/` | `process/context/planning/all-planning.md` | plan-shape calibration, planning examples, SIMPLE vs COMPLEX reference docs |
-| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 158 tests, in-memory DuckDB stubs, debugging quick-ref |
+| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 228 tests, in-memory DuckDB stubs, debugging quick-ref |
 
 ## Task Routing Table
 
@@ -170,7 +170,7 @@ stock_price_v3/
       logging_utils.py    -- Centralized logging setup
       audit_evaluator.py  -- Trade audit evaluation
       version.py          -- Version string
-  tests/                  -- 13 test files, 158 tests (pytest)
+  tests/                  -- 20 test files, 228 tests (pytest)
   scripts/
     migrate_sqlite_to_duckdb.py -- Legacy SQLite → DuckDB migration
     backup_db.sh          -- Database backup script
@@ -199,7 +199,7 @@ stock_price_v3/
 - **Bot:** python-telegram-bot 22.7 (async PTB framework)
 - **HTTP:** aiohttp 3.13, requests 2.33
 - **Config:** python-dotenv 1.2 (.env), dataclass-based settings with JSON overrides
-- **Testing:** pytest (158 tests, in-memory DuckDB stubs)
+- **Testing:** pytest (228 tests, in-memory DuckDB stubs)
 - **Deployment:** Bare metal VPS — systemd (bot), cron (daily pipeline at 15:30 ICT Mon–Fri)
 
 ## Key Patterns and Conventions
