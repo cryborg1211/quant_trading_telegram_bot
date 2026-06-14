@@ -41,7 +41,8 @@
     "take_profit_pct": 0.15,
     "fee_rate": 0.002,
     "virtual_allocation_per_ticker": 10000000.0,
-    "default_telegram_id": "default_user"
+    "default_telegram_id": "default_user",
+    "regime_sizing_enabled": true
   },
   "crawler": {
     "stock_start_date": "2016-01-01",

@@ -67,6 +67,11 @@ class TradingConfig:
     fee_rate: float = 0.002
     virtual_allocation_per_ticker: float = 10_000_000.0
     default_telegram_id: str = "default_user"
+    # When True, the live dispatch (_dispatch_signals) applies the same
+    # regime-conditional sizing the backtest validated: NO_TRADE regimes {0,7}
+    # skip the name, PENALTY regimes {1,6} get a 0.5x weight. Settings kill-switch:
+    # set "regime_sizing_enabled": false in settings.json + restart to disable.
+    regime_sizing_enabled: bool = True
 
 
 @dataclass

@@ -41,6 +41,11 @@ from src.models.quant_agent_arbitrator import (
 )
 from src.trading.portfolio_manager import PortfolioManager
 from src.trading import signal_ledger
+from src.trading.regime_policy import (
+    NO_TRADE_REGIMES,
+    PENALTY_REGIMES,
+    REGIME_PENALTY_FACTOR,
+)
 from src.utils.telegram_alerter import TelegramBot, format_source_links
 from src.reports.builders import (
     FEATURE_HUMAN_NAMES,
@@ -1077,11 +1082,29 @@ def _dispatch_signals(
             _status = _ov["status"]
             _ly_do = _ov["ly_do"]
         else:
+            # ── Regime-conditional sizing (serve/backtest parity) ──────────────
+            # else-branch ONLY → event overrides above keep precedence. Mirrors
+            # walk_forward._tranche_day: NO_TRADE {0,7} skip the name (its cohort
+            # weight stays cash — the n_picks denominator in tranche_fields was
+            # frozen before the loop, so survivors are NOT inflated); PENALTY {1,6}
+            # → 0.5x notional in tranche mode only (the legacy half-Kelly path
+            # already penalises inside suggested_weight via REGIME_PENALTY_CAP).
+            if (CONFIG.trading.regime_sizing_enabled
+                    and _regime is not None
+                    and _regime in NO_TRADE_REGIMES):
+                LOGGER.info("[Regime] %s skipped — NO_TRADE regime %s", ticker, _regime)
+                continue
             # Tranche artifacts size at the validated cohort weight
             # (NAV/hold_days across picks); legacy artifacts keep half-Kelly.
             _w = tranche_fields.get(
                 "suggested_weight",
                 suggested_weight(float(_p5[2]), market_regime=_regime))
+            if (CONFIG.trading.regime_sizing_enabled
+                    and tranche_fields
+                    and _regime is not None
+                    and _regime in PENALTY_REGIMES):
+                _w = _w * REGIME_PENALTY_FACTOR
+                LOGGER.info("[Regime] %s PENALTY regime %s -> weight x0.5", ticker, _regime)
             _status = "MUA"
             _ly_do = ""
 
