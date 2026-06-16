@@ -42,7 +42,9 @@
     "fee_rate": 0.002,
     "virtual_allocation_per_ticker": 10000000.0,
     "default_telegram_id": "default_user",
-    "regime_sizing_enabled": true
+    "regime_sizing_enabled": true,
+    "sentiment_entry_enabled": true,
+    "sentiment_entry_threshold": 0.7
   },
   "crawler": {
     "stock_start_date": "2016-01-01",

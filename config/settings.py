@@ -72,6 +72,16 @@ class TradingConfig:
     # skip the name, PENALTY regimes {1,6} get a 0.5x weight. Settings kill-switch:
     # set "regime_sizing_enabled": false in settings.json + restart to disable.
     regime_sizing_enabled: bool = True
+    # Sentiment-entry forward paper-log: when True, every arbitrated candidate's
+    # prediction + sentiment + price is logged each pipeline run (daily) and each
+    # /verify command (verify) into `sentiment_entry_paperlog`. Pure observability —
+    # changes NO trading decision. Settings kill-switch: set
+    # "sentiment_entry_enabled": false in settings.json + restart to disable.
+    sentiment_entry_enabled: bool = True
+    # Analysis-time REFERENCE constant only — the "DOWN & sentiment > threshold"
+    # treatment filter applied by scripts/analyze_sentiment_paperlog.py. It does
+    # NOT gate captures; the full candidate cross-section is always logged.
+    sentiment_entry_threshold: float = 0.7
 
 
 @dataclass
