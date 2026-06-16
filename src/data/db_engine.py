@@ -162,6 +162,12 @@ class DuckDBEngine:
         # was called, so audit writes can begin as soon as the table exists.
         self._init_audit_log_table()
 
+        # 10. sentiment_entry_paperlog (forward research log — observability only).
+        # Records the full arbitrated candidate cross-section each pipeline run +
+        # each /verify command so the "DOWN model / high positive sentiment"
+        # hypothesis can be analysed retrospectively. Changes NO trading decision.
+        self._init_sentiment_paperlog_table()
+
     # (RETIRED: _MACRO_DAILY_COLUMNS + _init_macro_daily_table were removed with
     #  the macro_daily table — see the DB audit. V4 does not use macro features.)
 
@@ -184,6 +190,50 @@ class DuckDBEngine:
                 ticker    VARCHAR,
                 details   VARCHAR,
                 timestamp TIMESTAMP
+            )
+        """)
+
+    def _init_sentiment_paperlog_table(self) -> None:
+        """Create the sentiment-entry forward paper-log table + its id sequence.
+
+        Forward research log: each daily pipeline run and each /verify command
+        records the FULL arbitrated candidate cross-section (NOT only treatment
+        names) with its T0 prediction, sentiment, and entry price. Realized
+        T+3 / T+20 returns are backfilled by `_backfill_paperlog_outcomes` once
+        the windows mature. This is pure observability — it changes NO trading
+        decision and adds zero Gemini cost.
+
+        The `UNIQUE (log_date, ticker, source)` constraint + `INSERT OR IGNORE`
+        in the writer make same-day re-runs idempotent (no double-logging).
+
+        Split into two execute() calls — DuckDB's multi-statement execute() is
+        version-sensitive (see the comment at the `seq_trade_id` block), so we
+        run the sequence and table DDL separately to guarantee both fire.
+        """
+        self.conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS seq_sentiment_entry_id START 1"
+        )
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS sentiment_entry_paperlog (
+                id              INTEGER DEFAULT nextval('seq_sentiment_entry_id'),
+                log_date        DATE    NOT NULL,
+                ticker          VARCHAR NOT NULL,
+                source          VARCHAR NOT NULL,
+                p_down_5d       DOUBLE,
+                p_side_5d       DOUBLE,
+                p_up_5d         DOUBLE,
+                decision_5d     INTEGER,
+                p_down_20d      DOUBLE,
+                p_side_20d      DOUBLE,
+                p_up_20d        DOUBLE,
+                final_decision  INTEGER,
+                sentiment_score DOUBLE,
+                entry_close     DOUBLE,
+                ret_3d          DOUBLE,
+                ret_20d         DOUBLE,
+                outcome_filled  BOOLEAN DEFAULT FALSE,
+                PRIMARY KEY (id),
+                UNIQUE (log_date, ticker, source)
             )
         """)
 

@@ -634,6 +634,170 @@ def _backfill_rl_outcomes(db: Any) -> int:
     return backfilled
 
 
+# ---------------------------------------------------------------------------
+# Sentiment-entry forward paper-log (observability only — NO trading decision).
+#
+# Hypothesis under test: "names where the price model predicts DOWN but news
+# sentiment is very positive (>0.7) — do they outperform?" Cannot be tested on
+# history because point-in-time sentiment archives do not exist. So we forward-
+# log the FULL arbitrated candidate cross-section every pipeline run (source
+# 'daily') and every /verify command (source 'verify'), then backfill realized
+# T+3 / T+20 returns once the windows mature. The DOWN & sentiment>threshold
+# treatment filter is applied at ANALYSIS time, never at capture time — the
+# control group is always present.
+# ---------------------------------------------------------------------------
+
+# 21 calendar days guarantees ≥20 trading sessions have elapsed for any VN
+# market calendar, so both the T+3 and T+20 windows are mature before backfill.
+_PAPERLOG_MATURE_DAYS: int = 21
+
+
+def _log_sentiment_entry_paperlog(
+    db: Any,
+    candidate_tickers: list[str],
+    stacking_5d: dict[str, list[float]],
+    stacking_20d: dict[str, list[float]],
+    final_decisions: dict[str, int],
+    all_sentiments: dict[str, dict],
+    source: str,
+) -> int:
+    """Forward-log the candidate cross-section into `sentiment_entry_paperlog`.
+
+    One row per ticker in `candidate_tickers` that has a valid 5d prediction.
+    The row captures the T0 state (prediction probs, argmax decision, final
+    arbitrated decision, sentiment score). `entry_close` and realized returns
+    are left NULL at capture time and filled later by
+    `_backfill_paperlog_outcomes` once the windows mature.
+
+    Idempotent: the `UNIQUE (log_date, ticker, source)` constraint + INSERT OR
+    IGNORE silently suppress same-day duplicates, so re-running a pipeline on
+    the same date does not double-log.
+
+    Args:
+        db: object exposing `.conn` (DuckDB connection) and `._audit_lock`
+            (threading.Lock). MUST be the DuckDBEngine singleton — never a side
+            `duckdb.connect()` in the same process (config-mismatch crash).
+        candidate_tickers: full arbitrated cross-section to log (NOT only the
+            treatment slice).
+        stacking_5d: {ticker: [p_down, p_side, p_up]} for the 5d horizon.
+        stacking_20d: {ticker: [p_down, p_side, p_up]} for the 20d horizon; may
+            be empty ({}) when the secondary artifact is missing → 20d probs
+            stored as NULL.
+        final_decisions: {ticker: int} from evaluate_trades_batch; missing →
+            NULL.
+        all_sentiments: {ticker: {"sentiment_score": float, ...}}; missing →
+            sentiment_score NULL.
+        source: 'daily' (pipeline) or 'verify' (bot command).
+
+    Returns:
+        Number of INSERT statements issued (suppressed duplicates not subtracted
+        — the OR IGNORE makes them no-ops). Tickers without a valid 5d
+        prediction are skipped and not counted.
+
+    Mirrors the `_audit_lock` write pattern from `_log_rl_predictions`.
+    """
+    log_date = datetime.now().strftime("%Y-%m-%d")
+    inserted = 0
+    for ticker in candidate_tickers:
+        probs_5d = stacking_5d.get(ticker)
+        if not probs_5d or len(probs_5d) < 3:
+            continue
+        p_down_5d, p_side_5d, p_up_5d = (
+            float(probs_5d[0]),
+            float(probs_5d[1]),
+            float(probs_5d[2]),
+        )
+        # argmax over [DOWN, SIDE, UP] → 0 | 1 | 2.
+        decision_5d = int(max(range(3), key=lambda i: probs_5d[i]))
+
+        probs_20d = stacking_20d.get(ticker)
+        if probs_20d and len(probs_20d) >= 3:
+            p_down_20d, p_side_20d, p_up_20d = (
+                float(probs_20d[0]),
+                float(probs_20d[1]),
+                float(probs_20d[2]),
+            )
+        else:
+            p_down_20d = p_side_20d = p_up_20d = None
+
+        sent = all_sentiments.get(ticker) or {}
+        sentiment_score = sent.get("sentiment_score")
+        final_decision = final_decisions.get(ticker)
+
+        with db._audit_lock:
+            db.conn.execute(
+                """
+                INSERT OR IGNORE INTO sentiment_entry_paperlog
+                (log_date, ticker, source, p_down_5d, p_side_5d, p_up_5d,
+                 decision_5d, p_down_20d, p_side_20d, p_up_20d,
+                 final_decision, sentiment_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    log_date, ticker, source,
+                    p_down_5d, p_side_5d, p_up_5d, decision_5d,
+                    p_down_20d, p_side_20d, p_up_20d,
+                    final_decision, sentiment_score,
+                ],
+            )
+        inserted += 1
+    return inserted
+
+
+def _backfill_paperlog_outcomes(db: Any) -> int:
+    """Fill `entry_close` / `ret_3d` / `ret_20d` for matured paper-log rows.
+
+    Selects rows where `outcome_filled = FALSE` and `log_date` is old enough
+    (≥21 calendar days) that both the T+3 and T+20 windows have matured, then
+    computes realized returns from the fresh parquet vintage via `price_lookup`.
+
+    VN price-scale note: `price_lookup.close_on_or_*` return the RAW parquet
+    value (thousands of VND). `ret_3d`/`ret_20d` are pure ratios — the scale
+    cancels because T0 and TN come from the same shard. Do NOT apply the ×1000
+    factor here. `entry_close` stores the raw thousands-VND value for reference.
+
+    Rows whose T0 shard is missing (delisted / not crawled) stay NULL and are
+    retried on the next run. Mirrors `_backfill_rl_outcomes` semantics + lock.
+
+    Returns:
+        Number of rows successfully backfilled (outcome_filled flipped TRUE).
+    """
+    pending = db.conn.execute(
+        f"""
+        SELECT id, ticker, log_date
+        FROM sentiment_entry_paperlog
+        WHERE outcome_filled = FALSE
+          AND log_date <= CURRENT_DATE - INTERVAL {_PAPERLOG_MATURE_DAYS} DAY
+        """
+    ).fetchall()
+
+    backfilled = 0
+    for row_id, ticker, log_date in pending:
+        t0_close = price_lookup.close_on_or_before(ticker, log_date, conn=db.conn)
+        if t0_close is None or t0_close <= 0:
+            continue
+        t3_close = price_lookup.close_on_or_after(
+            ticker, log_date + timedelta(days=3), conn=db.conn
+        )
+        t20_close = price_lookup.close_on_or_after(
+            ticker, log_date + timedelta(days=20), conn=db.conn
+        )
+        ret_3d = (t3_close - t0_close) / t0_close if t3_close is not None else None
+        ret_20d = (t20_close - t0_close) / t0_close if t20_close is not None else None
+
+        with db._audit_lock:
+            db.conn.execute(
+                """
+                UPDATE sentiment_entry_paperlog
+                SET entry_close = ?, ret_3d = ?, ret_20d = ?, outcome_filled = TRUE
+                WHERE id = ?
+                """,
+                [t0_close, ret_3d, ret_20d, row_id],
+            )
+        backfilled += 1
+    return backfilled
+
+
 # VN30 constituents — STRICT live universe gate (avoid noisy mid-caps → false
 # signals in weak markets). Update on the quarterly VN30 review.
 _VN30_UNIVERSE: frozenset[str] = frozenset({
@@ -1209,6 +1373,26 @@ def run_trade_execution(
                 logged, _RL_UP_CONFIDENCE_THRESHOLD, backfilled,
             )
 
+            # Sentiment-entry forward paper-log: capture the FULL arbitrated
+            # candidate cross-section (5d keys = every arbitrated name, not just
+            # the Top-3) + backfill any matured rows. Observability only — no
+            # trading decision changes. Reuses `db = manager.db` (no new conn).
+            if CONFIG.trading.sentiment_entry_enabled:
+                _paperlog_logged = _log_sentiment_entry_paperlog(
+                    db=db,
+                    candidate_tickers=list(stacking_predictions.get("5d", {}).keys()),
+                    stacking_5d=stacking_predictions.get("5d", {}),
+                    stacking_20d=stacking_predictions.get("20d", {}),
+                    final_decisions=final_decisions,
+                    all_sentiments=all_sentiments,
+                    source="daily",
+                )
+                _paperlog_backfilled = _backfill_paperlog_outcomes(db)
+                LOGGER.info(
+                    "Paperlog: logged=%s new row(s); backfilled=%s matured row(s)",
+                    _paperlog_logged, _paperlog_backfilled,
+                )
+
         LOGGER.info("Dispatching Telegram Alerts...")
         bot = TelegramBot()
         top_pos_features, top_neg_features = _build_feature_explanation(
@@ -1463,6 +1647,29 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
 
     # --- Step 5: Mean-Reversion (knife-catch) state — parallel sub-model ---
     mr_state = mr_score_tickers([ticker]).get(ticker)
+
+    # --- Step 5b: Sentiment-entry forward paper-log (source='verify') ---
+    # Observability only — must NEVER break the user-facing reply, so the whole
+    # block is wrapped in try/except. Uses the DuckDBEngine singleton directly
+    # (verify_single_ticker holds no PortfolioManager `db`); the singleton is the
+    # same connection the daily pipeline uses, so no config-mismatch crash.
+    if CONFIG.trading.sentiment_entry_enabled:
+        try:
+            from src.data.db_engine import DuckDBEngine  # noqa: PLC0415
+
+            _vdb = DuckDBEngine()
+            _log_sentiment_entry_paperlog(
+                db=_vdb,
+                candidate_tickers=[ticker],
+                stacking_5d=stacking_5d,
+                stacking_20d=stacking_20d,
+                final_decisions=final_decisions,
+                all_sentiments=all_sentiments,
+                source="verify",
+            )
+            _backfill_paperlog_outcomes(_vdb)
+        except Exception:  # noqa: BLE001
+            LOGGER.warning("[/verify] Paperlog write failed for %s — non-fatal.", ticker)
 
     LOGGER.info("[/verify] %s completed in %.2fs.", ticker, time.perf_counter() - total_start)
     return _build_verify_report(
