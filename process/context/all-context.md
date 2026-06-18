@@ -1,6 +1,6 @@
 # Quant Engine V4.0 - All Context
 
-Last updated: 2026-06-14
+Last updated: 2026-06-18
 
 This file is the root context entrypoint for the repo.
 
@@ -62,7 +62,7 @@ For most substantial tasks:
 | Group | Entry point | Scope |
 |---|---|---|
 | `planning/` | `process/context/planning/all-planning.md` | plan-shape calibration, planning examples, SIMPLE vs COMPLEX reference docs |
-| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 228 tests, in-memory DuckDB stubs, debugging quick-ref |
+| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 238 tests, in-memory DuckDB stubs, debugging quick-ref |
 
 ## Task Routing Table
 
@@ -170,11 +170,12 @@ stock_price_v3/
       logging_utils.py    -- Centralized logging setup
       audit_evaluator.py  -- Trade audit evaluation
       version.py          -- Version string
-  tests/                  -- 20 test files, 228 tests (pytest)
+  tests/                  -- 21 test files, 238 tests (pytest)
   scripts/
     migrate_sqlite_to_duckdb.py -- Legacy SQLite → DuckDB migration
     backup_db.sh          -- Database backup script
     cleanup_legacy_rl_stubs.py  -- Dead code cleanup
+    analyze_sentiment_paperlog.py -- T+3 / T+20 return stats for sentiment-entry treatment vs control
   deploy/
     quant-v6-bot.service  -- Systemd unit for run_bot.py
   doc/
@@ -199,7 +200,7 @@ stock_price_v3/
 - **Bot:** python-telegram-bot 22.7 (async PTB framework)
 - **HTTP:** aiohttp 3.13, requests 2.33
 - **Config:** python-dotenv 1.2 (.env), dataclass-based settings with JSON overrides
-- **Testing:** pytest (228 tests, in-memory DuckDB stubs)
+- **Testing:** pytest (238 tests, in-memory DuckDB stubs)
 - **Deployment:** Bare metal VPS — systemd (bot), cron (daily pipeline at 15:30 ICT Mon–Fri)
 
 ## Key Patterns and Conventions
@@ -219,6 +220,10 @@ stock_price_v3/
 **Backtest portfolio construction:** `run_backtest.py` defaults to `--mode tranche --hold-days 30` (staggered AFML cohort book: daily deploy NAV/H into top-`max_positions` names, hold exactly H trading days). Legacy `--mode grid` (concentrated delta-rebalance) is structurally unfit for this signal — its ~45 correlated entry dates let market beta dominate. Price-scale rule: parquet OHLCV is in thousands of VND; the engine converts to absolute VND via `WalkForwardConfig.price_unit_vnd` — any new code feeding parquet prices into `VNCostModel` must do the same. Bot payload carries a `strategy` dict (mode/hold_days/signal_threshold); serve consumes it via `_tranche_signal_fields` (tranche cohort weight `1/(hold_days×n_picks)`).
 
 **Regime-conditional sizing (DD control):** Both backtest and serve apply the market-regime policy from `src/trading/regime_policy.py` — the single source of truth for `NO_TRADE_REGIMES {0,7}` (skip the name, weight stays cash), `PENALTY_REGIMES {1,6}` (× `REGIME_PENALTY_FACTOR` = 0.5 = `REGIME_PENALTY_CAP/DEFAULT_NAV_CAP`), and `STRONG_TREND_REGIME {3}`; imported by both `src/bot/sizing.py` (serve) and `src/backtest/walk_forward.py` (backtest). **Backtest:** opt-in via `--regime-sizing` / `WalkForwardConfig.use_regime_sizing` (default OFF). **Serve:** `main._dispatch_signals` applies it in the non-event-override branch (regime read per-ticker from the `_LATEST_REGIME_BY_TICKER` cache; event overrides keep precedence), gated by `CONFIG.trading.regime_sizing_enabled` (default **ON**, settings.json kill-switch). A/B (2026-06-14, T+20 GOLDEN): MaxDD −23.3%→−16.9%, Sharpe +0.73→+0.88, Net +46%→+42%, DSR 0.35→0.45 (still <0.95 → stays paper-only). No feature-recipe change, no retrain. PENALTY uses a 0.5× *multiplier* (not the absolute `REGIME_PENALTY_CAP`) because tranche per-name (~0.7% NAV) is far below the 10% cap.
+
+**Serve-path horizons:** PRIMARY = T+20 (`v3_ensemble_20d.joblib`). SHORT = T+5 (`v3_ensemble_5d.joblib`), used by `/verify` for intraday confirmation — `SHORT_HORIZON_DAYS = 5` in `src/bot/bot_inference.py` (recovered 18-06-26; was briefly T+3 on 12-06-26, reverted because the 5d artifact was already gate-verified `v2-sha8:53b5bd85` and no retrain was required). Known cleanup debt: `src/reports/builders.py:326` hardcodes literal `5 ngày tới` instead of `{SHORT_HORIZON_DAYS}` — fix pending in the Telegram-work effort.
+
+**Sentiment-entry paper-log:** `sentiment_entry_paperlog` DuckDB table (+ `seq_sentiment_entry_id` sequence) captures the full candidate cross-section on every daily pipeline run (`source='daily'`) and every `/verify` invocation (`source='verify'`). Columns: per-horizon model probabilities, `decision_5d` argmax, `sentiment_score`, `entry_close`, `ret_3d`, `ret_20d`, `outcome_filled`. Backfill resolves returns after 21 calendar days using `price_lookup`. Config knobs: `CONFIG.trading.sentiment_entry_enabled` (default True) / `sentiment_entry_threshold` (default 0.7, analysis-time reference only — all rows are logged regardless). Analysis: `scripts/analyze_sentiment_paperlog.py`. Tests: `tests/test_sentiment_paperlog.py` (10 tests). Shipped 2026-06-16; `source='daily'` row not yet confirmed in production (requires one live cron run at 15:30 ICT).
 
 **Telegram formatting:** Strict 4096-char limit. HTML mode with careful tag closure. Long reports split into multiple messages.
 

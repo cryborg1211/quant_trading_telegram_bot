@@ -1,6 +1,6 @@
 # Quant Engine V4.0 - All Tests
 
-Last updated: 2026-06-10
+Last updated: 2026-06-18
 
 Attach this file first when the task involves testing, verification, or test debugging.
 
@@ -50,7 +50,7 @@ Use this file when you need to:
 
 ### Use `pytest` for everything
 
-- All 228 tests run through pytest
+- All 238 tests run through pytest
 - `pytest -q` for quick output (default via `pytest.ini`)
 - No separate test runners, no browser tests, no e2e framework
 - Tests use in-memory DuckDB and stubs — no external services needed
@@ -67,7 +67,7 @@ Unless the task clearly needs a different path:
 
 | Scope | Command | Notes |
 |---|---|---|
-| Full suite | `pytest -q` | 228 tests, all in-memory |
+| Full suite | `pytest -q` | 238 tests, all in-memory |
 | Single file | `pytest -q tests/test_<name>.py` | targeted verification |
 | Single test | `pytest -q tests/test_<name>.py::test_<func>` | surgical |
 | Verbose | `pytest -v` | full test names + pass/fail |
