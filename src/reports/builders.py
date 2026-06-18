@@ -125,8 +125,8 @@ _MR_SELL_VETO = (
 
 # SHORT horizon rendered in report copy ("Đánh giá xu hướng (N ngày tới)").
 # The `_5d`-named vars/labels below mean "short horizon" — the artifact behind
-# them is T+3 since the 12-06-26 retire of the T+5 model (verify-only role).
-SHORT_HORIZON_DAYS: int = 3
+# them is T+5 (recovered 16-06-26; the short model stays verify-only role).
+SHORT_HORIZON_DAYS: int = 5
 
 # Class-label -> display text mappings for the verify report.
 _VERIFY_5D_PRED_LABELS: dict[int, str] = {

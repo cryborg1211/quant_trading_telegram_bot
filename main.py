@@ -296,8 +296,9 @@ _V3_BUNDLE_PATHS: dict[int, Path] = {
     5:  Path("models/saved/v3_ensemble_5d.joblib"),   # retired short horizon (kept loadable)
     20: Path("models/saved/v3_ensemble_20d.joblib"),
 }
-# Short horizon = /verify-only cross-check model (T+3). The daily broadcast
-# dispatches the T+20 tranche book; the short model never drives sizing.
+# Short horizon = /verify-only cross-check model (T+5, recovered 16-06-26).
+# The daily broadcast dispatches the T+20 tranche book; the short model never
+# drives sizing.
 SHORT_HORIZON: int = SHORT_HORIZON_DAYS
 # Legacy fallback for the un-suffixed bundle from V3.0 runs.
 _V3_BUNDLE_LEGACY_FALLBACK = Path("models/saved/v3_ensemble.joblib")
