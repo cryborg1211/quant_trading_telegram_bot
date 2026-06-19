@@ -936,7 +936,7 @@ def daily_inference(
     max_candidates: int = 6,
     broadcast: bool = True,
     horizon: int = 20,
-) -> str:
+) -> tuple[str, list[dict]]:
     """Daily trading path. No crawling. No full Alpha360 parquet load.
 
     Args:
@@ -950,10 +950,12 @@ def daily_inference(
             interactive bot.
 
     Returns:
-        Combined HTML report of the dispatched Top-3 BUY signals (one block
-        per ticker, separated by a horizontal rule). Suitable for posting to
-        Telegram with `parse_mode=HTML`. Returns "" when no signals were
-        produced (e.g. liquidity filter cleared the pool, or no live prices).
+        A `(report_html, dispatched_signals)` tuple. `report_html` is the
+        combined HTML report of the dispatched Top-3 BUY signals (one block per
+        ticker, separated by a horizontal rule), or the fallback observability
+        report, or "" when no signals were produced. `dispatched_signals` is
+        the raw list of per-ticker signal_data dicts (empty on the fallback /
+        no-signal paths), consumed by the interactive bot's per-ticker sender.
     """
     LOGGER.info("Starting dual-horizon daily inference. No crawling will run in this task.")
     total_start = time.perf_counter()
@@ -1020,7 +1022,8 @@ def daily_inference(
         if not candidate_tickers:
             return (
                 "<b>[⚠️ THỊ TRƯỜNG YẾU]</b>\n<i>Không có mã nào trong vũ trụ "
-                "giao dịch sau bộ lọc thanh khoản/Universe hôm nay.</i>"
+                "giao dịch sau bộ lọc thanh khoản/Universe hôm nay.</i>",
+                [],
             )
         # MR knife-catch scores for the monitored names → [🔪 BẮT ĐÁY] tag.
         mr_scores = mr_score_tickers(candidate_tickers)
@@ -1041,7 +1044,7 @@ def daily_inference(
             "Dual-horizon daily inference completed in %.2fs.",
             time.perf_counter() - total_start,
         )
-        return report_html
+        return report_html, []
 
     # --- Top-6 → Top-3 Sentiment Filter ---
     # Scope strictly to candidate_tickers (the 6 evaluated by arbitrator+LLM).
@@ -1086,7 +1089,7 @@ def daily_inference(
         horizon_predictions,
     )
 
-    report_html = run_trade_execution(
+    report_html, dispatched_signals = run_trade_execution(
         top_buy_signals=top_buy_signals,
         final_decisions=final_decisions,
         all_sentiments=all_sentiments,
@@ -1099,7 +1102,7 @@ def daily_inference(
         event_overrides=event_overrides,
     )
     LOGGER.info("Dual-horizon daily inference completed in %.2fs.", time.perf_counter() - total_start)
-    return report_html
+    return report_html, dispatched_signals
 
 
 # ── Event-driven thresholds — used by the rescue + bear-veto loops in
@@ -1173,7 +1176,7 @@ def build_event_overrides(
     return overrides, rescued
 
 
-def _tranche_signal_fields(strategy: dict | None, n_picks: int) -> dict:
+def _tranche_signal_fields(strategy: dict | None, n_picks: int, horizon: int = 20) -> dict:
     """Tranche-mode dispatch enrichment from the artifact's `strategy` dict.
 
     Returns {} for legacy artifacts (no strategy / non-tranche mode) so the
@@ -1183,12 +1186,18 @@ def _tranche_signal_fields(strategy: dict | None, n_picks: int) -> dict:
     """
     if not strategy or strategy.get("mode") != "tranche":
         return {}
-    hold_days = int(strategy.get("hold_days", 30))
-    weight = 1.0 / (hold_days * max(1, n_picks))
-    exit_date = pd.bdate_range(datetime.now().date(), periods=hold_days + 1)[-1]
+    book_hold = int(strategy.get("hold_days", 30))
+    # Short-horizon cards (T+3/T+5) size AND hold on their own horizon; the
+    # primary (>=20) keeps the validated 30-session book (every artifact ships
+    # hold_days=30). Cohort weight = NAV/(hold*picks), capped at the 20% per-name
+    # NAV ceiling (src/bot/sizing.DEFAULT_NAV_CAP) so e.g. a 3-day single pick
+    # can't demand 33% NAV.
+    disp_hold = book_hold if int(horizon) >= 20 else int(horizon)
+    weight = min(1.0 / (disp_hold * max(1, n_picks)), 0.20)
+    exit_date = pd.bdate_range(datetime.now().date(), periods=disp_hold + 1)[-1]
     fields = {
         "suggested_weight": weight,
-        "hold_label": f"{hold_days} phiên (đến ~{exit_date.strftime('%d/%m/%Y')})",
+        "hold_label": f"{disp_hold} phiên (đến ~{exit_date.strftime('%d/%m/%Y')})",
     }
     pt, sl = strategy.get("pt_sigma"), strategy.get("sl_sigma")
     if pt is not None or sl is not None:
@@ -1223,7 +1232,7 @@ def _dispatch_signals(
     overrides the half-Kelly size with the validated cohort weight and adds
     hold-horizon / barrier guidance to the card; None keeps legacy behavior.
     """
-    tranche_fields = _tranche_signal_fields(strategy, len(top_buy_signals))
+    tranche_fields = _tranche_signal_fields(strategy, len(top_buy_signals), horizon)
     dispatched_signals: list[dict] = []
     for ticker in top_buy_signals:
         exec_price = live_exec_prices.get(ticker)
@@ -1317,7 +1326,7 @@ def run_trade_execution(
     horizon: int = 20,
     broadcast: bool = True,
     event_overrides: dict | None = None,
-) -> str:
+) -> tuple[str, list[dict]]:
     """Execute portfolio updates, RL outcome logging, and dispatch Telegram alerts.
 
     Args:
@@ -1332,8 +1341,11 @@ def run_trade_execution(
             path (`/suggest_buy`) to avoid duplicating alerts.
 
     Returns:
-        Combined HTML report of every signal dispatched (for chat-reply UX),
-        or "" if no signals were dispatched.
+        A `(combined_html, dispatched_signals)` tuple. `combined_html` is the
+        legacy combined HTML report of every signal dispatched (kept for the
+        cron/log path), or "" if none were dispatched. `dispatched_signals` is
+        the raw list of per-ticker signal_data dicts — consumed by the
+        interactive bot's per-ticker sender (`_send_per_ticker_reports`).
     """
     LOGGER.info("Starting Trade Execution (Portfolio Manager)...")
     dispatched_signals: list[dict] = []
@@ -1343,7 +1355,7 @@ def run_trade_execution(
 
         if not live_exec_prices:
             LOGGER.warning("No executable live prices available. Skipping portfolio price updates and alerts.")
-            return ""
+            return "", dispatched_signals
 
         with timed_step("Portfolio update/process_daily_trades"):
             manager.update_live_performance(live_exec_prices)
@@ -1445,9 +1457,9 @@ def run_trade_execution(
 
     except Exception:
         LOGGER.exception("Error during trade execution")
-        return _build_combined_report(dispatched_signals)
+        return _build_combined_report(dispatched_signals), dispatched_signals
 
-    return _build_combined_report(dispatched_signals)
+    return _build_combined_report(dispatched_signals), dispatched_signals
 
 
 # ---------------------------------------------------------------------------
@@ -1829,7 +1841,24 @@ def notify_tranche_exits() -> int:
                 f"• <b>{html.escape(str(d['ticker']))}</b> — vào {disp_str}, "
                 f"đủ {int(d['hold_days'])} phiên (đã qua {int(d['sessions_elapsed'])})"
             )
-        TelegramBot().send_text_alert("\n".join(lines), label="tranche_exit")
+        # Telegram hard limit is 4096 chars. A very large tranche book could
+        # exceed it; truncate to the lines that fit under 3800 and append an
+        # overflow notice so the alert always delivers as valid HTML.
+        msg = "\n".join(lines)
+        if len(msg) > 3800:
+            kept: list[str] = []
+            running = 0
+            overflow_notice_len = 40  # head-room for the "... và N mã khác" tail
+            for ln in lines:
+                if running + len(ln) + 1 > 3800 - overflow_notice_len:
+                    break
+                kept.append(ln)
+                running += len(ln) + 1
+            remaining = len(lines) - len(kept)
+            if remaining > 0:
+                kept.append(f"\n... và <b>{remaining}</b> mã khác (rút gọn).")
+            msg = "\n".join(kept)
+        TelegramBot().send_text_alert(msg, label="tranche_exit")
         signal_ledger.mark_closed(due)
         LOGGER.info("[SignalLedger] Exit alerts sent + closed: %s", len(due))
         return len(due)

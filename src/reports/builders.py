@@ -323,7 +323,7 @@ def _build_fallback_observability_report_vi(
         out += [
             f"<b>{i}. {html.escape(t)}{tag}</b>",
             f"   • <b>Giá hiện tại:</b> {html.escape(price_str)}",
-            f"   • <b>Đánh giá xu hướng (5 ngày tới):</b> "
+            f"   • <b>Đánh giá xu hướng ({SHORT_HORIZON_DAYS} ngày tới):</b> "
             f"Cửa Tăng <b>{p_up:.1f}%</b> | Đi Ngang {p_sd:.1f}% | "
             f"Cửa Giảm {p_dn:.1f}%",
             f"   • <b>Trạng thái:</b> ❌ HỦY BỎ TÍN HIỆU"
@@ -400,10 +400,6 @@ def _build_sell_hold_report(
             target_str = stop_str = "N/A"
 
         source_urls = (sentiment.get("source_urls", []) or [])[:6]
-        if source_urls:
-            url_lines = "\n".join(f"  • {html.escape(u)}" for u in source_urls)
-        else:
-            url_lines = "  • Không có tin tức đáng kể."
 
         block = (
             f"\U0001f4cc <b>{html.escape(ticker)}</b> — giá hiện tại {html.escape(price_str)}\n"
@@ -415,7 +411,7 @@ def _build_sell_hold_report(
             f"• \U0001f6e1️ <b>Ngưỡng cắt lỗ:</b> {stop_str}\n"
             f"• <b>Tin tức &amp; Tâm lý:</b> {html.escape(sentiment_status)} — "
             f"{html.escape(reasoning)}\n"
-            f"• <b>Nguồn tham khảo:</b>\n{url_lines}"
+            f"• {format_source_links(source_urls)}"
         )
         parts.append(block)
 
@@ -495,10 +491,6 @@ def _build_verify_report(
 
     # Source URLs (already populated from ground-truth tracker in arbitrator)
     source_urls = (sentiment.get("source_urls", []) or [])[:3]
-    if source_urls:
-        url_lines = "\n".join(f"  - {html.escape(u)}" for u in source_urls)
-    else:
-        url_lines = "  Không có tin tức đáng kể"
 
     return (
         f"\U0001f50d <b>[KIỂM ĐỊNH] {html.escape(ticker)}</b>\n"
@@ -515,7 +507,7 @@ def _build_verify_report(
         f"• Đánh giá: {html.escape(sent_status)} (điểm {sent_score:+.2f})\n"
         f"• Phân tích: {html.escape(sent_reasoning)}\n\n"
         f"\U0001f3af <b>Kết luận tổng hợp:</b> {verdict_html}\n\n"
-        f"\U0001f517 <b>Nguồn tham khảo:</b>\n{url_lines}"
+        f"\U0001f517 {format_source_links(source_urls)}"
     )
 
 

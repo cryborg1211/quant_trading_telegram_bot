@@ -50,6 +50,11 @@ from telegram.ext import (
     filters,
 )
 
+# Per-ticker BUY card builder. Aliased to avoid any confusion with PTB's own
+# internals; `telegram_alerter` does NOT import from this module, so there is
+# no circular-import risk.
+from src.utils.telegram_alerter import TelegramBot as AlerterBot
+
 load_dotenv()
 
 LOGGER = logging.getLogger(__name__)
@@ -120,6 +125,7 @@ HELP_TEXT = (
     "🤖 <b>TRỢ LÝ ĐẦU TƯ — DANH SÁCH LỆNH</b>\n"
     "\n"
     "<b>/suggest_buy20</b> — Khuyến nghị MUA T+20 (tranche, nắm giữ ~30 phiên).\n"
+    "<b>/suggest_buy5</b> — Khuyến nghị MUA T+5 (tầm nhìn ngắn).\n"
     "📒 <b>/exits</b> — Vị thế tranche đang mở + số phiên còn lại.\n"
     "🔴 <b>/suggest_sell</b> — Đánh giá NÊN BÁN hay GIỮ danh mục của bạn.\n"
     "⚖️ <b>/rebalance</b> — Tư vấn cơ cấu lại danh mục hiện tại.\n"
@@ -144,12 +150,102 @@ HELP_TEXT = (
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _safe_split_block(block: str, max_len: int) -> list[str]:
+    """Split a single oversized HTML block without cutting inside a tag.
+
+    Strategy for each cut (applied left-to-right over the remainder):
+    1. Walk backward from index `max_len` to find the best boundary that is
+       NOT inside an unclosed ``<...>`` tag — prefer a newline, else a space.
+    2. If no whitespace boundary exists at/under `max_len`, fall back to the
+       raw `max_len` cut, but if that index lands inside an unclosed ``<``,
+       back the cut up to just before that ``<`` so a tag is never severed.
+    3. If even index 0 opens a tag that does not close within `max_len` (a
+       single tag LONGER than `max_len`), emit that whole tag intact as one
+       oversized chunk rather than slicing through it — invalid HTML is worse
+       on every send path than one over-length message (the caller's
+       ``BadRequest`` fallback escapes an over-length card if Telegram rejects
+       it). Only when the tag never closes at all do we hard-cut at `max_len`
+       to guarantee termination (matches the legacy hard-slice for tag-free
+       input).
+
+    Returns a list of chunks. Each chunk is ``<= max_len`` EXCEPT a lone tag
+    longer than `max_len`, which is kept intact (see rule 3).
+    """
+    if len(block) <= max_len:
+        return [block] if block else []
+
+    chunks: list[str] = []
+    rest = block
+    while len(rest) > max_len:
+        window = rest[:max_len]
+        cut = _last_safe_boundary(window)
+        if cut <= 0:
+            # No safe whitespace boundary at/under max_len. Retreat out of any
+            # tag the raw cut would sever.
+            cut = _retreat_out_of_tag(window, max_len)
+            if cut <= 0:
+                # Index 0 opens a tag that does not close within max_len: emit
+                # the whole tag intact (cut just AFTER its real '>' in `rest`),
+                # or hard-cut at max_len if it never closes at all.
+                close_gt = rest.find(">")
+                cut = close_gt + 1 if close_gt != -1 else max_len
+        chunks.append(rest[:cut])
+        rest = rest[cut:].lstrip("\n ")
+    if rest:
+        chunks.append(rest)
+    return chunks
+
+
+def _last_safe_boundary(window: str) -> int:
+    """Index to cut `window` at: last newline (else space) outside any tag.
+
+    Returns 0 when no whitespace boundary exists outside a tag (caller then
+    falls back to a tag-retreated hard cut).
+    """
+    best_space = 0
+    depth_open = False  # True while inside an unclosed '<...>'
+    last_newline = 0
+    for i, ch in enumerate(window):
+        if ch == "<":
+            depth_open = True
+        elif ch == ">":
+            depth_open = False
+        elif not depth_open and ch in ("\n", " "):
+            best_space = i
+            if ch == "\n":
+                last_newline = i
+    # Prefer the last newline boundary; otherwise the last space boundary.
+    # Cut AFTER the boundary char so the whitespace stays with the left chunk
+    # (then stripped from the right remainder by the caller).
+    boundary = last_newline if last_newline else best_space
+    return boundary + 1 if boundary else 0
+
+
+def _retreat_out_of_tag(window: str, idx: int) -> int:
+    """If cutting `window` at `idx` lands inside an unclosed '<', back up.
+
+    Returns the largest index <= `idx` that is not inside an open tag, or 0
+    if even index 0 is inside the (single, oversized) tag — which cannot
+    happen here since index 0 is the block start.
+    """
+    open_lt = window.rfind("<", 0, idx)
+    if open_lt == -1:
+        return idx
+    close_gt = window.find(">", open_lt)
+    if close_gt == -1 or close_gt >= idx:
+        # The '<' opened before idx is still unclosed at idx → retreat to
+        # just before that '<' so the partial tag moves to the next chunk.
+        return open_lt
+    return idx
+
+
 def _split_html_report(report: str, max_len: int = TELEGRAM_MAX_MESSAGE_CHARS) -> list[str]:
     """Split a long combined HTML report into Telegram-safe chunks.
 
     Splits on the visual `══════` separator built by `_build_combined_report`
     in main.py so each chunk is one self-contained per-ticker block. Falls
-    back to hard char-slicing only if a single block somehow exceeds the limit.
+    back to a TAG-SAFE splitter (`_safe_split_block`) only if a single block
+    somehow exceeds the limit, so a chunk never ends inside a `<...>` tag.
     """
     if len(report) <= max_len:
         return [report] if report.strip() else []
@@ -166,8 +262,7 @@ def _split_html_report(report: str, max_len: int = TELEGRAM_MAX_MESSAGE_CHARS) -
             chunks.append(current)
             current = ""
         if len(block) > max_len:
-            for i in range(0, len(block), max_len):
-                chunks.append(block[i : i + max_len])
+            chunks.extend(_safe_split_block(block, max_len))
         else:
             current = block
     if current:
@@ -189,6 +284,96 @@ def _chunk_lines(lines: list[str], max_len: int = TELEGRAM_MAX_MESSAGE_CHARS) ->
     if current:
         chunks.append(current)
     return chunks
+
+
+async def _send_per_ticker_reports(
+    update: Update,
+    wait_msg: Any,
+    signal_data_list: list[dict],
+    *,
+    disable_preview: bool = True,
+) -> None:
+    """Send ONE Telegram message per ticker (no combined-string bundling).
+
+    Each card is built by `AlerterBot._build_message(sd)` — the exact same
+    institutional BUY card the cron push path uses — so it is pure HTML and
+    well under the 4096-char limit, sidestepping the splitter entirely.
+
+    Mirrors the 1-way oversight behaviour of `_send_or_reply_chunks`: every
+    card sent to a monitored "user" is also forwarded to ADMIN_CHAT_ID
+    (best-effort). Each send degrades to `html.escape`d text on a `BadRequest`
+    parse error rather than leaking raw tags.
+    """
+    if not signal_data_list:
+        if wait_msg is not None:
+            try:
+                await wait_msg.edit_text(EMPTY_BUY_RESULT_MESSAGE, parse_mode=ParseMode.HTML)
+            except BadRequest as exc:
+                LOGGER.warning("empty-result edit_text failed (%s).", exc)
+        return
+
+    # Build cards up-front so a malformed signal_data dict is skipped (logged)
+    # rather than aborting the whole batch.
+    cards: list[str] = []
+    for sd in signal_data_list:
+        try:
+            cards.append(AlerterBot._build_message(sd))
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "[PerTicker] _build_message failed for %s: %s",
+                (sd.get("ticker", "?") if isinstance(sd, dict) else "?"), exc,
+            )
+    if not cards:
+        if wait_msg is not None:
+            try:
+                await wait_msg.edit_text(EMPTY_BUY_RESULT_MESSAGE, parse_mode=ParseMode.HTML)
+            except BadRequest as exc:
+                LOGGER.warning("empty-card edit_text failed (%s).", exc)
+        return
+
+    # Header: edit the loading message in place into a 1-line summary.
+    header = f"📊 {len(cards)} tín hiệu — chi tiết từng mã bên dưới."
+    if wait_msg is not None:
+        try:
+            await wait_msg.edit_text(header, parse_mode=ParseMode.HTML)
+        except BadRequest as exc:
+            LOGGER.warning("header edit_text failed (%s).", exc)
+
+    # 1-way oversight: mirror the header + every card to the Admin when the
+    # requester is the monitored User. Best-effort — never affects the reply.
+    if ADMIN_CHAT_ID and _role_for(update) == "user":
+        try:
+            _bot = update.get_bot()
+            await _bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text="👁️ <b>[GIÁM SÁT] Bản sao phản hồi gửi cho người dùng:</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            for _card in cards:
+                await _bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=_card,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=disable_preview,
+                )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("[Oversight] per-ticker mirror failed: %s", exc)
+
+    if update.message is None:
+        return
+    for card in cards:
+        try:
+            await update.message.reply_text(
+                card,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=disable_preview,
+            )
+        except BadRequest as exc:
+            LOGGER.warning(
+                "per-ticker reply_text failed (%s); retrying with HTML-escaped text.",
+                exc,
+            )
+            await update.message.reply_text(html.escape(card))
 
 
 async def _send_or_reply_chunks(
@@ -251,8 +436,10 @@ async def _send_or_reply_chunks(
                 disable_web_page_preview=disable_preview,
             )
         except BadRequest as exc:
-            LOGGER.warning("reply_text failed (%s); retrying without parse_mode.", exc)
-            await update.message.reply_text(chunk)
+            LOGGER.warning(
+                "reply_text failed (%s); retrying with HTML-escaped text.", exc,
+            )
+            await update.message.reply_text(html.escape(chunk))
 
 
 def _log_request(name: str, update: Update) -> None:
@@ -425,7 +612,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _suggest_buy_dispatch(update: Update, horizon: int) -> None:
-    """Backend for /suggest_buy20 (T+5/T+3 short horizon is /verify-only now).
+    """Backend for /suggest_buy20 and /suggest_buy5 (T+5 short horizon restored).
 
     Posts ONE minimal loading message (so the bot doesn't look dead during the
     1–2 min inference), then replaces/deletes it with the final cards.  NO
@@ -469,7 +656,7 @@ async def _suggest_buy_dispatch(update: Update, horizon: int) -> None:
         return
 
     try:
-        report_html: str = await asyncio.to_thread(
+        report_html, signal_data_list = await asyncio.to_thread(
             daily_inference, broadcast=False, horizon=int(horizon),
         )
     except FileNotFoundError as exc:
@@ -499,7 +686,14 @@ async def _suggest_buy_dispatch(update: Update, horizon: int) -> None:
         )
         return
 
-    if not report_html or not report_html.strip():
+    if not signal_data_list:
+        # Fallback observability reports carry no dispatched signals but DO carry
+        # report_html — surface it (single tag-safe message) rather than the
+        # generic "no signal" line so the weak-market diagnostics still reach
+        # the user.
+        if report_html and report_html.strip():
+            await _send_or_reply_chunks(update, wait_msg, _split_html_report(report_html))
+            return
         await wait_msg.edit_text(
             f"<b>Không có tín hiệu MUA T+{horizon} hôm nay.</b>\n"
             "<i>Không có mã nào vượt qua Kelly threshold + Liquidity gate + Sentiment filter.</i>",
@@ -507,14 +701,19 @@ async def _suggest_buy_dispatch(update: Update, horizon: int) -> None:
         )
         return
 
-    # Deliver the cards: _send_or_reply_chunks edits the loading message into the
-    # single card, or DELETES it and posts fresh messages when there are several.
-    await _send_or_reply_chunks(update, wait_msg, _split_html_report(report_html))
+    # Deliver ONE message per ticker (each is the institutional BUY card, well
+    # below the 4096-char limit — no combined-string splitting needed).
+    await _send_per_ticker_reports(update, wait_msg, signal_data_list)
 
 
 async def suggest_buy20_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
     """T+20 BUY recommendations with tranche cohort sizing."""
     await _suggest_buy_dispatch(update, horizon=20)
+
+
+async def suggest_buy5_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
+    """T+5 short-horizon BUY recommendations."""
+    await _suggest_buy_dispatch(update, horizon=5)
 
 
 async def add_portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1279,6 +1478,7 @@ async def msg_id2_command(
 # This populates the "/" autocomplete menu in every chat.
 _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("suggest_buy20", "Khuyến nghị MUA T+20 — tranche ~30 phiên"),
+    BotCommand("suggest_buy5", "Khuyến nghị MUA T+5 — tầm nhìn ngắn"),
     BotCommand("exits", "Vị thế tranche đang mở + số phiên còn lại"),
     BotCommand("suggest_sell", "Lấy khuyến nghị BÁN/HOLD cho danh mục cá nhân"),
     BotCommand("rebalance", "AI tư vấn cơ cấu danh mục hiện tại"),
@@ -1381,7 +1581,14 @@ def build_application() -> Application:
             suggest_buy20_command,
         )
     )
-    # /suggest_buy5 retired — the short horizon (T+3) is /verify-only now.
+    # /suggest_buy5 restored — short horizon recovered to T+5 (18-06-26).
+    app.add_handler(CommandHandler("suggest_buy5", suggest_buy5_command))
+    app.add_handler(
+        MessageHandler(
+            filters.Regex(r"^/suggest-buy5(@\w+)?(\s|$)"),
+            suggest_buy5_command,
+        )
+    )
 
     # --- Phase 3 ---
     app.add_handler(CommandHandler("add", add_portfolio_command))
