@@ -1,6 +1,6 @@
 # Quant Engine V4.0 - All Context
 
-Last updated: 2026-06-18
+Last updated: 2026-06-19
 
 This file is the root context entrypoint for the repo.
 
@@ -242,6 +242,8 @@ stock_price_v3/
 
 **Deprecated:** `alpha360_generator.py` is gutted in V4.0 — system is purely tabular.
 
+**Local dashboard (new program, 2026-06-19):** Streamlit dashboard for a single Windows laptop user. Package root: `dashboard/` (new, not yet created — P1 scope). No-polling architecture: send-only Telegram alerter, no PTB ApplicationBuilder anywhere in `dashboard/`. Reuses `main.daily_inference(broadcast=False)`, `verify_single_ticker`, `inference_for_holdings`, `PortfolioManager`, `signal_ledger`, `audit_evaluator.run_post_mortem`. Installer: Inno Setup `setup.exe` (P4 scope) — no PyInstaller.
+
 ## Environment and Configuration
 
 **Config files:**
@@ -265,6 +267,7 @@ stock_price_v3/
 | Feature | Folder | Status |
 |---|---|---|
 | V4.1 Structural Debt | `process/features/v4-1-structural-debt/` | in-progress (Phase 1+2 done, Phase 3 next) |
+| Local Dashboard | `process/features/local-dashboard/` | in-progress (P0 planned) |
 
 ## Code-Review-Graph MCP
 
