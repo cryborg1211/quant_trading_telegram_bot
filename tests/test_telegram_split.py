@@ -5,9 +5,11 @@ imports cleanly without the full `python-telegram-bot` stack.
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
-from src.utils.telegram_bot import _split_html_report
+from src.utils.telegram_bot import _safe_split_block, _split_html_report
 
 _SEP = "══════════════════════════════"  # the separator used by _build_combined_report
 
@@ -89,3 +91,62 @@ class TestSplitHtmlReport:
         result = _split_html_report(report, max_len=max_len)
         assert len(result) == 1
         assert len(result[0]) == max_len
+
+
+# ── HTML-validity: tag-safe splitting (hardened path) ───────────────────────
+
+# A chunk ends "inside a tag" if it contains a '<' with no matching '>' after
+# it (i.e. the final '<' opens a tag that the chunk never closes).
+_DANGLING_OPEN_TAG = re.compile(r"<[^>]*$")
+
+
+def _no_chunk_ends_inside_a_tag(chunks: list[str]) -> bool:
+    return all(_DANGLING_OPEN_TAG.search(c) is None for c in chunks)
+
+
+def _anchor_tags_balanced(chunk: str) -> bool:
+    """Every `<a ...>` opened in the chunk is closed by `</a>` in the chunk."""
+    return chunk.count("<a ") == chunk.count("</a>")
+
+
+class TestSplitHtmlReportTagSafe:
+    def _oversized_link_block(self, max_len: int) -> str:
+        # Repeat an anchor-bearing line until well past max_len, so the splitter
+        # is forced to cut somewhere — the cut must never land mid-tag.
+        line = '<a href="https://example.com/path?a=1&amp;b=2">VnExpress</a> tin tức\n'
+        block = line * ((max_len * 3 // len(line)) + 1)
+        assert len(block) > max_len
+        return block
+
+    def test_oversized_html_block_no_mid_tag_cut(self):
+        max_len = 200
+        block = self._oversized_link_block(max_len)
+        chunks = _split_html_report(block, max_len=max_len)
+        assert len(chunks) >= 2
+        assert _no_chunk_ends_inside_a_tag(chunks), "a chunk ended inside an open tag"
+        for c in chunks:
+            assert _anchor_tags_balanced(c), f"unbalanced <a> tags in chunk: {c!r}"
+
+    def test_safe_split_block_chunks_within_max_len(self):
+        max_len = 200
+        block = self._oversized_link_block(max_len)
+        chunks = _safe_split_block(block, max_len=max_len)
+        assert all(len(c) <= max_len for c in chunks)
+        assert _no_chunk_ends_inside_a_tag(chunks)
+
+    def test_safe_split_block_preserves_plain_hardslice(self):
+        # Tag-free, whitespace-free input must still hard-slice exactly like the
+        # legacy loop (guards the existing oversized-block contract).
+        chunks = _safe_split_block("a" * 9000, max_len=4000)
+        assert [len(c) for c in chunks] == [4000, 4000, 1000]
+
+    def test_safe_split_block_never_severs_a_long_tag(self):
+        # A single OPENING tag longer than max_len must never be sliced through:
+        # no chunk may end inside the '<...>'. The oversized opening tag is kept
+        # intact in one chunk (rule 3) even though it exceeds max_len.
+        open_tag = '<a href="' + "x" * 300 + '">'
+        block = "prefix text here\n" + open_tag + "label</a>\nsuffix"
+        chunks = _safe_split_block(block, max_len=100)
+        assert _no_chunk_ends_inside_a_tag(chunks), "an opening tag was severed"
+        # The full opening tag appears intact (not split mid-attribute).
+        assert any(open_tag in c for c in chunks)

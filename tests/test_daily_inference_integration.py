@@ -68,12 +68,16 @@ def test_daily_inference_happy_path(
             "VHM": {"sentiment_score": 0.2, "reasoning_vi": "neutral"},
         },
     )
-    mock_rte.return_value = "<b>test report</b>"
+    # run_trade_execution now returns a (combined_html, dispatched_signals) tuple,
+    # and daily_inference propagates that tuple.
+    _signals = [{"ticker": "VCB"}, {"ticker": "BID"}, {"ticker": "VHM"}]
+    mock_rte.return_value = ("<b>test report</b>", _signals)
 
     from main import daily_inference
-    result = daily_inference(broadcast=False)
+    report_html, signal_data_list = daily_inference(broadcast=False)
 
-    assert result == "<b>test report</b>"
+    assert report_html == "<b>test report</b>"
+    assert signal_data_list == _signals
     mock_rte.assert_called_once()
     call_kwargs = mock_rte.call_args
     top_buy = call_kwargs.kwargs.get("top_buy_signals") or call_kwargs[1].get("top_buy_signals")
@@ -118,9 +122,11 @@ def test_daily_inference_fallback_path(
     mock_fb_report.return_value = "<b>fallback report</b>"
 
     from main import daily_inference
-    result = daily_inference(broadcast=False)
+    report_html, signal_data_list = daily_inference(broadcast=False)
 
-    assert result == "<b>fallback report</b>"
+    # Fallback path bypasses run_trade_execution → no dispatched signals.
+    assert report_html == "<b>fallback report</b>"
+    assert signal_data_list == []
     mock_rte.assert_not_called()
     mock_fb_report.assert_called_once()
 
@@ -173,12 +179,13 @@ def test_daily_inference_rescue_loop_invoked(
         )
 
     mock_eval.side_effect = eval_side_effect
-    mock_rte.return_value = "<b>rescue report</b>"
+    mock_rte.return_value = ("<b>rescue report</b>", [{"ticker": "FPT"}])
 
     from main import daily_inference
-    result = daily_inference(broadcast=False)
+    report_html, signal_data_list = daily_inference(broadcast=False)
 
-    assert result == "<b>rescue report</b>"
+    assert report_html == "<b>rescue report</b>"
+    assert signal_data_list == [{"ticker": "FPT"}]
     mock_rte.assert_called_once()
     call_kwargs = mock_rte.call_args
     top_buy = call_kwargs.kwargs.get("top_buy_signals") or call_kwargs[1].get("top_buy_signals")
