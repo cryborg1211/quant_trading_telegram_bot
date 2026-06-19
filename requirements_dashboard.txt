@@ -1,0 +1,8 @@
+# Dashboard-only dependencies (additive to requirements.txt).
+# Install into the same venv as the main project:
+#   pip install -r requirements_dashboard.txt
+#
+# Packages already pinned in requirements.txt (python-dotenv, pandas, duckdb,
+# google-genai, etc.) are intentionally NOT duplicated here.
+
+streamlit>=1.35
