@@ -1,16 +1,13 @@
-"""GIỮ tab — portfolio holdings.
+"""GIỮ tab — portfolio holdings (P2 wired).
 
-P1: static skeleton with STUB data. Renders an add-position form, a holdings
-table, summary metric cards, and a "Chạy lại" button. The add form writes to
-``st.session_state["pending_add"]`` but does NOT touch the portfolio DB in P1.
-Remove buttons and "Chạy lại" render but are no-ops in P1.
+Live portfolio CRUD against the ``portfolio`` DuckDB table (under a fixed local
+user_id, P0 GOTCHA 2), live PnL via ``price_lookup.latest_close`` (VN
+thousands-VND scale applied in ``_pnl_ratio``), and exit countdown via
+``signal_ledger.list_open()``.
 
-P2 TODO:
-  - add/remove → raw DuckDB INSERT/DELETE on the ``portfolio`` table via
-    ``DuckDBEngine()`` under a FIXED local user_id (see P0 GOTCHA 2). There is
-    no add/remove API on PortfolioManager; the bot does raw SQL.
-  - holdings table + PnL + sell verdict → ``main.inference_for_holdings(tickers)``.
-  - exit countdown → ``signal_ledger.list_open()`` / ``check_exits_due()``.
+The add form pre-fills from the MUA tab's quick-add
+(``st.session_state["giu_prefill"]``). Holdings reads are TTL-cached
+(``st.cache_data ttl=30``); any add/remove clears the cache.
 """
 
 from __future__ import annotations
@@ -18,50 +15,52 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-# --- STUB DATA (P1 only) ------------------------------------------------------
-STUB_HOLDINGS: list[dict] = [
-    {
-        "ma": "HPG",
-        "KL": 1000,
-        "gia_vao": 26800.0,
-        "PnL": "+2.6%",
-        "lenh": "GIỮ",
-        "thoat_countdown": "còn 12 phiên",
-    },
-    {
-        "ma": "FPT",
-        "KL": 300,
-        "gia_vao": 132000.0,
-        "PnL": "+5.1%",
-        "lenh": "GIỮ",
-        "thoat_countdown": "còn 4 phiên",
-    },
-    {
-        "ma": "SSI",
-        "KL": 1500,
-        "gia_vao": 31500.0,
-        "PnL": "-1.8%",
-        "lenh": "BÁN",
-        "thoat_countdown": "đến hạn",
-    },
-]
+from dashboard.utils.headless import (
+    LOCAL_USER_ID,
+    _pnl_ratio,
+    portfolio_add,
+    portfolio_list,
+    portfolio_remove,
+)
 
-# Stub summary values (P2: computed from live holdings + PnL).
-STUB_SUMMARY = {
-    "von_vao": "126.000.000 ₫",
-    "PnL_today": "+1.2%",
-    "PnL_total": "+3.4%",
-    "lenh_mo": "3",
-}
+
+@st.cache_data(ttl=30)
+def _cached_holdings(user_id: str) -> list[dict]:
+    """TTL-cached holdings read (cleared on add/remove)."""
+    return portfolio_list(user_id)
+
+
+def _latest_close(ticker: str) -> float | None:
+    """Lazy wrapper around price_lookup.latest_close (heavy import deferred)."""
+    from src.data import price_lookup  # noqa: PLC0415 — lazy heavy import
+
+    return price_lookup.latest_close(ticker)
+
+
+def _open_positions() -> dict[str, dict]:
+    """Map ticker → open-signal row (for exit countdown). Empty on failure."""
+    try:
+        from src.trading import signal_ledger  # noqa: PLC0415 — lazy heavy import
+
+        return {p["ticker"]: p for p in signal_ledger.list_open()}
+    except Exception:  # noqa: BLE001 — countdown is best-effort
+        return {}
 
 
 def render() -> None:
     """Render the GIỮ (portfolio holdings) tab."""
     st.header("GIỮ — Danh mục")
-    st.caption("Quản lý vị thế đang nắm giữ (dữ liệu mẫu — P1).")
+    st.caption("Quản lý vị thế đang nắm giữ.")
+
+    # --- MUA quick-add pre-fill ----------------------------------------------
+    prefill = st.session_state.pop("giu_prefill", None)
+    if prefill:
+        st.session_state["add_ticker"] = str(prefill.get("ticker", ""))
+        st.session_state["add_price"] = float(prefill.get("price", 0.0) or 0.0)
+        st.info(f"Đã điền sẵn {prefill.get('ticker')} từ tab MUA — nhập khối lượng và lưu.")
 
     # --- Add-position form ----------------------------------------------------
-    with st.expander("➕ Thêm vị thế", expanded=False):
+    with st.expander("➕ Thêm vị thế", expanded=bool(prefill)):
         with st.form("add_position"):
             cols = st.columns(3)
             new_ticker = cols[0].text_input("Mã", key="add_ticker").strip().upper()
@@ -74,38 +73,72 @@ def render() -> None:
             submitted = st.form_submit_button("Thêm vào danh mục")
         if submitted:
             if new_ticker and new_volume > 0 and new_price > 0:
-                # P1: stage only — no PortfolioManager / DB write yet.
-                st.session_state["pending_add"] = {
-                    "ticker": new_ticker,
-                    "volume": int(new_volume),
-                    "price": float(new_price),
-                }
-                st.success(
-                    f"(P1 mẫu) Đã ghi tạm {new_ticker} — chưa lưu vào danh mục."
-                )
+                try:
+                    portfolio_add(LOCAL_USER_ID, new_ticker, int(new_volume), float(new_price))
+                    _cached_holdings.clear()
+                    st.success(f"Đã thêm {new_ticker} vào danh mục.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.warning(str(exc))
             else:
                 st.warning("Nhập đủ Mã, Khối lượng và Giá vào (> 0).")
 
-    # --- Holdings table -------------------------------------------------------
+    # --- Holdings + PnL + exit countdown -------------------------------------
     st.subheader("Vị thế hiện tại")
-    df = pd.DataFrame(STUB_HOLDINGS)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    holdings = _cached_holdings(LOCAL_USER_ID)
+    if not holdings:
+        st.info("Chưa có vị thế nào trong danh mục.")
+        if st.button("🔄 Chạy lại", key="giu_rerun"):
+            _cached_holdings.clear()
+            st.rerun()
+        return
 
-    # Per-row remove buttons (P1: no-op stubs).
-    st.caption("Gỡ vị thế (mẫu — chưa hoạt động ở P1):")
-    remove_cols = st.columns(len(STUB_HOLDINGS))
-    for col, row in zip(remove_cols, STUB_HOLDINGS):
-        if col.button(f"Gỡ {row['ma']}", key=f"remove_{row['ma']}"):
-            st.toast(f"(P1 mẫu) Gỡ {row['ma']} — chưa kết nối DB.")
+    open_positions = _open_positions()
+
+    rows: list[dict] = []
+    ratios: list[float] = []
+    von_vao = 0.0
+    for h in holdings:
+        ticker = h["ticker"]
+        entry = float(h["price"] or 0.0)
+        volume = int(h["volume"] or 0)
+        von_vao += entry * volume
+        ratio = _pnl_ratio(entry, _latest_close(ticker))
+        if ratio is not None:
+            ratios.append(ratio)
+        countdown = open_positions.get(ticker, {}).get("sessions_remaining", "-")
+        rows.append({
+            "Mã": ticker,
+            "KL": volume,
+            "Giá vào": f"{entry:,.0f}",
+            "PnL": f"{ratio:+.1%}" if ratio is not None else "N/A",
+            "Còn lại (phiên)": countdown,
+        })
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # Per-row remove buttons.
+    st.caption("Gỡ vị thế:")
+    remove_cols = st.columns(len(holdings))
+    for col, h in zip(remove_cols, holdings):
+        if col.button(f"Gỡ {h['ticker']}", key=f"remove_{h['ticker']}"):
+            portfolio_remove(LOCAL_USER_ID, h["ticker"])
+            _cached_holdings.clear()
+            st.toast(f"Đã gỡ {h['ticker']}.")
+            st.rerun()
 
     # --- Summary cards --------------------------------------------------------
     st.subheader("Tổng quan")
+    avg_pnl = (sum(ratios) / len(ratios)) if ratios else None
     summary_cols = st.columns(4)
-    summary_cols[0].metric("Vốn vào", STUB_SUMMARY["von_vao"])
-    summary_cols[1].metric("PnL hôm nay", STUB_SUMMARY["PnL_today"])
-    summary_cols[2].metric("PnL tổng", STUB_SUMMARY["PnL_total"])
-    summary_cols[3].metric("Lệnh mở", STUB_SUMMARY["lenh_mo"])
+    summary_cols[0].metric("Vốn vào", f"{von_vao:,.0f} ₫")
+    summary_cols[1].metric(
+        "PnL trung bình", f"{avg_pnl:+.1%}" if avg_pnl is not None else "N/A"
+    )
+    summary_cols[2].metric("Số mã có giá", f"{len(ratios)}/{len(holdings)}")
+    summary_cols[3].metric("Lệnh mở", str(len(holdings)))
 
-    # --- Re-run button (P1: no-op) -------------------------------------------
+    # --- Re-run button --------------------------------------------------------
     if st.button("🔄 Chạy lại", key="giu_rerun"):
-        st.toast("(P1 mẫu) Chạy lại — chưa kết nối inference.")
+        _cached_holdings.clear()
+        st.rerun()

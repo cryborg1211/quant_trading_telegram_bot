@@ -74,8 +74,12 @@ def _write_env(updates: dict[str, str]) -> None:
         set_key(str(_ENV_PATH), key, value)
 
 
-def _write_settings_json(horizon_default: int, sentiment_threshold: float) -> None:
-    """Merge horizon + sentiment threshold into config/settings.json.
+def _write_settings_json(
+    horizon_default: int,
+    sentiment_threshold: float,
+    dashboard_user_id: str,
+) -> None:
+    """Merge horizon + sentiment threshold + dashboard user_id into settings.json.
 
     Read-parse-merge-write: only the targeted keys are touched; everything
     else in the file is preserved verbatim.
@@ -85,6 +89,12 @@ def _write_settings_json(horizon_default: int, sentiment_threshold: float) -> No
     trading["sentiment_entry_threshold"] = round(float(sentiment_threshold), 2)
     # Dashboard-local preference (not consumed by the engine yet; P2 reads it).
     trading["dashboard_horizon_default"] = int(horizon_default)
+
+    # Dashboard user_id (read at startup by headless._read_user_id). Persist at
+    # the top level so it survives a settings.json without a `trading` block.
+    clean_uid = (dashboard_user_id or "").strip()
+    if clean_uid:
+        data["dashboard_user_id"] = clean_uid
 
     _SETTINGS_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
     _SETTINGS_JSON_PATH.write_text(
@@ -106,6 +116,10 @@ def render() -> None:
     has_token = bool(env.get("TELEGRAM_BOT_TOKEN"))
     existing_threshold = float(trading.get("sentiment_entry_threshold", 0.7))
     existing_horizon = int(trading.get("dashboard_horizon_default", 20))
+    # headless._read_user_id is pure stdlib (no ML stack); lazy-import keeps the
+    # Settings tab consistent with the lazy-import convention.
+    from dashboard.utils.headless import _read_user_id  # noqa: PLC0415
+    existing_user_id = _read_user_id()
 
     with st.form("settings_form"):
         gemini_key = st.text_input(
@@ -137,6 +151,15 @@ def render() -> None:
             value=min(max(existing_threshold, 0.5), 0.95),
             step=0.05,
         )
+        dashboard_user_id = st.text_input(
+            "Dashboard user_id",
+            value=existing_user_id,
+            help="User_id tách danh mục dashboard khỏi lịch sử bot Telegram.",
+        )
+        st.caption(
+            "User_id separates dashboard portfolio from Telegram bot history. "
+            "Đổi giá trị này cần khởi động lại dashboard để áp dụng."
+        )
         submitted = st.form_submit_button("💾 Lưu cài đặt")
 
     # ---- WRITES happen ONLY here, on explicit Save click --------------------
@@ -153,7 +176,7 @@ def render() -> None:
             env_updates["TELEGRAM_CHAT_ID"] = telegram_chat_id.strip()
 
             _write_env(env_updates)
-            _write_settings_json(horizon_default, sentiment_threshold)
+            _write_settings_json(horizon_default, sentiment_threshold, dashboard_user_id)
             st.success("Đã lưu cài đặt.")
             st.caption(
                 "Lưu ý: thay đổi settings.json cần khởi động lại dashboard để áp dụng "
