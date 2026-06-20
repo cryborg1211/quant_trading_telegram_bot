@@ -936,6 +936,7 @@ def daily_inference(
     max_candidates: int = 6,
     broadcast: bool = True,
     horizon: int = 20,
+    persist: bool = True,
 ) -> tuple[str, list[dict]]:
     """Daily trading path. No crawling. No full Alpha360 parquet load.
 
@@ -1100,6 +1101,7 @@ def daily_inference(
         horizon=int(horizon),
         broadcast=broadcast,
         event_overrides=event_overrides,
+        persist=persist,
     )
     LOGGER.info("Dual-horizon daily inference completed in %.2fs.", time.perf_counter() - total_start)
     return report_html, dispatched_signals
@@ -1326,6 +1328,7 @@ def run_trade_execution(
     horizon: int = 20,
     broadcast: bool = True,
     event_overrides: dict | None = None,
+    persist: bool = True,
 ) -> tuple[str, list[dict]]:
     """Execute portfolio updates, RL outcome logging, and dispatch Telegram alerts.
 
@@ -1339,6 +1342,13 @@ def run_trade_execution(
             `TelegramBot.send_signal_alert()` is skipped. The combined HTML
             report is still built and returned. Used by the interactive bot
             path (`/suggest_buy`) to avoid duplicating alerts.
+        persist: When False, ALL DuckDB write side-effects are skipped —
+            `manager.update_live_performance`, `manager.process_daily_trades`,
+            RL prediction logging/backfill, and the sentiment-entry paperlog
+            logging/backfill. Signal dispatch (`_dispatch_signals`) still runs,
+            so the caller still receives the full `dispatched_signals` list.
+            Default `True` keeps the cron path byte-for-byte identical. Used by
+            the local dashboard preview path to avoid phantom portfolio writes.
 
     Returns:
         A `(combined_html, dispatched_signals)` tuple. `combined_html` is the
@@ -1357,13 +1367,14 @@ def run_trade_execution(
             LOGGER.warning("No executable live prices available. Skipping portfolio price updates and alerts.")
             return "", dispatched_signals
 
-        with timed_step("Portfolio update/process_daily_trades"):
-            manager.update_live_performance(live_exec_prices)
-            manager.process_daily_trades(
-                top_buy_signals=top_buy_signals,
-                next_day_open_prices=live_exec_prices,
-                predictions=final_decisions,
-            )
+        if persist:
+            with timed_step("Portfolio update/process_daily_trades"):
+                manager.update_live_performance(live_exec_prices)
+                manager.process_daily_trades(
+                    top_buy_signals=top_buy_signals,
+                    next_day_open_prices=live_exec_prices,
+                    predictions=final_decisions,
+                )
 
         # TD-05: replaced the hardcoded `actual_t5_outcome = -0.05` stub with
         # a proper two-phase logger:
@@ -1373,38 +1384,39 @@ def run_trade_execution(
         #                 prices from stock_ohlcv and computing the actual return.
         # Both phases run every daily_inference call, so backfill happens on the
         # next session after a 5-day window elapses for any given prediction.
-        with timed_step("RL prediction logging (T0 INSERT + T+5 backfill UPDATE)"):
-            db = manager.db
-            predictions_5d = stacking_predictions.get("5d", stacking_predictions)
-            top_pos_text, _ = _build_feature_explanation(
-                xgb_model_5d, selected_features_5d, top_k=3
-            )
-            logged = _log_rl_predictions(db, predictions_5d, top_pos_text)
-            backfilled = _backfill_rl_outcomes(db)
-            LOGGER.info(
-                "RL T0 logged=%s (UP prob > %.2f); T+5 backfilled=%s",
-                logged, _RL_UP_CONFIDENCE_THRESHOLD, backfilled,
-            )
-
-            # Sentiment-entry forward paper-log: capture the FULL arbitrated
-            # candidate cross-section (5d keys = every arbitrated name, not just
-            # the Top-3) + backfill any matured rows. Observability only — no
-            # trading decision changes. Reuses `db = manager.db` (no new conn).
-            if CONFIG.trading.sentiment_entry_enabled:
-                _paperlog_logged = _log_sentiment_entry_paperlog(
-                    db=db,
-                    candidate_tickers=list(stacking_predictions.get("5d", {}).keys()),
-                    stacking_5d=stacking_predictions.get("5d", {}),
-                    stacking_20d=stacking_predictions.get("20d", {}),
-                    final_decisions=final_decisions,
-                    all_sentiments=all_sentiments,
-                    source="daily",
+        if persist:
+            with timed_step("RL prediction logging (T0 INSERT + T+5 backfill UPDATE)"):
+                db = manager.db
+                predictions_5d = stacking_predictions.get("5d", stacking_predictions)
+                top_pos_text, _ = _build_feature_explanation(
+                    xgb_model_5d, selected_features_5d, top_k=3
                 )
-                _paperlog_backfilled = _backfill_paperlog_outcomes(db)
+                logged = _log_rl_predictions(db, predictions_5d, top_pos_text)
+                backfilled = _backfill_rl_outcomes(db)
                 LOGGER.info(
-                    "Paperlog: logged=%s new row(s); backfilled=%s matured row(s)",
-                    _paperlog_logged, _paperlog_backfilled,
+                    "RL T0 logged=%s (UP prob > %.2f); T+5 backfilled=%s",
+                    logged, _RL_UP_CONFIDENCE_THRESHOLD, backfilled,
                 )
+
+                # Sentiment-entry forward paper-log: capture the FULL arbitrated
+                # candidate cross-section (5d keys = every arbitrated name, not just
+                # the Top-3) + backfill any matured rows. Observability only — no
+                # trading decision changes. Reuses `db = manager.db` (no new conn).
+                if CONFIG.trading.sentiment_entry_enabled:
+                    _paperlog_logged = _log_sentiment_entry_paperlog(
+                        db=db,
+                        candidate_tickers=list(stacking_predictions.get("5d", {}).keys()),
+                        stacking_5d=stacking_predictions.get("5d", {}),
+                        stacking_20d=stacking_predictions.get("20d", {}),
+                        final_decisions=final_decisions,
+                        all_sentiments=all_sentiments,
+                        source="daily",
+                    )
+                    _paperlog_backfilled = _backfill_paperlog_outcomes(db)
+                    LOGGER.info(
+                        "Paperlog: logged=%s new row(s); backfilled=%s matured row(s)",
+                        _paperlog_logged, _paperlog_backfilled,
+                    )
 
         LOGGER.info("Dispatching Telegram Alerts...")
         bot = TelegramBot()
