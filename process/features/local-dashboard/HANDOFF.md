@@ -11,9 +11,13 @@ Launcher builds venv on first run (NO PyInstaller). `setup.exe` = Inno Setup ins
 ## Phase state
 - **P0** reuse audit ✓ → `process/features/local-dashboard/reports/p0-reuse-audit-findings_19-06-26.md`
 - **P1** UI skeleton ✓ → `dashboard/` package, 6 tabs (was stub)
-- **P2** logic linking ✓ (code-verified, suite 249 green, py_compile clean) — persist gate + tabs wired live
-- **P2 GATE OPEN:** live `streamlit run` smoke NOT done (streamlit not installed)
-- **P3** launcher / **P4** installer / **P5** hardening — NOT planned (author after P2 smoke)
+- **P2** logic linking ✓ (code-verified, suite 251 green, py_compile clean) — persist gate + tabs wired live
+- **P2 GATE CLOSED (2026-06-21):** streamlit 1.58.0 installed; `AppTest` boot smoke added
+  (`tests/test_dashboard_app_smoke.py`, 2 tests) → all 6 tabs render, holdings path renders,
+  no uncaught exception, no per-tab error boundary fired. Real `streamlit run --server.headless`
+  boots clean (health `ok`, no traceback). Heavy seams (daily_inference / run_post_mortem /
+  portfolio_list / price_lookup) stubbed at tab use-sites — smoke needs no models/Gemini/DB.
+- **P3** launcher / **P4** installer / **P5** hardening — NOT planned (author next)
 
 Plans: `process/features/local-dashboard/active/` — umbrella, p0, p1, p2 PLANs.
 
@@ -24,8 +28,13 @@ Plans: `process/features/local-dashboard/active/` — umbrella, p0, p1, p2 PLANs
 - Threading: `dashboard/utils/thread_runner.run_in_thread` (ThreadPoolExecutor + session_state + spinner).
 
 ## NEXT (do first)
-1. **Live smoke**: `pip install -r requirements_dashboard.txt` → `streamlit run dashboard/app.py`. Verify: 6 tabs render; GIỮ add/remove round-trip; MUA preview leaves `portfolio` `user_id='cron'` row count unchanged; Verify push needs `.env` keys.
-2. Then author + execute **P3** (`run_dashboard.bat` launcher + first-run venv bootstrap).
+1. **P2 live smoke — DONE (2026-06-21).** `AppTest` boot smoke + real headless `streamlit run`
+   both green; suite 251. Automated render gate now regression-guarded.
+   - Still WORTH a manual eyeball with real `.env` keys + fresh parquet: launch
+     `streamlit run dashboard/app.py`, click each tab, confirm MUA shows live picks, GIỮ
+     add/remove round-trips, Verify push reaches Telegram. (Automated smoke stubs the heavy
+     seams, so it does NOT exercise real inference / Gemini / Telegram end-to-end.)
+2. Author + execute **P3** (`run_dashboard.bat` launcher + first-run venv bootstrap, NO PyInstaller).
 
 ## ENV GOTCHAS (cost time last session)
 - **git-bash BROKEN this box** (profile ~line 180 unterminated quote) → EVERY Bash-tool call fails. Use **PowerShell** for git/pytest/python.
