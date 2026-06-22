@@ -50,3 +50,5 @@ old-data/
 TradingAgents-main/
 # Added by code-review-graph
 .code-review-graph/
+#old files
+stock_price_old/
