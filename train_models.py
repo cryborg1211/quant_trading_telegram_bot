@@ -53,7 +53,11 @@ from src.backtest.pipeline import (
     select_features,
 )
 from src.models.tabular_ensemble import TabularEnsemble
-from src.models.macro_risk_hmm import build_market_proxy_returns, train_macro_risk_hmm
+from src.models.macro_risk_hmm import (
+    build_market_proxy_returns,
+    build_regime_observation,
+    train_macro_risk_hmm,
+)
 
 LOGGER = logging.getLogger("quant.train")
 
@@ -122,15 +126,16 @@ def main(cfg: RunConfig) -> None:
     macro_hmm = None
     if cfg.use_macro_hmm:
         with phase("Macro Risk Oracle — train HMM (in-sample)"):
-            market_ret = build_market_proxy_returns(ds.panel)
+            obs = build_regime_observation(
+                ds.panel, use_macro=cfg.use_macro_in_hmm, macro_parquet=cfg.macro_parquet)
             cutoff_ts = pd.Timestamp(ds.cutoff)
-            train_ret = market_ret[market_ret.index < cutoff_ts]
+            train_ret = obs[obs.index < cutoff_ts]
             try:
                 macro_hmm = train_macro_risk_hmm(
                     train_ret, n_states=cfg.hmm_n_states, seed=cfg.seed)
                 # Leak-free filtered P(Bull) — logged here for sanity; the
                 # evaluator recomputes it from this same HMM at backtest time.
-                p_bull = macro_hmm.p_bull_series(market_ret, filtered=True)
+                p_bull = macro_hmm.p_bull_series(obs, filtered=True)
                 oos_pb = p_bull[p_bull.index >= cutoff_ts]
                 LOGGER.info("HMM P(Bull) | bull_state=%d  OOS mean=%.3f  OOS min=%.3f",
                             macro_hmm.bull_state, float(oos_pb.mean()), float(oos_pb.min()))

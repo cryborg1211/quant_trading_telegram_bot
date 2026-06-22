@@ -36,7 +36,16 @@ import polars as pl
 
 LOGGER = logging.getLogger("models.macro_risk_hmm")
 
-__all__ = ["MacroRiskHMM", "build_market_proxy_returns", "train_macro_risk_hmm"]
+__all__ = [
+    "MacroRiskHMM",
+    "build_market_proxy_returns",
+    "build_regime_observation",
+    "train_macro_risk_hmm",
+]
+
+# Macro return columns (from src/data/macro_crawler.py → data/macro_daily.parquet)
+# appended as extra HMM emission dims when macro is enabled.
+_MACRO_RET_COLS: tuple[str, ...] = ("sp500_ret", "dxy_ret", "usdvnd_ret")
 
 
 def build_market_proxy_returns(
@@ -63,6 +72,66 @@ def build_market_proxy_returns(
     return mret.replace([np.inf, -np.inf], np.nan).dropna().rename("market_ret")
 
 
+def build_regime_observation(
+    panel: pl.DataFrame | pd.DataFrame,
+    *,
+    use_macro: bool = False,
+    macro_parquet: object = None,
+    close_col: str = "close",
+    ticker_col: str = "ticker",
+    date_col: str = "date",
+) -> "pd.Series | pd.DataFrame":
+    """The HMM observation: price-breadth proxy, optionally widened with macro dims.
+
+    Returns the 1-D ``market_ret`` Series (identical to ``build_market_proxy_returns``)
+    when ``use_macro`` is off or the macro parquet is unavailable — so the legacy
+    price-only regime is the exact, unchanged fallback. When macro is on AND the
+    parquet exists, returns a DataFrame whose FIRST column is ``market_ret`` followed
+    by the macro return dims (``sp500_ret``/``dxy_ret``/``usdvnd_ret``).
+
+    Leak discipline: macro is left-joined AS-OF each proxy date (``reindex`` on the
+    proxy index, no future rows), small calendar gaps forward-filled ≤3 days. Rows
+    where any dim is still NaN (warm-up) are dropped so the emission matrix is dense.
+    """
+    market_ret = build_market_proxy_returns(
+        panel, close_col=close_col, ticker_col=ticker_col, date_col=date_col
+    )
+    if not use_macro or macro_parquet is None:
+        return market_ret
+
+    from pathlib import Path  # noqa: PLC0415 — local; keeps module import light
+
+    path = Path(str(macro_parquet))
+    if not path.exists():
+        LOGGER.warning("[macro-hmm] %s absent — price-only proxy.", path)
+        return market_ret
+    try:
+        macro = pd.read_parquet(path)
+    except Exception as exc:  # noqa: BLE001 — unreadable parquet → price-only
+        LOGGER.warning("[macro-hmm] could not read %s (%s) — price-only.", path, exc)
+        return market_ret
+
+    cols = [c for c in _MACRO_RET_COLS if c in macro.columns]
+    if "date" not in macro.columns or not cols:
+        LOGGER.warning("[macro-hmm] %s missing date/macro-ret cols — price-only.", path)
+        return market_ret
+
+    macro = macro.copy()
+    macro["date"] = pd.to_datetime(macro["date"])
+    macro = macro.set_index("date").sort_index()
+    obs = pd.DataFrame({"market_ret": market_ret})
+    aligned = macro[cols].reindex(obs.index).ffill(limit=3)  # as-of, gap-bridge only
+    for c in cols:
+        obs[c] = aligned[c]
+    obs = obs.dropna()
+    if obs.shape[1] < 2 or obs.empty:
+        LOGGER.warning("[macro-hmm] macro join yielded no usable dims — price-only.")
+        return market_ret
+    LOGGER.info("[macro-hmm] regime observation widened to %d dims: %s",
+                obs.shape[1], list(obs.columns))
+    return obs
+
+
 @dataclass
 class MacroRiskHMM:
     """A fitted 2-state Gaussian HMM + the identified Bull-state index."""
@@ -73,8 +142,11 @@ class MacroRiskHMM:
     state_vars: list                    # per-state variance (raw units, diag)
     train_end: str | None = None        # ISO date of the last in-sample bar
 
-    def _X(self, r: pd.Series) -> np.ndarray:
-        return r.to_numpy(dtype=np.float64).reshape(-1, 1) * self.scale
+    def _X(self, obs: "pd.Series | pd.DataFrame") -> np.ndarray:
+        arr = np.asarray(obs.to_numpy(dtype=np.float64))
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        return arr * self.scale
 
     # ── internal: leak-free filtered posterior at the final timestep ─────────
     def _filtered_last(self, Xs: np.ndarray) -> float:
@@ -83,7 +155,7 @@ class MacroRiskHMM:
 
     def p_bull_series(
         self,
-        market_returns: pd.Series,
+        obs: "pd.Series | pd.DataFrame",
         *,
         filtered: bool = True,
         min_obs: int = 20,
@@ -91,10 +163,12 @@ class MacroRiskHMM:
         """
         P(Bull) for each day, date-indexed.
 
-        filtered=True  → expanding-window forward filter (leak-free; use for OOS).
-        filtered=False → full-sequence smoothed posterior (leaky; diagnostics only).
+        `obs` is the regime observation — a 1-D market-return Series, or the N-D
+        DataFrame from `build_regime_observation` (must match the dimensionality
+        the HMM was trained on). filtered=True → expanding-window forward filter
+        (leak-free; use for OOS). filtered=False → smoothed (leaky; diagnostics).
         """
-        r = market_returns.dropna()
+        r = obs.dropna()
         idx = r.index
         if len(r) == 0:
             return pd.Series(dtype=np.float64, name="p_bull")
@@ -110,9 +184,9 @@ class MacroRiskHMM:
         # Warm-up bars (< min_obs) → neutral 0.5 then forward-fill.
         return pd.Series(out, index=idx, name="p_bull").ffill().fillna(0.5)
 
-    def p_bull_latest(self, market_returns: pd.Series) -> float:
+    def p_bull_latest(self, obs: "pd.Series | pd.DataFrame") -> float:
         """Leak-free filtered P(Bull) for the most recent bar (live inference)."""
-        r = market_returns.dropna()
+        r = obs.dropna()
         if len(r) == 0:
             return 0.5
         return self._filtered_last(self._X(r))
@@ -152,7 +226,11 @@ def train_macro_risk_hmm(
     r = returns_train.dropna()
     if len(r) < max(2 * n_states, 30):
         raise ValueError(f"train returns too short for HMM: {len(r)} obs")
-    Xs = r.to_numpy(dtype=np.float64).reshape(-1, 1) * scale
+    Xs = np.asarray(r.to_numpy(dtype=np.float64))
+    if Xs.ndim == 1:
+        Xs = Xs.reshape(-1, 1)
+    Xs = Xs * scale
+    n_dims = Xs.shape[1]
     data_var = float(np.var(Xs))
     degen_ceiling = 50.0 * data_var          # an unused state's var >> data var
 
@@ -182,19 +260,29 @@ def train_macro_risk_hmm(
             "the train split may lack regime diversity.")
 
     model = best_model
-    means_scaled = model.means_.ravel()
-    vars_scaled = model.covars_.ravel()
-    # Bull = highest mean; tie-break → lower variance.
-    order = np.lexsort((vars_scaled, -means_scaled))
+    means_scaled = np.asarray(model.means_)                  # (n_states, n_dims)
+    covars = np.asarray(model.covars_)
+    if covars.ndim == 3:                                     # full matrices → diagonal
+        vars_scaled = np.diagonal(covars, axis1=1, axis2=2)  # (n_states, n_dims)
+    elif covars.ndim == 2:                                   # diag variances
+        vars_scaled = covars
+    else:                                                    # 1-D edge
+        vars_scaled = covars.reshape(n_states, -1)
+    # Bull = the state with the HIGHER market-breadth return (column 0); ties →
+    # lower variance on that same dim. Macro dims (columns 1..) only sharpen the
+    # regime split — they never redefine which state is "Bull".
+    market_means = means_scaled[:, 0]
+    market_vars = vars_scaled[:, 0]
+    order = np.lexsort((market_vars, -market_means))
     bull_state = int(order[0])
 
-    # Report diagnostics in RAW return units.
+    # Report diagnostics in RAW return units (nested per-state lists for N-D).
     means_raw = (means_scaled / scale).tolist()
     vars_raw = (vars_scaled / (scale ** 2)).tolist()
     LOGGER.info(
-        "MacroRiskHMM fit | states=%d  means(raw)=%s  vars(raw)=%s  bull_state=%d  "
+        "MacroRiskHMM fit | dims=%d states=%d  market_means(raw)=%s  bull_state=%d  "
         "train_obs=%d  logL=%.1f",
-        n_states, [round(m, 6) for m in means_raw], [round(v, 7) for v in vars_raw],
+        n_dims, n_states, np.round(market_means / scale, 6).tolist(),
         bull_state, len(r), best_ll,
     )
     return MacroRiskHMM(

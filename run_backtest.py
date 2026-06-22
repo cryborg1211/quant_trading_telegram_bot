@@ -57,7 +57,7 @@ from src.backtest.pipeline import (
     load_corporate_actions,
 )
 from src.models.tabular_ensemble import TabularEnsemble, make_ensemble_oracle
-from src.models.macro_risk_hmm import build_market_proxy_returns
+from src.models.macro_risk_hmm import build_market_proxy_returns, build_regime_observation
 from src.backtest.walk_forward import WalkForwardEngine, WalkForwardConfig
 from src.portfolio.construction import PortfolioConstraints
 from src.execution.vn_cost_model import ExecutionConfig
@@ -352,8 +352,9 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
     p_bull_series = None
     if macro_hmm is not None:
         try:
-            market_ret = build_market_proxy_returns(ds.panel)
-            p_bull_series = macro_hmm.p_bull_series(market_ret, filtered=True)
+            obs = build_regime_observation(
+                ds.panel, use_macro=cfg.use_macro_in_hmm, macro_parquet=cfg.macro_parquet)
+            p_bull_series = macro_hmm.p_bull_series(obs, filtered=True)
             oos_pb = p_bull_series[p_bull_series.index >= pd.Timestamp(cutoff)]
             LOGGER.info("HMM P(Bull) | bull_state=%d  OOS mean=%.3f  OOS min=%.3f",
                         macro_hmm.bull_state, float(oos_pb.mean()), float(oos_pb.min()))

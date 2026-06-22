@@ -172,11 +172,17 @@ class RunConfig:
     # Macro Risk Oracle (HMM soft regime scaling)
     use_macro_hmm: bool = True
     hmm_n_states: int = 2
+    # Macro-Integration P2: blend DXY/USD-VND/SP500 returns into the HMM emission
+    # dims. Auto-falls back to the price-only proxy when the parquet is absent, so
+    # this default is a no-op until the macro crawler (P1) has populated it.
+    use_macro_in_hmm: bool = True
+    macro_parquet: str = "data/macro_daily.parquet"
 
     def __post_init__(self) -> None:
         # Coerce path-like strings to Path so callers can pass either.
         self.bitemporal_duckdb = Path(self.bitemporal_duckdb)
         self.core_duckdb = Path(self.core_duckdb)
+        self.macro_parquet = Path(self.macro_parquet)
 
 
 # Structural feature-recipe version.  Computed automatically from FEATURE_SCHEMA
