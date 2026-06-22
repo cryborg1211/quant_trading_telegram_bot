@@ -266,8 +266,9 @@ stock_price_v3/
 
 | Feature | Folder | Status |
 |---|---|---|
-| V4.1 Structural Debt | `process/features/v4-1-structural-debt/` | in-progress (Phase 1+2 done, Phase 3 next) |
-| Local Dashboard | `process/features/local-dashboard/` | in-progress (P0 planned) |
+| V4.1 Structural Debt | `process/features/v4-1-structural-debt/` | COMPLETE (2026-06-21, all 3 phases) |
+| Local Dashboard | `process/features/local-dashboard/` | in-progress (P0–P2 done; P3 launcher next) |
+| Macro Integration (A/B) | `process/features/macro-integration/` | planned (2026-06-22) |
 
 ## Code-Review-Graph MCP
 
