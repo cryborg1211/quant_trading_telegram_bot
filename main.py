@@ -649,8 +649,14 @@ def _backfill_rl_outcomes(db: Any) -> int:
 # ---------------------------------------------------------------------------
 
 # 21 calendar days guarantees ≥20 trading sessions have elapsed for any VN
-# market calendar, so both the T+3 and T+20 windows are mature before backfill.
+# market calendar, so the T+20 (max-horizon) window is mature before its return
+# is written and the row is flipped terminal (outcome_filled = TRUE).
 _PAPERLOG_MATURE_DAYS: int = 21
+
+# Short (T+3) window maturity gate — rows are SCANNED this early so the T+3
+# return fills progressively instead of starving until the 21-day max horizon.
+# 4 calendar days buffers the 3 trading-day window across a weekend.
+_PAPERLOG_SHORT_MATURE_DAYS: int = 4
 
 
 def _log_sentiment_entry_paperlog(
@@ -746,57 +752,104 @@ def _log_sentiment_entry_paperlog(
 
 
 def _backfill_paperlog_outcomes(db: Any) -> int:
-    """Fill `entry_close` / `ret_3d` / `ret_20d` for matured paper-log rows.
+    """Progressively fill `entry_close` / `ret_3d` / `ret_20d` as windows mature.
 
-    Selects rows where `outcome_filled = FALSE` and `log_date` is old enough
-    (≥21 calendar days) that both the T+3 and T+20 windows have matured, then
-    computes realized returns from the fresh parquet vintage via `price_lookup`.
+    The two horizons mature on different clocks, so the backfill is PROGRESSIVE,
+    not all-at-once (the prior version gated the whole row on the 21-day MAX
+    horizon, starving T+3 metrics for ~18 days):
+
+      * A row is SCANNED as soon as its SHORT (T+3) window matures
+        (`log_date ≤ today − _PAPERLOG_SHORT_MATURE_DAYS`).
+      * `ret_3d` is written the moment T+3 is available; `ret_20d` only once the
+        T+20 window matures (`log_date ≤ today − _PAPERLOG_MATURE_DAYS`).
+      * `outcome_filled` flips TRUE only when the TERMINAL (T+20) return is
+        populated — the row stays pending while only `ret_3d` is known, so a
+        later run completes it.
+
+    Each horizon is written independently and only while currently NULL, so a
+    partially-filled row is never reverted and re-runs are idempotent.
 
     VN price-scale note: `price_lookup.close_on_or_*` return the RAW parquet
     value (thousands of VND). `ret_3d`/`ret_20d` are pure ratios — the scale
     cancels because T0 and TN come from the same shard. Do NOT apply the ×1000
     factor here. `entry_close` stores the raw thousands-VND value for reference.
 
-    Rows whose T0 shard is missing (delisted / not crawled) stay NULL and are
-    retried on the next run. Mirrors `_backfill_rl_outcomes` semantics + lock.
+    Rows whose T0 shard is missing (delisted / not crawled) stay untouched and
+    are retried on the next run. Mirrors `_backfill_rl_outcomes` semantics + lock.
 
     Returns:
-        Number of rows successfully backfilled (outcome_filled flipped TRUE).
+        Number of rows WRITTEN (made progress) this pass — short-only fills
+        included, not just terminal completions.
     """
     pending = db.conn.execute(
         f"""
-        SELECT id, ticker, log_date
+        SELECT id, ticker, log_date, entry_close, ret_3d, ret_20d
         FROM sentiment_entry_paperlog
         WHERE outcome_filled = FALSE
-          AND log_date <= CURRENT_DATE - INTERVAL {_PAPERLOG_MATURE_DAYS} DAY
+          AND log_date <= CURRENT_DATE - INTERVAL {_PAPERLOG_SHORT_MATURE_DAYS} DAY
         """
     ).fetchall()
 
-    backfilled = 0
-    for row_id, ticker, log_date in pending:
-        t0_close = price_lookup.close_on_or_before(ticker, log_date, conn=db.conn)
+    long_cutoff = datetime.now().date() - timedelta(days=_PAPERLOG_MATURE_DAYS)
+    written = short_fills = long_fills = completions = 0
+
+    for row_id, ticker, log_date, entry_close, ret_3d, ret_20d in pending:
+        # T0 entry close — reuse the cached value if already stored, else look
+        # it up once (and cache it on the write below).
+        t0_close = entry_close
+        if t0_close is None:
+            t0_close = price_lookup.close_on_or_before(ticker, log_date, conn=db.conn)
         if t0_close is None or t0_close <= 0:
-            continue
-        t3_close = price_lookup.close_on_or_after(
-            ticker, log_date + timedelta(days=3), conn=db.conn
-        )
-        t20_close = price_lookup.close_on_or_after(
-            ticker, log_date + timedelta(days=20), conn=db.conn
-        )
-        ret_3d = (t3_close - t0_close) / t0_close if t3_close is not None else None
-        ret_20d = (t20_close - t0_close) / t0_close if t20_close is not None else None
+            continue  # T0 shard missing → leave pending, retry next run.
+
+        new_ret_3d, new_ret_20d = ret_3d, ret_20d
+        wrote_short = wrote_long = False
+
+        # SHORT (T+3) — fill as soon as the window is available.
+        if ret_3d is None:
+            t3_close = price_lookup.close_on_or_after(
+                ticker, log_date + timedelta(days=3), conn=db.conn
+            )
+            if t3_close is not None:
+                new_ret_3d = (t3_close - t0_close) / t0_close
+                wrote_short = True
+
+        # LONG (T+20) — only once the max horizon has matured.
+        if ret_20d is None and log_date <= long_cutoff:
+            t20_close = price_lookup.close_on_or_after(
+                ticker, log_date + timedelta(days=20), conn=db.conn
+            )
+            if t20_close is not None:
+                new_ret_20d = (t20_close - t0_close) / t0_close
+                wrote_long = True
+
+        if not (wrote_short or wrote_long):
+            continue  # nothing newly available → retry next run.
+
+        # Terminal only when the T+20 (max-horizon) return is populated.
+        completed = new_ret_20d is not None
 
         with db._audit_lock:
             db.conn.execute(
                 """
                 UPDATE sentiment_entry_paperlog
-                SET entry_close = ?, ret_3d = ?, ret_20d = ?, outcome_filled = TRUE
+                SET entry_close = ?, ret_3d = ?, ret_20d = ?, outcome_filled = ?
                 WHERE id = ?
                 """,
-                [t0_close, ret_3d, ret_20d, row_id],
+                [t0_close, new_ret_3d, new_ret_20d, completed, row_id],
             )
-        backfilled += 1
-    return backfilled
+        written += 1
+        short_fills += int(wrote_short)
+        long_fills += int(wrote_long)
+        completions += int(completed)
+
+    if pending:
+        LOGGER.info(
+            "[paperlog] backfill | scanned=%d written=%d short_fill=%d "
+            "long_fill=%d completed=%d",
+            len(pending), written, short_fills, long_fills, completions,
+        )
+    return written
 
 
 # VN30 constituents — STRICT live universe gate (avoid noisy mid-caps → false

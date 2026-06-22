@@ -243,8 +243,10 @@ def test_backfill_computes_ret_3d_and_ret_20d(fake_db, monkeypatch) -> None:
     assert filled is True
 
 
-def test_backfill_skips_immature_rows(fake_db, monkeypatch) -> None:
-    log_date = date.today() - timedelta(days=5)  # NOT matured (< 21 days)
+def test_backfill_short_horizon_fills_progressively(fake_db, monkeypatch) -> None:
+    # T+3 mature but T+20 NOT (6 days): ret_3d fills now, ret_20d stays NULL,
+    # and the row stays pending until the long window matures.
+    log_date = date.today() - timedelta(days=6)
     _insert_raw_row(fake_db, "FPT", log_date)
 
     monkeypatch.setattr(
@@ -255,11 +257,71 @@ def test_backfill_skips_immature_rows(fake_db, monkeypatch) -> None:
     )
 
     n = main._backfill_paperlog_outcomes(fake_db)
+    assert n == 1
+    entry_close, ret_3d, ret_20d, filled = fake_db.conn.execute(
+        "SELECT entry_close, ret_3d, ret_20d, outcome_filled "
+        "FROM sentiment_entry_paperlog WHERE ticker = 'FPT'"
+    ).fetchone()
+    assert entry_close == pytest.approx(100.0)
+    assert ret_3d == pytest.approx((110.0 - 100.0) / 100.0)
+    assert ret_20d is None          # long horizon not yet mature
+    assert filled is False          # stays pending until T+20
+
+
+def test_backfill_skips_ultra_fresh_row(fake_db, monkeypatch) -> None:
+    # Younger than the short-maturity gate → not even scanned.
+    log_date = date.today() - timedelta(days=2)
+    _insert_raw_row(fake_db, "VCB", log_date)
+
+    monkeypatch.setattr(
+        main.price_lookup, "close_on_or_before", lambda t, d, conn=None: 100.0
+    )
+    monkeypatch.setattr(
+        main.price_lookup, "close_on_or_after", lambda t, d, conn=None: 110.0
+    )
+
+    n = main._backfill_paperlog_outcomes(fake_db)
     assert n == 0
-    filled = fake_db.conn.execute(
-        "SELECT outcome_filled FROM sentiment_entry_paperlog WHERE ticker = 'FPT'"
-    ).fetchone()[0]
+    ret_3d, filled = fake_db.conn.execute(
+        "SELECT ret_3d, outcome_filled FROM sentiment_entry_paperlog WHERE ticker = 'VCB'"
+    ).fetchone()
+    assert ret_3d is None
     assert filled is False
+
+
+def test_backfill_long_horizon_completes_partial_row(fake_db, monkeypatch) -> None:
+    # A row already carrying ret_3d (filled on an earlier run) gets ret_20d and
+    # flips terminal once the max horizon matures. entry_close is REUSED — the
+    # T0 lookup must not run, proven by a poisoned close_on_or_before.
+    log_date = date.today() - timedelta(days=25)
+    with fake_db._audit_lock:
+        fake_db.conn.execute(
+            """
+            INSERT INTO sentiment_entry_paperlog
+            (log_date, ticker, source, p_down_5d, p_side_5d, p_up_5d, decision_5d,
+             entry_close, ret_3d, outcome_filled)
+            VALUES (?, 'HPG', 'daily', 0.6, 0.3, 0.1, 0, 100.0, 0.05, FALSE)
+            """,
+            [log_date.strftime("%Y-%m-%d")],
+        )
+
+    monkeypatch.setattr(
+        main.price_lookup, "close_on_or_before", lambda t, d, conn=None: 999.0  # poisoned
+    )
+    monkeypatch.setattr(
+        main.price_lookup, "close_on_or_after", lambda t, d, conn=None: 120.0
+    )
+
+    n = main._backfill_paperlog_outcomes(fake_db)
+    assert n == 1
+    entry_close, ret_3d, ret_20d, filled = fake_db.conn.execute(
+        "SELECT entry_close, ret_3d, ret_20d, outcome_filled "
+        "FROM sentiment_entry_paperlog WHERE ticker = 'HPG'"
+    ).fetchone()
+    assert entry_close == pytest.approx(100.0)            # cached entry preserved
+    assert ret_3d == pytest.approx(0.05)                  # short return untouched
+    assert ret_20d == pytest.approx((120.0 - 100.0) / 100.0)
+    assert filled is True                                 # terminal now
 
 
 def test_backfill_handles_missing_parquet(fake_db, monkeypatch) -> None:
