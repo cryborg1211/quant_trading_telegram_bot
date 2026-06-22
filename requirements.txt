@@ -12,6 +12,8 @@ scikit-learn==1.8.0            # ensemble meta + CalibratedClassifierCV (estimat
 # ── Storage ──────────────────────────────────────────────────────────────────
 duckdb==1.5.2
 pyarrow==24.0.0
+# ── Macro data source ────────────────────────────────────────────────────────
+yfinance==1.2.2                # DXY / USD-VND / SP500 daily (src/data/macro_crawler.py)
 # ── Models — tabular ensemble base learners ──────────────────────────────────
 # ALL THREE are required.  tabular_ensemble.py imports them behind try/except
 # (graceful degradation), so a MISSING one does NOT error — it silently drops a

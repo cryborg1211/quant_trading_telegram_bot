@@ -1848,6 +1848,7 @@ def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> No
     primed for tomorrow's session:
       1. ingest the day's HOSE OHLCV (market-hour guarded; `force_crawl` bypasses;
          `days_back` limits to the last N days — e.g. 1 for previous-day-only);
+      1b. refresh the daily macro series (DXY / USD-VND / SP500 → macro_daily.parquet);
       2. refresh daily LLM news sentiment;
       3. run the daily inference (T+20 tranche Top-3 broadcast);
       4. alert tranche cohorts whose hold horizon has elapsed (signal ledger).
@@ -1863,6 +1864,15 @@ def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> No
     # 1. EOD OHLCV ingestion (guarded by 15:00 ICT close unless --force-crawl).
     #    days_back=1 (previous-day) keeps the daily refresh incremental.
     crawl_hose(force_crawl=force_crawl, days_back=days_back)
+
+    # 1b. Daily macro refresh (DXY / USD-VND / SP500 → data/macro_daily.parquet).
+    #     Non-critical to the EOD signal path — a feed outage must NOT abort it.
+    with timed_step("Macro daily refresh"):
+        try:
+            from src.data.macro_crawler import update_macro_daily
+            update_macro_daily(days_back=days_back)
+        except Exception:  # noqa: BLE001 — macro is best-effort
+            LOGGER.exception("[macro] daily refresh failed — continuing EOD pipeline.")
 
     # 2. Daily LLM news sentiment.
     with timed_step("Fetching daily LLM sentiment"):
@@ -1937,7 +1947,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--task",
         default="daily_inference",
-        choices=["daily_inference", "crawl_hose", "full_pipeline"],
+        choices=["daily_inference", "crawl_hose", "crawl_macro", "full_pipeline"],
         help="Task to run. daily_inference is the no-crawl live path; "
              "crawl_hose / full_pipeline are the EOD ingestion paths.",
     )
@@ -2039,6 +2049,9 @@ def main() -> None:
     try:
         if task_name == "crawl_hose":
             crawl_hose(force_crawl=args.force_crawl, days_back=args.days_back)
+        elif task_name == "crawl_macro":
+            from src.data.macro_crawler import update_macro_daily
+            update_macro_daily(days_back=args.days_back)
         elif task_name == "full_pipeline":
             full_pipeline(force_crawl=args.force_crawl, days_back=args.days_back)
         else:
