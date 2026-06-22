@@ -14,9 +14,9 @@ Driven by the Architecture & Alpha Bottleneck Audit (2026-06-09) which identifie
 
 | Phase | Name | Status |
 |---|---|---|
-| 1 | `daily_inference` decomposition + report builder extraction | completed |
-| 2 | Automated feature-schema hashing | not-started |
-| 3 | Hub-node test coverage | not-started |
+| 1 | `daily_inference` decomposition + report builder extraction | completed (2026-06-10) |
+| 2 | Automated feature-schema hashing | completed (2026-06-13) |
+| 3 | Hub-node test coverage | completed (2026-06-21) |
 
 ## Key Source Files
 
@@ -24,8 +24,8 @@ Driven by the Architecture & Alpha Bottleneck Audit (2026-06-09) which identifie
 - `src/backtest/pipeline.py` — FEATURE_RECIPE_VERSION, build_features
 - `src/models/tabular_ensemble.py` — TabularEnsemble.fit (untested hub)
 - `src/labels/triple_barrier.py` — triple_barrier_pipeline (untested hub)
-- `src/utils/telegram_bot.py` — build_application (untested hub)
-- `run_backtest.py` — main (untested hub, degree 97)
+- `src/utils/telegram_bot.py` — build_application (untested hub; scoped OUT of Phase 3 — PTB ApplicationBuilder is awkward under the stubbed telegram module)
+- `run_backtest.py` — run_oos / _build_wf_config (hub, degree 97; covered in Phase 3 — there is no standalone `main`)
 
 ## Related Context
 
@@ -34,4 +34,10 @@ Driven by the Architecture & Alpha Bottleneck Audit (2026-06-09) which identifie
 
 ## Current Status
 
-Status: in-progress (Phase 1 completed 2026-06-10, Phase 2 next)
+Status: **COMPLETE (2026-06-21)** — all three phases done.
+
+- Phase 1: `daily_inference` decomposed (271→169 lines) into `_select_candidates` / `_rescue_loop` / `_dispatch_signals`; 10 report builders extracted to `src/reports/builders.py`.
+- Phase 2: feature-schema hashing live (`src/utils/schema_hash.py`); `FEATURE_RECIPE_VERSION` = `v2-sha8:53b5bd85`.
+- Phase 3: hub-node coverage — `VNCostModel.simulate`, `triple_barrier_pipeline`, `TabularEnsemble.fit`, `run_oos`/`_build_wf_config` (95 tests). Plan archived to `completed/`.
+
+Follow-up candidate (not in this program's scope): direct `build_application` coverage, and the other untested hubs / monolithic communities from the 2026-06-09 audit.

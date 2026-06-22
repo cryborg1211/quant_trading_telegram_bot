@@ -229,7 +229,7 @@ stock_price_v3/
 
 **Hub nodes (highest blast radius):**
 1. `build_regime_features` (market_regime.py) — degree 142
-2. `run_backtest.main` — degree 97
+2. `run_backtest.run_oos` / `_build_wf_config` — degree 97 (no standalone `main`; the hub is these two extracted functions)
 3. `daily_inference` (main.py) — degree 84 (active decomposition target)
 4. `triple_barrier_pipeline` — degree 82
 5. `TabularEnsemble.fit` — degree 75
@@ -238,7 +238,7 @@ stock_price_v3/
 **Active refactoring (V4.1 Structural Debt program):**
 - Phase 1 COMPLETE: `daily_inference` decomposed (271→169 lines) into `_select_candidates()`, `_rescue_loop()`, `_dispatch_signals()`. Report builders (10 functions + 11 constants) extracted to `src/reports/builders.py`. 21 new tests added.
 - Phase 2 COMPLETE (2026-06-13): Automated feature-schema hashing live (`src/utils/schema_hash.py`); `FEATURE_RECIPE_VERSION` computed via `compute_feature_schema_hash(...)` (recipe `v2-sha8:53b5bd85`), replacing the manual `"v1.1"` string.
-- Phase 3 NEXT: Hub-node test coverage (`run_backtest.main`, `triple_barrier_pipeline`, `TabularEnsemble.fit`, `VNCostModel.simulate`)
+- Phase 3 COMPLETE (2026-06-21): Hub-node test coverage added for `VNCostModel.simulate`, `triple_barrier_pipeline`, `TabularEnsemble.fit`, `run_backtest.run_oos`/`_build_wf_config` — new `tests/test_vn_cost_model.py`, `test_triple_barrier.py`, `test_tabular_ensemble.py`, `test_run_backtest_wiring.py` (95 tests).
 
 **Deprecated:** `alpha360_generator.py` is gutted in V4.0 — system is purely tabular.
 
