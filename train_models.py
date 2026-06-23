@@ -97,7 +97,7 @@ def train_tabular_ensemble(X: np.ndarray, y: np.ndarray, w: np.ndarray,
     return ensemble
 
 
-def main(cfg: RunConfig) -> None:
+def main(cfg: RunConfig, out_path: Path = CHECKPOINT_PATH) -> None:
     configure_logging()
     np.random.seed(cfg.seed)
     t_start = time.perf_counter()
@@ -163,7 +163,7 @@ def main(cfg: RunConfig) -> None:
             ensembles.append((seed, ens))
 
     # ── 6. Dump the pure training checkpoint ─────────────────────────────────
-    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "schema_version": CHECKPOINT_SCHEMA,
         "ensembles": ensembles,                 # list[(seed, TabularEnsemble)]
@@ -187,11 +187,11 @@ def main(cfg: RunConfig) -> None:
             "has_macro_hmm": macro_hmm is not None,
         },
     }
-    joblib.dump(checkpoint, CHECKPOINT_PATH, compress=3)
-    size_kb = CHECKPOINT_PATH.stat().st_size / 1024
+    joblib.dump(checkpoint, out_path, compress=3)
+    size_kb = out_path.stat().st_size / 1024
 
     LOGGER.info("=" * 78)
-    LOGGER.info(" ✔ TRAINING CHECKPOINT PERSISTED → %s  (%.1f KB)", CHECKPOINT_PATH, size_kb)
+    LOGGER.info(" ✔ TRAINING CHECKPOINT PERSISTED → %s  (%.1f KB)", out_path, size_kb)
     LOGGER.info("   seeds=%s  features=%d  cutoff=%s  HMM=%s",
                 seeds, len(tabular_features), ds.cutoff, macro_hmm is not None)
     LOGGER.info("   Next:  python run_backtest.py   (fast sweep + persist the live-bot payload)")
@@ -199,7 +199,7 @@ def main(cfg: RunConfig) -> None:
     LOGGER.info("=" * 78)
 
 
-def _cli() -> RunConfig:
+def _cli() -> "tuple[RunConfig, Path]":
     p = argparse.ArgumentParser(
         description="V4.0 Heavy Lifter — train the ensemble + HMM and checkpoint them.")
     # Data sources / universe
@@ -216,6 +216,10 @@ def _cli() -> RunConfig:
     p.add_argument("--tb-sl", type=float, default=None, help="stop-loss σ multiple")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--no-hmm", action="store_true", help="disable the Macro Risk HMM Oracle")
+    p.add_argument("--use-macro-features", action="store_true",
+                   help="P3/P4 A/B: add macro returns as GBM features (bumps the recipe hash)")
+    p.add_argument("--out", type=Path, default=CHECKPOINT_PATH,
+                   help="checkpoint output path (default: the standard checkpoint)")
     a = p.parse_args()
 
     cfg = RunConfig()
@@ -230,8 +234,9 @@ def _cli() -> RunConfig:
     if a.tb_sl is not None: cfg.tb_sl = a.tb_sl
     if a.seed is not None: cfg.seed = a.seed
     if a.no_hmm: cfg.use_macro_hmm = False
-    return cfg
+    if a.use_macro_features: cfg.use_macro_features = True
+    return cfg, a.out
 
 
 if __name__ == "__main__":
-    main(_cli())
+    main(*_cli())
