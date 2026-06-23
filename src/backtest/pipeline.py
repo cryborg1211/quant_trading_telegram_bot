@@ -85,6 +85,17 @@ FEATURE_SCHEMA: list[tuple[str, str]] = [
 # categorical to LightGBM/CatBoost at fit time (see TabularEnsemble).
 CATEGORICAL_FEATURES: list[str] = ["market_regime"]
 
+# Macro-Integration P3: market-level macro returns appended as GBM features when
+# RunConfig.use_macro_features is ON. Continuous (Float32), joined by date from
+# data/macro_daily.parquet, inserted BEFORE the trailing categorical(s) so the
+# continuous-then-categorical column order stays load-bearing.
+_MACRO_FEATURE_SCHEMA: list[tuple[str, str]] = [
+    ("sp500_ret",  "Float32"),
+    ("dxy_ret",    "Float32"),
+    ("usdvnd_ret", "Float32"),
+]
+_MACRO_FEATURE_NAMES: list[str] = [name for name, _ in _MACRO_FEATURE_SCHEMA]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Console / logging setup (shared by both entry-points)
@@ -177,6 +188,10 @@ class RunConfig:
     # this default is a no-op until the macro crawler (P1) has populated it.
     use_macro_in_hmm: bool = True
     macro_parquet: str = "data/macro_daily.parquet"
+    # Macro-Integration P3 (A/B variant): add macro returns as GBM features.
+    # Default OFF → FEATURE_RECIPE_VERSION byte-identical to baseline (no-op).
+    # ON bumps the recipe hash (forces retrain) — the P4 A/B variant only.
+    use_macro_features: bool = False
 
     def __post_init__(self) -> None:
         # Coerce path-like strings to Path so callers can pass either.
@@ -192,6 +207,26 @@ class RunConfig:
 FEATURE_RECIPE_VERSION: str = compute_feature_schema_hash(
     FEATURE_SCHEMA, RunConfig().frac_diff_d
 )
+
+
+def effective_feature_schema(use_macro_features: bool) -> list[tuple[str, str]]:
+    """FEATURE_SCHEMA, optionally widened with macro dims before the trailing
+    categorical(s). ``use_macro_features=False`` returns the exact baseline."""
+    if not use_macro_features:
+        return FEATURE_SCHEMA
+    n_cat = len(CATEGORICAL_FEATURES)
+    return FEATURE_SCHEMA[:-n_cat] + _MACRO_FEATURE_SCHEMA + FEATURE_SCHEMA[-n_cat:]
+
+
+def effective_recipe_version(use_macro_features: bool, frac_diff_d: float | None = None) -> str:
+    """Recipe hash for the effective schema.
+
+    ``use_macro_features=False`` is byte-identical to ``FEATURE_RECIPE_VERSION``;
+    ``True`` yields a NEW hash so a macro-trained artifact is rejected by the
+    price-only serve tripwire (serve runs ``build_features`` with the flag OFF).
+    """
+    d = RunConfig().frac_diff_d if frac_diff_d is None else frac_diff_d
+    return compute_feature_schema_hash(effective_feature_schema(use_macro_features), d)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -382,6 +417,28 @@ def load_corporate_actions(cfg: RunConfig) -> list:
 # 2. FEATURE PIPELINE  (Phase 1 + 1.5 + 9) — all leak-free (≤ t only)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _join_macro_features(df: pl.DataFrame, macro_parquet) -> pl.DataFrame:
+    """Left-join the macro returns onto the panel by date.
+
+    Macro is market-level → the same values broadcast across every ticker that
+    day. Raises if the parquet is missing — the flag was explicitly enabled, so
+    the data must exist (run ``python main.py --task crawl_macro`` first).
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    path = Path(str(macro_parquet))
+    if not path.exists():
+        raise FileNotFoundError(
+            f"use_macro_features=True but {path} is missing — run "
+            f"`python main.py --task crawl_macro` first.")
+    macro = pl.read_parquet(path).select(["date", *_MACRO_FEATURE_NAMES])
+    macro = macro.with_columns(
+        pl.col("date").cast(df.schema["date"]),
+        *[pl.col(c).cast(pl.Float32) for c in _MACRO_FEATURE_NAMES],
+    )
+    return df.join(macro, on="date", how="left")
+
+
 def build_features(
     ohlcv: pl.DataFrame, cfg: RunConfig,
 ) -> tuple[pl.DataFrame, list[str], list[str]]:
@@ -445,21 +502,33 @@ def build_features(
     df = build_regime_features(df.lazy()).collect()
 
     # Continuous pool first, THEN the categorical(s) — column order is load-bearing.
-    all_features = original_features + candidate_features + CATEGORICAL_FEATURES
+    continuous = original_features + candidate_features
 
-    assert [name for name, _ in FEATURE_SCHEMA] == all_features, (
+    # Macro-Integration P3 (A/B variant): append market-level macro returns as
+    # continuous GBM features (before the categorical). Flag- AND recipe-hash-
+    # gated, so the default (OFF) path is byte-identical to the baseline recipe.
+    if cfg.use_macro_features:
+        df = _join_macro_features(df, cfg.macro_parquet)
+        continuous = continuous + _MACRO_FEATURE_NAMES
+
+    all_features = continuous + CATEGORICAL_FEATURES
+    expected_schema = effective_feature_schema(cfg.use_macro_features)
+
+    assert [name for name, _ in expected_schema] == all_features, (
         f"FEATURE_SCHEMA names do not match all_features order. "
-        f"Schema: {[n for n,_ in FEATURE_SCHEMA]} | built: {all_features}. "
+        f"Schema: {[n for n,_ in expected_schema]} | built: {all_features}. "
         f"Update FEATURE_SCHEMA to match the hardcoded pool."
     )
 
-    # Drop rows with any NaN in the CONTINUOUS features (FracDiff / MA / factor
-    # warm-up).  market_regime is excluded — it is never null.
-    df = df.drop_nulls(subset=original_features + candidate_features)
+    # Drop rows with any NaN in the CONTINUOUS features (FracDiff / MA / factor /
+    # macro warm-up).  market_regime is excluded — it is never null.
+    df = df.drop_nulls(subset=continuous)
     LOGGER.info(
-        "Features built (V3.1 pool + regime) | total=%d (originals=%d + candidates=%d "
-        "+ categorical=%d)  rows=%d",
+        "Features built (V3.1 pool + regime%s) | total=%d (originals=%d + candidates=%d "
+        "+ macro=%d + categorical=%d)  rows=%d",
+        " + macro" if cfg.use_macro_features else "",
         len(all_features), len(original_features), len(candidate_features),
+        len(_MACRO_FEATURE_NAMES) if cfg.use_macro_features else 0,
         len(CATEGORICAL_FEATURES), df.height)
     return df, all_features, candidate_features
 
@@ -728,6 +797,8 @@ def materialize_dataset(cfg: RunConfig) -> Dataset:
 __all__ = [
     "TRADING_DAYS",
     "FEATURE_RECIPE_VERSION",
+    "effective_feature_schema",
+    "effective_recipe_version",
     "FEATURE_SCHEMA",
     "CATEGORICAL_FEATURES",
     "configure_logging",

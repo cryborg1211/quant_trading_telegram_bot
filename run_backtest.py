@@ -50,6 +50,7 @@ from src.backtest.pipeline import (
     AlignedData,
     TRADING_DAYS,
     FEATURE_RECIPE_VERSION,
+    effective_recipe_version,
     configure_logging,
     phase,
     materialize_dataset,
@@ -541,7 +542,7 @@ def _persist_bot_payload(cfg: RunConfig, tabular_features: list[str], golden: di
             # (All other recipe knobs are fixed literals inside the SHARED
             # build_features, so they cannot drift between train and serve.)
             "frac_diff_d": float(cfg.frac_diff_d),
-            "feature_recipe_version": FEATURE_RECIPE_VERSION,   # structural recipe stamp (tripwire)
+            "feature_recipe_version": effective_recipe_version(cfg.use_macro_features),   # structural recipe stamp (tripwire)
             "categorical_features": list(getattr(best_seed_record["ensemble"], "categorical_features", [])),
             "liquid_top_n": int(cfg.liquid_top_n) if cfg.liquid_top_n else None,
             "sweep_results": [
