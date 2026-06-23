@@ -268,7 +268,7 @@ stock_price_v3/
 |---|---|---|
 | V4.1 Structural Debt | `process/features/v4-1-structural-debt/` | COMPLETE (2026-06-21, all 3 phases) |
 | Local Dashboard | `process/features/local-dashboard/` | in-progress (P0–P2 done; P3 launcher next) |
-| Macro Integration (A/B) | `process/features/macro-integration/` | planned (2026-06-22) |
+| Macro Integration (A/B) | `process/features/macro-integration/` | COMPLETE (2026-06-23): P1 crawler + P2 macro-HMM overlay kept; GBM-macro A/B KILLED (worse DD+PBO), `use_macro_features` default OFF |
 
 ## Code-Review-Graph MCP
 

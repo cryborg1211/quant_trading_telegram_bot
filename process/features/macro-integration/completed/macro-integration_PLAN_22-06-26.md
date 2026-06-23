@@ -3,8 +3,8 @@
 **Plan type:** COMPLEX (4 sequential phases)
 **Feature folder:** `process/features/macro-integration/`
 **Created:** 2026-06-22
-**Status:** READY FOR EXECUTE (phase-by-phase)
-**Branch:** `fix/techdebt-paperlog` (or a new `feat/macro-integration` — confirm at EXECUTE)
+**Status:** COMPLETE (2026-06-23). P1 crawler + P2 macro-HMM overlay shipped & kept; P3 flagged GBM variant (default OFF); P4 A/B → **KILLED** GBM-macro (worse DD+PBO). See `reports/macro-ab-result_23-06-26.md`.
+**Branch:** `feat/macro-integration` (commits `62447b1` plan → `209f9b6` P1 → `82ab926` P2 → `c121d00` P3 → `8fc6dd7` P4)
 
 ---
 
