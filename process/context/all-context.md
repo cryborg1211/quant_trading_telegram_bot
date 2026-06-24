@@ -152,6 +152,7 @@ stock_price_v3/
     models/
       tabular_ensemble.py -- LightGBM + XGBoost + CatBoost → LogisticRegression meta
       macro_risk_hmm.py   -- HMM macro-regime overlay (2-state Gaussian)
+      garch_hmm_regime.py -- GARCH(1,1)+multi-D Gaussian HMM exposure-brake overlay (log-vol space, persistence-capped)
       quant_agent_arbitrator.py -- Gemini-powered sentiment arbitrator + bear veto
       statistical_gates.py -- Statistical pre-filters
       train_mr_lgbm.py    -- Mean-reversion LGBM trainer
@@ -171,11 +172,15 @@ stock_price_v3/
       audit_evaluator.py  -- Trade audit evaluation
       version.py          -- Version string
   tests/                  -- 21 test files, 238 tests (pytest)
+  train_macro_regime.py   -- Train + serialize the GARCH-HMM regime overlay
   scripts/
     migrate_sqlite_to_duckdb.py -- Legacy SQLite → DuckDB migration
     backup_db.sh          -- Database backup script
     cleanup_legacy_rl_stubs.py  -- Dead code cleanup
     analyze_sentiment_paperlog.py -- T+3 / T+20 return stats for sentiment-entry treatment vs control
+    validate_garch_hmm_brake.py -- A/B backtest: T+5 signals with vs without GARCH-HMM exposure brake
+    sweep_garch_hmm_brake.py    -- Robustness grid (min_exposure floor × max_persistence cap)
+    walk_forward_macro_pipeline.py -- Rolling-window regime diagnostic (T+5/T+20, 504d train)
   deploy/
     quant-v6-bot.service  -- Systemd unit for run_bot.py
   doc/
@@ -191,7 +196,7 @@ stock_price_v3/
 
 - **Language:** Python 3.11.9
 - **ML Framework:** Pure-tabular stacking ensemble — LightGBM 4.6 + XGBoost 3.2 + CatBoost 1.2 → CalibratedClassifierCV LogisticRegression meta-learner
-- **Regime Model:** hmmlearn 0.3 (2-state Gaussian HMM macro-regime overlay)
+- **Regime Model:** hmmlearn 0.3 (2-state Gaussian HMM macro-regime overlay); arch 8.0 GARCH(1,1) + multi-D Gaussian HMM exposure-brake overlay (`garch_hmm_regime.py`)
 - **Feature Pipeline:** Polars 1.40 native (fast columnar operations), Pandas 3.0 for legacy compat
 - **Storage:** DuckDB 1.5 + PyArrow 24 Parquet shards (OHLCV ingestion, feature caching)
 - **Numerics:** NumPy 2.3, SciPy 1.16, scikit-learn 1.8
@@ -269,6 +274,7 @@ stock_price_v3/
 | V4.1 Structural Debt | `process/features/v4-1-structural-debt/` | COMPLETE (2026-06-21, all 3 phases) |
 | Local Dashboard | `process/features/local-dashboard/` | in-progress (P0–P2 done; P3 launcher next) |
 | Macro Integration (A/B) | `process/features/macro-integration/` | COMPLETE (2026-06-23): P1 crawler + P2 macro-HMM overlay kept; GBM-macro A/B KILLED (worse DD+PBO), `use_macro_features` default OFF |
+| GARCH-HMM Regime Overlay | `process/features/macro-integration/` | in-progress (2026-06-24): `garch_hmm_regime.py` GARCH(1,1)+5-D HMM exposure brake; log-vol space, persistence-capped 0.96, linear scaler clip(P(Bull),0.2,1.0). OOS T+5 KEEP (loss-mitigation, still −Sharpe); robustness sweep running |
 
 ## Code-Review-Graph MCP
 

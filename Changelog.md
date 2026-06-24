@@ -3,6 +3,32 @@
 All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## 2026-06-24
+
+### GARCH-HMM macro-regime overlay — new risk layer
+- Added `src/models/garch_hmm_regime.py`: GARCH(1,1) conditional volatility
+  fused with a multi-dimensional Gaussian HMM into a leak-free market-exposure
+  scaler. 5-D emission matrix `[market_ret, sp500_ret, dxy_ret, usdvnd_ret,
+  log(σₜ)]` → N-state HMM → `exposure_scaler = clip(P(Bull), 0.2, 1.0)`.
+- **Numerical-stability engineering** (the bits that make it converge on real
+  data):
+  - **Log-vol space** + 99th-pctl winsorize — raw σₜ is right-skewed and
+    random-walks under IGARCH, violating the Gaussian-emission assumption.
+  - **Persistence guard** — post-fit projection caps α+β ≤ 0.96 (escapes the
+    IGARCH trap) by rescaling (α, β) and recomputing ω to preserve the
+    unconditional variance.
+  - Per-column z-score + degenerate-fit rejection + multi-restart EM.
+- Added scripts: `train_macro_regime.py` (fit + serialize weights),
+  `scripts/validate_garch_hmm_brake.py` (A/B vs baseline),
+  `scripts/sweep_garch_hmm_brake.py` (floor × persistence robustness grid),
+  `scripts/walk_forward_macro_pipeline.py` (rolling-window T+5/T+20 diagnostic).
+- **OOS (915d, T+5, seed 0):** Sharpe −0.36 → −0.15, MaxDD −55% → −39%,
+  Return −38% → −15%. Validated **loss-mitigation** (bear OOS window), not
+  standalone alpha. Verdict KEEP; robustness sweep in progress.
+- New dependency: `arch==8.0.0`.
+- Added `README.md` (GitHub-facing) and `tests/test_garch_hmm_regime.py` (26).
+- Test suite: 369 → **395 passed**.
+
 ## 2026-06-21
 
 ### V4.1 Structural Debt — Phase 3: hub-node test coverage
