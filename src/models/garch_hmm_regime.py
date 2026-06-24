@@ -198,9 +198,37 @@ class GarchHmmRegime:
 
         Use as a multiplicative gate on portfolio weights:
             final_weight = raw_weight × exposure_brake
+
+        NOTE: the binary cutoff is a hard cash-out — one bp of P(Bull) flips the
+        whole book to 100% cash, which whipsaws the Sharpe. Prefer
+        `exposure_scaler` for production (continuous downsizing).
         """
         p = self.p_bull_series(obs, filtered=filtered)
         return (p >= threshold).astype(np.float64).rename("exposure")
+
+    def exposure_scaler(
+        self,
+        obs: pd.DataFrame,
+        *,
+        min_exposure: float = 0.2,
+        max_exposure: float = 1.0,
+        filtered: bool = True,
+    ) -> pd.Series:
+        """Continuous exposure scaler ∈ [min_exposure, max_exposure].
+
+            exposure = clip(P(Bull), min_exposure, max_exposure)
+
+        Replaces the binary brake's hard cash-out with smooth de-risking:
+        instead of {0, 1}, the portfolio scales its baseline weights down
+        toward `min_exposure` (a residual floor, never a full liquidation) as
+        P(Bull) falls. Multiply directly into the daily target weights:
+            final_weight = raw_weight × exposure_scaler
+
+        The `min_exposure` floor keeps a toehold during weak-but-not-dead
+        regimes, avoiding the binary brake's Sharpe-destroying 0/100 churn.
+        """
+        p = self.p_bull_series(obs, filtered=filtered)
+        return p.clip(lower=min_exposure, upper=max_exposure).rename("exposure")
 
 
 def train_garch_hmm(
@@ -213,6 +241,7 @@ def train_garch_hmm(
     n_iter: int = 300,
     n_restarts: int = 20,
     scale: float = 100.0,
+    max_persistence: float = 0.96,
 ) -> GarchHmmRegime:
     """Fit GARCH(1,1) on market returns, then N-state HMM on the 5-D emission.
 
@@ -223,6 +252,13 @@ def train_garch_hmm(
     n_states : number of HMM hidden states (3 or 4 recommended).
     scale : legacy param (kept for API compat); actual conditioning uses
             per-column z-score standardization.
+    max_persistence : hard cap on α + β to force MEAN-REVERTING volatility and
+            avoid the IGARCH trap (α + β = 1 → σ_t random-walks → explosive
+            tail). The `arch` library exposes no inequality constraint on the
+            parameter SUM, so when the unconstrained MLE lands above the cap we
+            project (α, β) back onto the α + β = cap line proportionally and
+            recompute ω to PRESERVE the fitted unconditional variance
+            (σ²_unc = ω / (1 − persistence)). Default 0.96.
 
     Returns
     -------
@@ -269,6 +305,26 @@ def train_garch_hmm(
         "mu": float(res.params.get("mu", 0.0)) / 100.0,
     }
     garch_params["omega"] /= 100.0 ** 2
+
+    # ── Persistence cap: project off the IGARCH boundary ─────────────────
+    # arch fits in (×100)² units; ω was already rescaled to decimal² above, so
+    # the unconditional variance is computed in decimal² and stays consistent.
+    raw_persistence = garch_params["alpha"] + garch_params["beta"]
+    if raw_persistence > max_persistence and raw_persistence > 1e-9:
+        # Preserve the fitted unconditional variance, then re-derive ω at the
+        # capped persistence so long-run vol is unchanged but mean-reverting.
+        sigma2_unc = (
+            garch_params["omega"] / (1.0 - raw_persistence)
+            if raw_persistence < 1.0 else float(np.var(market_ret))
+        )
+        scale_factor = max_persistence / raw_persistence
+        garch_params["alpha"] *= scale_factor
+        garch_params["beta"] *= scale_factor
+        garch_params["omega"] = max(sigma2_unc * (1.0 - max_persistence), 1e-12)
+        LOGGER.info(
+            "GARCH persistence capped %.4f → %.4f (IGARCH guard, σ²_unc preserved)",
+            raw_persistence, max_persistence,
+        )
 
     persistence = garch_params["alpha"] + garch_params["beta"]
     LOGGER.info(

@@ -156,6 +156,8 @@ def main(
     macro_parquet: Path = _MACRO_PARQUET,
     n_states: int = 3,
     threshold: float = 0.5,
+    min_exposure: float = 0.2,
+    max_exposure: float = 1.0,
     hold_days: int = 5,
     use_regime_sizing: bool = False,
     seed_idx: int = 0,
@@ -164,8 +166,8 @@ def main(
     t0 = time.perf_counter()
 
     LOGGER.info("=" * 72)
-    LOGGER.info(" GARCH-HMM BRAKE VALIDATION | states=%d  threshold=%.2f  hold=%dd",
-                n_states, threshold, hold_days)
+    LOGGER.info(" GARCH-HMM LINEAR BRAKE VALIDATION | states=%d  exposure=[%.2f, %.2f]  hold=%dd",
+                n_states, min_exposure, max_exposure, hold_days)
     LOGGER.info("=" * 72)
 
     # ── 1. Load checkpoint ───────────────────────────────────────────────
@@ -194,17 +196,19 @@ def main(
 
     garch_hmm = train_garch_hmm(obs_train, n_states=n_states, seed=cfg.seed, n_restarts=12)
 
-    # ── 4. Compute exposure brake over full series ───────────────────────
-    brake = garch_hmm.exposure_brake(obs, threshold=threshold, filtered=True)
-    p_bull = garch_hmm.p_bull_series(obs, filtered=True)
-    oos_brake = brake[brake.index >= cutoff_ts]
-    LOGGER.info("OOS brake: %.0f%% days ON, %.0f%% days OFF",
-                oos_brake.mean() * 100, (1 - oos_brake.mean()) * 100)
-
-    # Convert P(Bull) to a brake-modulated version: when brake=0 → P(Bull)=0
-    # This zeros out target weights inside the walk-forward engine.
-    p_bull_braked = (p_bull * brake).rename("p_bull")
-    # For the "no brake" baseline, pass None (full exposure).
+    # ── 4. Compute LINEAR exposure scaler over full series ───────────────
+    # Continuous braking: exposure = clip(P(Bull), min_exp, max_exp). Replaces
+    # the binary hard cash-out (which stuck ~60% of days at 100% cash and tanked
+    # the Sharpe) with smooth downsizing toward a residual floor.
+    scaler = garch_hmm.exposure_scaler(
+        obs, min_exposure=min_exposure, max_exposure=max_exposure, filtered=True)
+    oos_scaler = scaler[scaler.index >= cutoff_ts]
+    LOGGER.info(
+        "OOS exposure scaler: mean=%.3f  min=%.3f  max=%.3f  (floor=%.2f)",
+        float(oos_scaler.mean()), float(oos_scaler.min()),
+        float(oos_scaler.max()), min_exposure)
+    # The engine multiplies daily target weights by this series. None = baseline.
+    p_bull_scaled = scaler.rename("p_bull")
 
     # ── 5A. Baseline run (no brake) ──────────────────────────────────────
     LOGGER.info("Running BASELINE (no brake)...")
@@ -212,11 +216,12 @@ def main(
         ds.panel, tabular_features, ensemble, corporate_actions, cutoff, cfg,
         p_bull_series=None, hold_days=hold_days, use_regime_sizing=use_regime_sizing)
 
-    # ── 5B. Braked run ───────────────────────────────────────────────────
-    LOGGER.info("Running GARCH-HMM BRAKED (threshold=%.2f)...", threshold)
+    # ── 5B. Linear-braked run ────────────────────────────────────────────
+    LOGGER.info("Running GARCH-HMM LINEAR BRAKE (exposure=[%.2f, %.2f])...",
+                min_exposure, max_exposure)
     eq_brake = _run_wf(
         ds.panel, tabular_features, ensemble, corporate_actions, cutoff, cfg,
-        p_bull_series=p_bull_braked, hold_days=hold_days, use_regime_sizing=use_regime_sizing)
+        p_bull_series=p_bull_scaled, hold_days=hold_days, use_regime_sizing=use_regime_sizing)
 
     # ── 6. Compare ───────────────────────────────────────────────────────
     initial_capital = cfg.initial_capital
@@ -227,7 +232,8 @@ def main(
     sep = "─" * 58
 
     print(f"\n{sep}")
-    print(f"  GARCH-HMM BRAKE A/B  |  states={n_states}  threshold={threshold}  hold={hold_days}d")
+    print(f"  GARCH-HMM LINEAR BRAKE A/B  |  states={n_states}  "
+          f"exposure=[{min_exposure}, {max_exposure}]  hold={hold_days}d")
     print(sep)
     print(header)
     print(sep)
@@ -242,7 +248,8 @@ def main(
 
     # Brake-specific stats
     print(f"  {'OOS Days':<18} {m_base['n_days']:>12d} {m_brake['n_days']:>12d}")
-    print(f"  {'Brake OFF days':<18} {'':>12} {(1 - oos_brake.mean()) * 100:>11.0f}%")
+    print(f"  {'Mean exposure':<18} {'':>12} {oos_scaler.mean():>11.2f}x")
+    print(f"  {'Min exposure':<18} {'':>12} {oos_scaler.min():>11.2f}x")
     print(f"  {'Bull state':<18} {'':>12} {garch_hmm.bull_state:>12d}")
     persistence = garch_hmm.garch_params["alpha"] + garch_hmm.garch_params["beta"]
     print(f"  {'GARCH persist.':<18} {'':>12} {persistence:>11.4f}")
@@ -281,7 +288,9 @@ def main(
         "verdict": verdict,
         "garch_params": garch_hmm.garch_params,
         "n_states": n_states,
-        "threshold": threshold,
+        "min_exposure": min_exposure,
+        "max_exposure": max_exposure,
+        "mean_oos_exposure": float(oos_scaler.mean()),
     }
 
 
@@ -292,7 +301,11 @@ def _cli() -> dict:
     p.add_argument("--macro-parquet", type=Path, default=_MACRO_PARQUET)
     p.add_argument("--n-states", type=int, default=3)
     p.add_argument("--threshold", type=float, default=0.5,
-                   help="P(Bull) threshold for exposure brake (default: 0.5)")
+                   help="(legacy binary brake) P(Bull) cutoff — unused by linear scaler")
+    p.add_argument("--min-exposure", type=float, default=0.2,
+                   help="exposure floor for linear brake clip (default: 0.2)")
+    p.add_argument("--max-exposure", type=float, default=1.0,
+                   help="exposure cap for linear brake clip (default: 1.0)")
     p.add_argument("--hold-days", type=int, default=5,
                    help="Tranche hold period (default: 5 for T+5)")
     p.add_argument("--seed-idx", type=int, default=0,
@@ -305,6 +318,8 @@ def _cli() -> dict:
         "macro_parquet": a.macro_parquet,
         "n_states": a.n_states,
         "threshold": a.threshold,
+        "min_exposure": a.min_exposure,
+        "max_exposure": a.max_exposure,
         "hold_days": a.hold_days,
         "use_regime_sizing": a.regime_sizing,
         "seed_idx": a.seed_idx,
