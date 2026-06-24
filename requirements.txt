@@ -22,6 +22,7 @@ lightgbm==4.6.0
 xgboost==3.2.0
 catboost==1.2.10
 hmmlearn==0.3.3                # Macro Risk Oracle — 2-state Gaussian HMM regime overlay
+arch==8.0.0                    # GARCH(1,1) conditional volatility (garch_hmm_regime.py)
 # ── Telegram bot + config ────────────────────────────────────────────────────
 python-telegram-bot==22.7      # run_bot.py / telegram_bot.py (HARD import — bot won't start without it)
 python-dotenv==1.2.2
