@@ -33,13 +33,18 @@ import time
 from datetime import date
 from pathlib import Path
 
-import joblib
-import numpy as np
-import pandas as pd
-import polars as pl
+# ── Ensure repo root on sys.path (avoid 'No module named src') ───────────
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import joblib  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import polars as pl  # noqa: E402
 
 # ── Project imports ──────────────────────────────────────────────────────
-from src.backtest.pipeline import (
+from src.backtest.pipeline import (  # noqa: E402
     RunConfig,
     TRADING_DAYS,
     configure_logging,
