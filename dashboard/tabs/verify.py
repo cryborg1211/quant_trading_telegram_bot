@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+from dashboard.components.report_card import render_report_html
 from dashboard.utils.headless import LOCAL_USER_ID, verify_single_ticker_headless
 from dashboard.utils.thread_runner import run_in_thread
 
@@ -53,8 +54,7 @@ def render() -> None:
 
     html = st.session_state.get(result_key)
     if html:
-        st.subheader(f"Kết quả cho {ticker}")
-        st.markdown(html, unsafe_allow_html=True)
+        render_report_html(html, title=f"Kết quả cho {ticker}")
     elif html == "":
         st.warning(f"Không có kết quả cho {ticker} (mã ngoài vũ trụ giao dịch?).")
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+from dashboard.components.report_card import render_report_html
 from dashboard.utils.headless import (
     LOCAL_USER_ID,
     inference_for_holdings_headless,
@@ -42,4 +43,4 @@ def render() -> None:
         st.info("Không có đánh giá nào cho danh mục hiện tại.")
         return
 
-    st.markdown(html, unsafe_allow_html=True)
+    render_report_html(html)

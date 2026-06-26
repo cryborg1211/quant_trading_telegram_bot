@@ -117,6 +117,31 @@ _GLOBAL_CSS = f"""
 
   /* dividers */
   hr {{ border-color: {BORDER}; }}
+
+  /* serve-path report card (BÁN / Verify / Audit Telegram-HTML adapter) */
+  .qv-report {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 14px;
+    padding: 16px 20px;
+    color: {TEXT};
+    font-size: 0.92rem;
+    line-height: 1.6;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+  }}
+  .qv-report-title {{
+    font-size: 1.05rem; font-weight: 800; color: {TEXT}; margin-bottom: 10px;
+  }}
+  .qv-report b {{ color: {TEXT}; font-weight: 700; }}
+  .qv-report a {{ color: {ACCENT}; text-decoration: none; }}
+  .qv-report a:hover {{ text-decoration: underline; }}
+  .qv-report code {{
+    background: {SURFACE_2}; color: {AMBER}; padding: 1px 6px;
+    border-radius: 6px; font-size: 0.85em;
+  }}
+  .qv-report hr {{
+    border: none; border-top: 1px solid {BORDER}; margin: 12px 0;
+  }}
 </style>
 """
 

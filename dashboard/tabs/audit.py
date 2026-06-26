@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+from dashboard.components.report_card import render_report_html
 from dashboard.utils.headless import LOCAL_USER_ID
 
 _WINDOW_DAYS = {"Tuần": 7, "Tháng": 30}
@@ -38,7 +39,7 @@ def render() -> None:
     days = _WINDOW_DAYS[window]
 
     html = _cached_postmortem(LOCAL_USER_ID, days)
-    st.markdown(html, unsafe_allow_html=True)
+    render_report_html(html)
 
     st.info(
         "Audit chỉ hiển thị dữ liệu từ phiên giao dịch dashboard — các lệnh "
