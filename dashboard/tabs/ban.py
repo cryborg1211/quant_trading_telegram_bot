@@ -41,7 +41,7 @@ def render() -> None:
     ):
         return
 
-    if st.button("🔄 Làm mới", key="ban_refresh"):
+    if st.button("🔄 Làm mới", key="ban_refresh", type="tertiary"):
         clear_cached(inference_for_holdings_headless, tickers)
         st.rerun()
 

@@ -58,7 +58,7 @@ def render() -> None:
     elif html == "":
         st.warning(f"Không có kết quả cho {ticker} (mã ngoài vũ trụ giao dịch?).")
 
-    if st.button("📤 Gửi Telegram", key="verify_push"):
+    if st.button("📤 Gửi Telegram", key="verify_push", type="tertiary"):
         push_html = st.session_state.get(result_key)
         if not push_html:
             st.warning("Chạy kiểm tra trước khi gửi.")

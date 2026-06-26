@@ -99,7 +99,7 @@ def render() -> None:
     holdings = _cached_holdings(LOCAL_USER_ID)
     if not holdings:
         st.info("Chưa có vị thế nào trong danh mục.")
-        if st.button("🔄 Chạy lại", key="giu_rerun"):
+        if st.button("🔄 Chạy lại", key="giu_rerun", type="tertiary"):
             _cached_holdings.clear()
             st.rerun()
         return

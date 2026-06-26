@@ -60,7 +60,7 @@ def render() -> None:
         render_skeleton_cards(3)
         return
 
-    if st.button("🔄 Làm mới", key="mua_refresh"):
+    if st.button("🔄 Làm mới", key="mua_refresh", type="tertiary"):
         clear_cached(daily_inference_headless, horizon)
         st.rerun()
 

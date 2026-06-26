@@ -119,6 +119,20 @@ _GLOBAL_CSS = f"""
     filter: none;
   }}
 
+  /* tertiary buttons → neutral ghost (non-destructive secondary actions) */
+  .stButton > button[kind="tertiary"] {{
+    background: transparent;
+    color: {MUTED};
+    border: 1px solid {BORDER};
+    font-weight: 600;
+  }}
+  .stButton > button[kind="tertiary"]:hover {{
+    color: {TEXT};
+    background: {SURFACE_2};
+    border-color: {MUTED};
+    filter: none;
+  }}
+
   /* sidebar */
   section[data-testid="stSidebar"] {{
     background: {SURFACE};

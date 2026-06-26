@@ -47,7 +47,7 @@ def render() -> None:
     ):
         return
 
-    if st.button("🔄 Làm mới", key="audit_refresh"):
+    if st.button("🔄 Làm mới", key="audit_refresh", type="tertiary"):
         _cached_postmortem.clear()
         st.rerun()
 

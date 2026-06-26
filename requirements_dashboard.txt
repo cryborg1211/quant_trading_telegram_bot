@@ -5,4 +5,5 @@
 # Packages already pinned in requirements.txt (python-dotenv, pandas, duckdb,
 # google-genai, etc.) are intentionally NOT duplicated here.
 
-streamlit>=1.35
+# 1.39+: st.button(type="tertiary") used for neutral ghost buttons in the theme.
+streamlit>=1.39
