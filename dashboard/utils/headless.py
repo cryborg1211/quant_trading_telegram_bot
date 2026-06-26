@@ -124,6 +124,31 @@ def verify_single_ticker_headless(ticker: str) -> str:
 # Portfolio raw-SQL helpers (mirror the bot's /add, /remove, list)
 # --------------------------------------------------------------------------- #
 
+def _parse_price(value: object) -> float:
+    """Coerce a stored price to float, tolerating legacy formatted strings.
+
+    The ``portfolio`` table is shared with the bot era, where some rows stored
+    the entry price as display TEXT (e.g. ``'47,800 VND'`` / ``'47.800 ₫'``)
+    rather than a number. Strip thousands separators + any currency/letters so
+    both clean floats and formatted strings parse to a usable number; returns
+    0.0 on anything unparseable so a single bad row never crashes the GIỮ tab.
+    """
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    import re  # noqa: PLC0415 — local; stays out of the hot import path
+
+    # Drop thousands commas first, then keep only digits / dot / minus.
+    cleaned = re.sub(r"[^0-9.\-]", "", str(value).replace(",", ""))
+    if cleaned in ("", "-", ".", "-."):
+        return 0.0
+    try:
+        return float(cleaned)
+    except ValueError:
+        return 0.0
+
+
 def portfolio_list(user_id: str) -> list[dict]:
     """Return this user's holdings as row dicts (empty list on any failure)."""
     try:
@@ -142,7 +167,7 @@ def portfolio_list(user_id: str) -> list[dict]:
         )
         return []
     return [
-        {"ticker": r[0], "volume": r[1], "price": r[2], "added_at": r[3]}
+        {"ticker": r[0], "volume": r[1], "price": _parse_price(r[2]), "added_at": r[3]}
         for r in rows
     ]
 
