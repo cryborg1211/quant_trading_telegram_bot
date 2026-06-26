@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard",
+      "runtimeExecutable": "C:\\Users\\caokh\\AppData\\Local\\Programs\\Python\\Python311\\python.exe",
+      "runtimeArgs": ["-m", "streamlit", "run", "dashboard/app.py", "--server.headless", "true", "--server.port", "8501"],
+      "port": 8501
+    }
+  ]
+}
