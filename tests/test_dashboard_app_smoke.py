@@ -88,7 +88,8 @@ def test_app_boots_six_tabs_clean() -> None:
         f"tab error boundary fired: {_tab_boundary_errors(at)}"
     )
     # Main shell + MUA seam actually executed (empty signals → info message).
-    assert any(t.value == "Quant V4 Dashboard" for t in at.title)
+    # Title now renders via the styled theme.page_header (st.markdown), not st.title.
+    assert any("Quant V4 Dashboard" in m.value for m in at.markdown)
     assert any("Không có tín hiệu" in i.value for i in at.info)
 
 

@@ -35,8 +35,13 @@ from dashboard.tabs import (  # noqa: E402 - import after load_dotenv by design
     settings,
     verify,
 )
+from dashboard import theme  # noqa: E402
 
-st.set_page_config(page_title="Quant V4 Dashboard", layout="wide")
+st.set_page_config(
+    page_title="Quant V4 Dashboard",
+    page_icon="📈",
+    layout="wide",
+)
 
 # Tab order matches the approved design.
 _TAB_LABELS = ["MUA", "GIỮ", "BÁN", "Verify", "Audit", "Settings"]
@@ -65,10 +70,19 @@ def _env_dot(var: str, label: str) -> str:
 def _render_sidebar() -> None:
     """Render the sidebar nav legend + real status dots."""
     with st.sidebar:
-        st.title("Quant V4")
+        st.markdown(
+            f'<div style="font-size:1.5rem;font-weight:800;color:{theme.ACCENT};'
+            'letter-spacing:-0.02em;">📈 Quant V4</div>',
+            unsafe_allow_html=True,
+        )
         st.caption("Bảng điều khiển nội bộ")
 
-        st.subheader("Trạng thái")
+        st.markdown(
+            f'<div style="color:{theme.MUTED};font-size:0.8rem;font-weight:700;'
+            'text-transform:uppercase;letter-spacing:0.05em;margin:12px 0 4px;">'
+            'Trạng thái</div>',
+            unsafe_allow_html=True,
+        )
         st.markdown(_data_freshness_dot())
         st.markdown(_env_dot("GEMINI_API_KEY", "Gemini"))
         st.markdown(_env_dot("TELEGRAM_BOT_TOKEN", "Telegram"))
@@ -79,8 +93,12 @@ def _render_sidebar() -> None:
 
 def main() -> None:
     """Build the dashboard shell and dispatch to each tab."""
+    theme.inject_global_css()
     _render_sidebar()
-    st.title("Quant V4 Dashboard")
+    theme.page_header(
+        "Quant V4 Dashboard",
+        "Tín hiệu giao dịch T+5 / T+20 · phân tích cục bộ",
+    )
 
     tab_mua, tab_giu, tab_ban, tab_verify, tab_audit, tab_settings = st.tabs(
         _TAB_LABELS

@@ -14,22 +14,15 @@ from __future__ import annotations
 import streamlit as st
 
 from dashboard.components.signal_bar import render_signal_bar
-
-# Action badge colors keyed by action label.
-_ACTION_COLORS = {
-    "MUA": "#1f9d55",
-    "GIỮ": "#d69e2e",
-    "GIU": "#d69e2e",
-    "BÁN": "#e53e3e",
-    "BAN": "#e53e3e",
-}
+from dashboard.theme import action_color
 
 
 def _action_badge(action: str) -> str:
-    color = _ACTION_COLORS.get(action.upper(), "#4a5568")
+    color = action_color(action)
     return (
-        f'<span style="background:{color};color:#fff;padding:2px 10px;'
-        f'border-radius:12px;font-weight:700;font-size:13px;">{action}</span>'
+        f'<span style="background:{color};color:#06120e;padding:3px 12px;'
+        f'border-radius:999px;font-weight:800;font-size:12px;'
+        f'letter-spacing:0.02em;">{action}</span>'
     )
 
 

@@ -12,10 +12,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-# Segment colors (up = green, side = amber, down = red).
-_UP_COLOR = "#1f9d55"
-_SIDE_COLOR = "#d69e2e"
-_DOWN_COLOR = "#e53e3e"
+from dashboard.theme import ACCENT as _UP_COLOR, AMBER as _SIDE_COLOR, DANGER as _DOWN_COLOR
 
 
 def _normalize(prob_up: float, prob_side: float, prob_down: float) -> tuple[float, float, float]:
