@@ -194,6 +194,19 @@ def portfolio_add(user_id: str, ticker: str, volume: int, price: float) -> None:
             "VALUES (?, ?, ?, ?, ?)",
             [user_id, ticker, int(volume), float(price), datetime.now()],
         )
+        # Audit-trail the /add so the post-mortem Audit tab can grade the
+        # position NET of round-trip cost (mirrors the bot's add path). Best-
+        # effort — a logging failure must never fail the portfolio write.
+        try:
+            DuckDBEngine().log_user_action(
+                user_id, "add", ticker, details=f"vol={int(volume)};price={float(price)}"
+            )
+        except Exception:  # noqa: BLE001 — audit logging is best-effort
+            import logging  # noqa: PLC0415
+
+            logging.getLogger(__name__).warning(
+                "portfolio_add audit log failed for %s", ticker, exc_info=True
+            )
 
 
 def portfolio_remove(user_id: str, ticker: str) -> None:

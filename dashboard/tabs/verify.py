@@ -4,8 +4,9 @@ Enter a ticker, click "Kiểm tra" to run ``verify_single_ticker_headless``
 (→ ``main.verify_single_ticker``, HEADLESS-OK) on a background thread. The
 result HTML renders via ``st.markdown(unsafe_allow_html=True)`` and is cached in
 session_state so the "Gửi Telegram" button can push it send-only via
-``TelegramBot().send_text_alert`` (NEVER ``build_application`` — no polling). A
-successful push logs a ``verify`` audit row under the local user_id.
+``TelegramBot().send_text_alert`` (NEVER ``build_application`` — no polling). The
+verify RUN logs a ``verify`` audit row under the local user_id (best-effort) so
+the post-mortem Audit tab sees every check, not only the rare Telegram push.
 """
 
 from __future__ import annotations
@@ -39,6 +40,16 @@ def render() -> None:
             ttl=120,
         )
         st.session_state[result_key] = html or ""
+        # Audit-log the verify at the moment it RUNS (not only on Telegram push)
+        # so the post-mortem Audit tab reflects every recommendation the user
+        # actually pulled. Best-effort — a logging failure must not break the tab.
+        if html:
+            try:
+                from src.data.db_engine import DuckDBEngine  # noqa: PLC0415
+
+                DuckDBEngine().log_user_action(LOCAL_USER_ID, "verify", ticker)
+            except Exception:  # noqa: BLE001 — audit logging is best-effort
+                pass
 
     html = st.session_state.get(result_key)
     if html:
@@ -57,11 +68,7 @@ def render() -> None:
 
             TelegramBot().send_text_alert(push_html, label=ticker)
             st.success("Đã gửi.")
-            try:
-                from src.data.db_engine import DuckDBEngine  # noqa: PLC0415
-
-                DuckDBEngine().log_user_action(LOCAL_USER_ID, "verify", ticker)
-            except Exception:  # noqa: BLE001 — audit logging is best-effort
-                st.caption("(Đã gửi nhưng ghi nhật ký audit thất bại.)")
+            # Note: the audit row is written on the verify RUN above, not here —
+            # a Telegram push is optional and must not be the only audit trigger.
         except Exception as exc:  # noqa: BLE001 — surface send failure, no retry
             st.error(f"Gửi thất bại: {exc}")

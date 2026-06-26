@@ -151,10 +151,11 @@ def _fetch_audited_tickers(user_id: str, days: int, db: Any) -> list[dict[str, A
 def _get_t0_price(ticker: str, ts: Any, db: Any) -> float | None:
     """Close price at-or-just-before the user's query timestamp.
 
-    Uses `stock_ohlcv`: the most recent completed daily candle BEFORE OR ON
-    the query date is the closest defensible T0 reference (we cannot use
-    the same-day close if the query happened mid-session — that close
-    didn't exist yet).
+    Uses the fresh-parquet `price_lookup.close_on_or_before` (legacy
+    `stock_ohlcv` table retired): the most recent completed daily candle
+    BEFORE OR ON the query date is the closest defensible T0 reference (we
+    cannot use the same-day close if the query happened mid-session — that
+    close didn't exist yet).
     """
     if isinstance(ts, datetime):
         ts_date = ts.date()
