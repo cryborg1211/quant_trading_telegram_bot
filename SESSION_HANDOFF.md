@@ -1,11 +1,10 @@
 # SESSION HANDOFF — 2026-06-26 (Quant Engine V4)
 
 ## STATE NOW
-- Branch **`main`** @ `ff15746`, **pushed to origin** (github.com/cryborg1211/quant_trading_telegram_bot).
-- Working tree: **UNCOMMITTED** = `scripts/benchmark_defense_layers.py` (new, import-verified, NOT yet committed — running from working tree).
-- **Benchmark `btb0vjrxf` DIED** (laptop power-off again). 3/7 arms cached + durable in
-  `process/features/macro-integration/reports/defense_benchmark_s0_h5.json`. **Resume to finish.**
-- Multi-seed brake sweep ABANDONED: seed-1 has 2/9 cells on disk (`garch_hmm_brake_sweep_s1_h5.csv`), seeds 2–3 not started. Killed on purpose (laptop too flaky for 3.5hr).
+- Branch **`main`** @ `f1cf636`, **pushed to origin** (github.com/cryborg1211/quant_trading_telegram_bot).
+- Working tree clean (handoff edits pending commit).
+- **Benchmark COMPLETE** (`f1cf636`): all 7 defense arms scored → `regime+garch` WINS. See below.
+- Multi-seed brake sweep PENDING: seed-1 has 2/9 cells on disk (`garch_hmm_brake_sweep_s1_h5.csv`), seeds 2–3 not started. Deferred (laptop too flaky for 3.5hr; resume per-seed when on a stable box).
 
 ## DONE THIS SESSION (committed + pushed)
 GARCH-HMM regime overlay — full arc, all on main:
@@ -21,20 +20,31 @@ GARCH-HMM regime overlay — full arc, all on main:
 ## ⚠️ GARCH-HMM IS NOT WIRED TO SERVE
 `garch_hmm` appears in only 6 files: the model, trainer, tests, 3 scripts. **ZERO refs in `main.py` / `dashboard/` / `src/bot/` / `src/trading/`.** It is pure research. Using it live needs real integration (load weights, apply scaler in `main._dispatch_signals`, config flag + kill-switch, AND resolve triple-regime compounding with the already-ON `regime_policy`). Recommendation: do NOT default-on. Single-seed, bear-OOS, loss-mitigation only, system is paper-only anyway.
 
-## BENCHMARK — partial result (3/7 arms, resume to finish)
-`scripts/benchmark_defense_layers.py` — head-to-head of defensive overlays on ONE walk-forward (seed 0), + flat-leverage TIMING control per soft arm. Pure evaluation → pick ONE fixed winner (NOT a dynamic selector = lookahead).
-Cached so far:
-- `baseline`        Sharpe −0.364  MaxDD −54.99%  Ret −38.5%
-- `regime_policy`   Sharpe **−0.290**  MaxDD −38.8%  Ret −22.2%  ← best so far (= current serve default)
-- `macro_hmm`       Sharpe −0.779  ← **HURTS** (worse than baseline; macro 2-state HMM is bad here)
-- pending: `garch_hmm`, `macro+garch_min`, `regime+garch`, `all_min` + controls.
-Note: in the floor-sweep, garch_hmm@floor0.2 was Sharpe −0.137 (beats regime_policy −0.290) — so garch may win once it finishes. CONFIRM by resuming.
-**Resume:** `python scripts/benchmark_defense_layers.py --floor 0.2 --seed-idx 0` (skips the 3 cached arms, runs the rest, prints ranked table + BEST).
+## BENCHMARK — COMPLETE (committed `f1cf636`, pushed)
+`scripts/benchmark_defense_layers.py` — head-to-head of defensive overlays on ONE walk-forward (seed 0) + flat-leverage TIMING control per soft arm. Result json: `process/features/macro-integration/reports/defense_benchmark_s0_h5.json`.
+
+| arm | Sharpe | ΔSh | MaxDD% | Ret% | timing_α |
+|---|---|---|---|---|---|
+| baseline | −0.364 | +0.000 | −54.99 | −38.50 | — |
+| regime_policy | −0.290 | +0.074 | −38.80 | −22.18 | — |
+| macro_hmm | −0.779 | −0.416 | −51.00 | −43.31 | −0.413 |
+| garch_hmm | −0.147 | +0.216 | −38.30 | −14.54 | +0.220 |
+| macro+garch_min | −0.548 | −0.185 | −36.58 | −25.37 | −0.183 |
+| **regime+garch** | **+0.005** | **+0.368** | **−25.64** | **−2.49** | **+0.372** |
+| all_min | −0.287 | +0.076 | −22.10 | −10.59 | +0.078 |
+
+**VERDICT — `regime+garch` WINS.** regime_policy (price micro-regime) + GARCH-HMM (macro breadth) are COMPLEMENTARY — stacked they reach ~breakeven from −0.364 baseline, biggest improvement, +0.37 timing. **macro_hmm HURTS (−0.78) — kill it; it poisons every min-combine it's in.** Fixed combine wins; NO dynamic selector (=lookahead). Still single-seed, bear OOS, breakeven ≠ alpha.
+
+## DECISION — do we use it?
+**Staged yes, not default-on today.**
+- `regime_policy`: KEEP (already serve-default-ON).
+- **GARCH-HMM brake: WIRE as opt-in, default-OFF.** It's the validated best partner. Promote to default ONLY after seeds 1–3 confirm (multi-seed still pending). Pair WITH regime sizing, do not replace it.
+- `macro_hmm`: **KILL from serve** (hurts).
 
 ## NEXT
-1. **Resume the benchmark** (one command above, ~50min left). Get the ranked table → decide the single defense layer (or min-combine) to deploy as a FIXED default.
-2. **Commit `benchmark_defense_layers.py`** once the run confirms end-to-end (+ its result json).
-3. THEN (user's stated next task): **audit the audit system.**
+1. (user's stated next task) **audit the audit system** — pointers below.
+2. (deferred) **Wire GARCH-HMM into serve** as default-OFF opt-in: load `models/saved/garch_hmm_v4_weights.joblib`, apply `exposure_scaler(latest_macro_obs)` as a weight multiplier in `main._dispatch_signals` alongside the existing regime sizing; add `CONFIG.trading.garch_brake_enabled` flag + settings.json kill-switch. Needs a proper RIPER-5 plan (interaction w/ regime sizing).
+3. (deferred) **Multi-seed confirm** (seeds 1–3) before flipping garch default-on. seed-1 has 2/9 cells cached. `python scripts/sweep_garch_hmm_brake.py --seed-idx 1` (resumes).
 
 ## AUDIT SYSTEM (user auditing next — pointers)
 - `src/utils/audit_evaluator.py` → `run_post_mortem` — trade audit / post-mortem evaluation.
