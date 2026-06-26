@@ -91,26 +91,31 @@ def run_post_mortem(user_id: str, days: int) -> str:
         return f"❌ <b>Lỗi DB:</b> <code>{html.escape(str(exc))}</code>"
 
     if not audited:
-        return (
+        user_part = (
             f"<b>📊 BÁO CÁO HẬU KIỂM ({days} NGÀY QUA)</b>\n"
             f"══════════════════════\n\n"
             f"<i>Không có lệnh nào trong {days} ngày qua có thể hậu kiểm.</i>\n"
             f"<i>Chỉ các lệnh /verify và /add (có mã cụ thể) được tính.</i>"
         )
-
-    # Cap so the report doesn't bloat.
-    if len(audited) > _MAX_TICKERS_PER_REPORT:
-        truncated = True
-        audited = audited[:_MAX_TICKERS_PER_REPORT]
     else:
-        truncated = False
+        # Cap so the report doesn't bloat.
+        if len(audited) > _MAX_TICKERS_PER_REPORT:
+            truncated = True
+            audited = audited[:_MAX_TICKERS_PER_REPORT]
+        else:
+            truncated = False
 
-    # 2. Build per-ticker evaluation rows
-    rows: list[dict[str, Any]] = []
-    for item in audited:
-        rows.append(_evaluate_one_ticker(item, days, db))
+        # 2. Build per-ticker evaluation rows
+        rows: list[dict[str, Any]] = []
+        for item in audited:
+            rows.append(_evaluate_one_ticker(item, days, db))
+        user_part = _build_audit_report(rows, days, truncated=truncated)
 
-    return _build_audit_report(rows, days, truncated=truncated)
+    # 3. Engine-picks section — grade the bot's OWN dispatched recommendations
+    # from the global `dispatched_signals` ledger (no user_id; cron-written).
+    # Read-only; never raises (degrades to an empty string → section omitted).
+    engine_part = _build_engine_section(days, db)
+    return f"{user_part}\n\n{engine_part}" if engine_part else user_part
 
 
 # ─── DB helpers ───────────────────────────────────────────────────────────
@@ -317,6 +322,124 @@ def _summarize_hit_rate(rows: list[dict[str, Any]]) -> str | None:
         f"(🟢 {up} / 🔴 {down} / 🟡 {flat} đi ngang, {len(priced)} mã)\n"
         f"<b>Lợi nhuận TB:</b> {avg:+.1f}%"
     )
+
+
+# ─── Engine-picks section (dispatched_signals ledger, read-only) ───────────
+
+def _fetch_dispatched_signals(days: int, db: Any) -> list[tuple]:
+    """Engine picks dispatched within the window, newest first.
+
+    Reads the GLOBAL `dispatched_signals` ledger (no user_id — the bot's own
+    recommendations, written by the cron broadcast dispatch). Returns raw rows
+    `(ticker, dispatch_date, horizon, hold_days, status, closed_date)`. Returns
+    an empty list if the table does not exist yet (cron never ran) or on any
+    read error — this section must never break the user report.
+    """
+    since = (datetime.now() - timedelta(days=days)).date()
+    sql = (
+        "SELECT ticker, dispatch_date, horizon, hold_days, status, closed_date "
+        "FROM dispatched_signals "
+        "WHERE dispatch_date >= ? "
+        "ORDER BY dispatch_date DESC, ticker"
+    )
+    try:
+        return db.conn.execute(sql, [since]).fetchall()
+    except Exception as exc:  # noqa: BLE001 — table may not exist; degrade silently
+        LOGGER.info("[/audit] dispatched_signals read skipped: %s", exc)
+        return []
+
+
+def _evaluate_dispatched_signal(row: tuple, db: Any) -> dict[str, Any]:
+    """Grade one ledger pick entry→exit, NET of round-trip cost. Never raises.
+
+    Exit price is the close on the `hold_days`-th trading session after
+    dispatch once that many sessions have elapsed (matured); otherwise the
+    latest close (provisional — position still inside its hold window).
+    """
+    ticker = str(row[0]).upper().strip()
+    d0 = row[1]
+    horizon = row[2]
+    hold_days = int(row[3] or 0)
+
+    try:
+        t0 = price_lookup.close_on_or_before(ticker, d0, conn=db.conn)
+        sessions = price_lookup.trading_dates_after(d0, conn=db.conn)
+        if hold_days > 0 and len(sessions) >= hold_days:
+            exit_date = sessions[hold_days - 1]
+            t_exit = price_lookup.close_on_or_before(ticker, exit_date, conn=db.conn)
+            matured = True
+        else:
+            t_exit = price_lookup.latest_close(ticker, conn=db.conn)
+            matured = False
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("[/audit] ledger %s price fetch failed: %s", ticker, exc)
+        return {"ticker": ticker, "dispatch_date": d0, "error": f"price lookup: {exc}"}
+
+    if t0 is None or t_exit is None:
+        return {"ticker": ticker, "dispatch_date": d0, "error": "thiếu giá lịch sử trong DB"}
+    if t0 <= 0:
+        return {"ticker": ticker, "dispatch_date": d0, "error": f"giá T0 không hợp lệ ({t0})"}
+
+    pct = (t_exit - t0) / t0 * 100.0 - _VN_ROUND_TRIP_COST_PCT
+    return {
+        "ticker": ticker,
+        "dispatch_date": d0,
+        "horizon": int(horizon) if horizon is not None else None,
+        "pct": pct,
+        "matured": matured,
+    }
+
+
+def _build_engine_section(days: int, db: Any) -> str:
+    """Build the engine-picks (dispatched_signals) report section, or "".
+
+    Read-only and defensive: any failure → empty string so the user-command
+    report is never disturbed. Omitted entirely when the ledger has no rows in
+    the window.
+    """
+    try:
+        raw = _fetch_dispatched_signals(days, db)
+    except Exception:  # noqa: BLE001 — belt-and-suspenders; _fetch already guards
+        return ""
+    if not raw:
+        return ""
+
+    truncated = len(raw) > _MAX_TICKERS_PER_REPORT
+    rows = [_evaluate_dispatched_signal(r, db) for r in raw[:_MAX_TICKERS_PER_REPORT]]
+
+    header = (
+        f"<b>🤖 TÍN HIỆU HỆ THỐNG ({days} NGÀY)</b>\n"
+        f"══════════════════════"
+    )
+    blocks: list[str] = [header]
+    summary = _summarize_hit_rate(rows)
+    if summary:
+        blocks.append(summary)
+
+    for r in rows:
+        ticker = html.escape(r["ticker"])
+        d0 = r.get("dispatch_date")
+        d0_str = d0.strftime("%d/%m") if hasattr(d0, "strftime") else str(d0)
+        if r.get("error"):
+            blocks.append(
+                f"\n• <b>Mã:</b> {ticker} <i>({d0_str})</i>\n"
+                f"• <b>Thực tế:</b> ⚠️ {html.escape(str(r['error']))}"
+            )
+            continue
+        move_label = _format_move(r["pct"])
+        state = "đã chốt" if r.get("matured") else "đang giữ"
+        hz = r.get("horizon")
+        hz_str = f"T+{hz}" if hz else "—"
+        blocks.append(
+            f"\n• <b>Mã:</b> {ticker} <i>({d0_str}, {hz_str})</i>\n"
+            f"• <b>Thực tế:</b> {move_label}  <i>({state})</i>"
+        )
+
+    if truncated:
+        blocks.append(
+            f"\n<i>Đã giới hạn ở {_MAX_TICKERS_PER_REPORT} tín hiệu gần nhất.</i>"
+        )
+    return "\n".join(blocks)
 
 
 def _build_audit_report(rows: list[dict[str, Any]], days: int, truncated: bool) -> str:

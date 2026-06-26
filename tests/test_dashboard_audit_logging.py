@@ -88,3 +88,82 @@ def test_hit_rate_none_when_nothing_priced():
 
     assert _summarize_hit_rate([{"ticker": "A", "error": "no price"}]) is None
     assert _summarize_hit_rate([]) is None
+
+
+# --------------------------------------------------------------------------- #
+# Engine-picks section (#3) — grade the bot's OWN dispatched recommendations.
+# --------------------------------------------------------------------------- #
+
+from datetime import date
+
+
+def test_evaluate_dispatched_signal_matured_net_return():
+    """Matured pick → exit = close on hold_days-th session, NET of round-trip."""
+    from src.utils import audit_evaluator as ae
+
+    row = ("hpg", date(2026, 6, 1), 5, 5, "CLOSED", date(2026, 6, 8))
+    db = MagicMock()
+    with patch.object(ae, "price_lookup") as pl:
+        pl.close_on_or_before.side_effect = [100.0, 110.0]  # t0, exit
+        pl.trading_dates_after.return_value = [date(2026, 6, d) for d in (2, 3, 4, 5, 8, 9)]
+        out = ae._evaluate_dispatched_signal(row, db)
+
+    assert out["ticker"] == "HPG"
+    assert out["matured"] is True
+    # (110-100)/100*100 - 0.30 = 9.70
+    assert abs(out["pct"] - 9.70) < 1e-9
+    pl.latest_close.assert_not_called()
+
+
+def test_evaluate_dispatched_signal_open_is_provisional():
+    """Not enough sessions elapsed → latest_close, matured=False."""
+    from src.utils import audit_evaluator as ae
+
+    row = ("ssi", date(2026, 6, 20), 20, 20, "OPEN", None)
+    db = MagicMock()
+    with patch.object(ae, "price_lookup") as pl:
+        pl.close_on_or_before.return_value = 100.0          # t0
+        pl.trading_dates_after.return_value = [date(2026, 6, 21), date(2026, 6, 24)]
+        pl.latest_close.return_value = 105.0
+        out = ae._evaluate_dispatched_signal(row, db)
+
+    assert out["matured"] is False
+    assert abs(out["pct"] - 4.70) < 1e-9  # (105-100)/100*100 - 0.30
+
+
+def test_fetch_dispatched_signals_graceful_when_table_missing():
+    """A missing/erroring ledger table degrades to [] — never raises."""
+    from src.utils.audit_evaluator import _fetch_dispatched_signals
+
+    db = MagicMock()
+    db.conn.execute.side_effect = RuntimeError("no such table: dispatched_signals")
+    assert _fetch_dispatched_signals(30, db) == []
+
+
+def test_build_engine_section_renders_header_and_hitrate():
+    """Engine section shows the 🤖 header + reused win/loss summary."""
+    from src.utils import audit_evaluator as ae
+
+    raw = [
+        ("hpg", date(2026, 6, 1), 5, 5, "CLOSED", date(2026, 6, 8)),
+        ("ssi", date(2026, 6, 2), 5, 5, "CLOSED", date(2026, 6, 9)),
+    ]
+    db = MagicMock()
+    with patch.object(ae, "_fetch_dispatched_signals", return_value=raw), \
+         patch.object(ae, "price_lookup") as pl:
+        pl.close_on_or_before.side_effect = [100.0, 120.0, 100.0, 90.0]  # 2 picks: +up, -down
+        pl.trading_dates_after.return_value = [date(2026, 6, d) for d in (2, 3, 4, 5, 8, 9, 10)]
+        out = ae._build_engine_section(30, db)
+
+    assert "🤖 TÍN HIỆU HỆ THỐNG" in out
+    assert "Tỷ lệ đúng:" in out
+    assert "HPG" in out and "SSI" in out
+
+
+def test_build_engine_section_empty_when_no_ledger_rows():
+    """No ledger rows → empty string so the section is omitted."""
+    from src.utils import audit_evaluator as ae
+
+    db = MagicMock()
+    with patch.object(ae, "_fetch_dispatched_signals", return_value=[]):
+        assert ae._build_engine_section(30, db) == ""
