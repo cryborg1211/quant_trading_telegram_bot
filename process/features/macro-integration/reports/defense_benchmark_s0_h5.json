@@ -1,0 +1,82 @@
+{
+  "baseline": {
+    "sharpe": -0.3636,
+    "max_dd": -54.99,
+    "total_ret": -38.5,
+    "final_nav": 6150018242.0,
+    "n_days": 917,
+    "mean_exposure": NaN
+  },
+  "regime_policy": {
+    "sharpe": -0.2899,
+    "max_dd": -38.8,
+    "total_ret": -22.18,
+    "final_nav": 7782307929.0,
+    "n_days": 917,
+    "mean_exposure": NaN
+  },
+  "macro_hmm": {
+    "sharpe": -0.7791,
+    "max_dd": -51.0,
+    "total_ret": -43.31,
+    "final_nav": 5669449357.0,
+    "n_days": 917,
+    "mean_exposure": 0.722
+  },
+  "garch_hmm": {
+    "sharpe": -0.1472,
+    "max_dd": -38.3,
+    "total_ret": -14.54,
+    "final_nav": 8545594514.0,
+    "n_days": 917,
+    "mean_exposure": 0.637
+  },
+  "macro+garch_min": {
+    "sharpe": -0.5484,
+    "max_dd": -36.58,
+    "total_ret": -25.37,
+    "final_nav": 7462751499.0,
+    "n_days": 917,
+    "mean_exposure": 0.493
+  },
+  "regime+garch": {
+    "sharpe": 0.0048,
+    "max_dd": -25.64,
+    "total_ret": -2.49,
+    "final_nav": 9751029868.0,
+    "n_days": 917,
+    "mean_exposure": 0.637
+  },
+  "all_min": {
+    "sharpe": -0.2871,
+    "max_dd": -22.1,
+    "total_ret": -10.59,
+    "final_nav": 8940840333.0,
+    "n_days": 917,
+    "mean_exposure": 0.493
+  },
+  "__controls": {
+    "0.72": {
+      "sharpe": -0.3663,
+      "max_dd": -43.39,
+      "total_ret": -27.92,
+      "final_nav": 7207875831.0,
+      "n_days": 917
+    },
+    "0.64": {
+      "sharpe": -0.3667,
+      "max_dd": -39.51,
+      "total_ret": -24.73,
+      "final_nav": 7527395826.0,
+      "n_days": 917
+    },
+    "0.49": {
+      "sharpe": -0.3654,
+      "max_dd": -31.64,
+      "total_ret": -18.65,
+      "final_nav": 8135102674.0,
+      "n_days": 917
+    }
+  },
+  "__controls_done": true
+}
