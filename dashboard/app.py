@@ -33,6 +33,7 @@ from dashboard.tabs import (  # noqa: E402 - import after load_dotenv by design
     giu,
     mua,
     settings,
+    tam_nhin,
     verify,
 )
 from dashboard import theme  # noqa: E402
@@ -44,7 +45,7 @@ st.set_page_config(
 )
 
 # Tab order matches the approved design.
-_TAB_LABELS = ["MUA", "GIỮ", "BÁN", "Verify", "Audit", "Settings"]
+_TAB_LABELS = ["MUA", "GIỮ", "BÁN", "Verify", "Audit", "Settings", "Tầm Nhìn Thuật Toán"]
 
 
 def _data_freshness_dot() -> str:
@@ -100,9 +101,15 @@ def main() -> None:
         "Tín hiệu giao dịch T+5 / T+20 · phân tích cục bộ",
     )
 
-    tab_mua, tab_giu, tab_ban, tab_verify, tab_audit, tab_settings = st.tabs(
-        _TAB_LABELS
-    )
+    (
+        tab_mua,
+        tab_giu,
+        tab_ban,
+        tab_verify,
+        tab_audit,
+        tab_settings,
+        tab_tam_nhin,
+    ) = st.tabs(_TAB_LABELS)
 
     # Map each tab container to its render fn; isolate failures per tab.
     tab_renderers = [
@@ -112,6 +119,7 @@ def main() -> None:
         (tab_verify, verify.render),
         (tab_audit, audit.render),
         (tab_settings, settings.render),
+        (tab_tam_nhin, tam_nhin.render),
     ]
     for tab, render_fn in tab_renderers:
         with tab:

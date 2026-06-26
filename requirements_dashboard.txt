@@ -7,3 +7,5 @@
 
 # 1.39+: st.button(type="tertiary") used for neutral ghost buttons in the theme.
 streamlit>=1.39
+# Fan-chart forecast (Tầm Nhìn Thuật Toán tab) — go.Scatter + st.plotly_chart.
+plotly>=5.18

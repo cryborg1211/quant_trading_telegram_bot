@@ -35,7 +35,9 @@ pytest.importorskip("streamlit.testing.v1")
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
 _APP_PATH = str(Path(__file__).resolve().parents[1] / "dashboard" / "app.py")
-_TAB_LABELS = ["MUA", "GIỮ", "BÁN", "Verify", "Audit", "Settings"]
+_TAB_LABELS = [
+    "MUA", "GIỮ", "BÁN", "Verify", "Audit", "Settings", "Tầm Nhìn Thuật Toán"
+]
 
 
 def _sync_run_in_thread(fn, *args, label: str = "", ttl=None, **kwargs):
