@@ -57,16 +57,18 @@ def render() -> None:
         render_report_html(html, title=f"Kết quả cho {ticker}")
     elif html == "":
         st.warning(f"Không có kết quả cho {ticker} (mã ngoài vũ trụ giao dịch?).")
+    else:
+        # Ticker entered but not checked yet — a friendly placeholder beats a
+        # blank gap, and the push button stays hidden until there is a result.
+        st.info(f"Bấm **🔍 Kiểm tra** để xem dự báo T+5 / T+20 cho **{ticker}**.")
+        return
 
-    if st.button("📤 Gửi Telegram", key="verify_push", type="tertiary"):
-        push_html = st.session_state.get(result_key)
-        if not push_html:
-            st.warning("Chạy kiểm tra trước khi gửi.")
-            return
+    # Telegram push only makes sense once a real result exists.
+    if html and st.button("📤 Gửi Telegram", key="verify_push", type="tertiary"):
         try:
             from src.utils.telegram_alerter import TelegramBot  # noqa: PLC0415
 
-            TelegramBot().send_text_alert(push_html, label=ticker)
+            TelegramBot().send_text_alert(html, label=ticker)
             st.success("Đã gửi.")
             # Note: the audit row is written on the verify RUN above, not here —
             # a Telegram push is optional and must not be the only audit trigger.

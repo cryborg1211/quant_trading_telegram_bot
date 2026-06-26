@@ -25,6 +25,8 @@ from pathlib import Path
 import streamlit as st
 from dotenv import dotenv_values, set_key
 
+from dashboard.theme import ACCENT, DANGER, MUTED
+
 # Repo root = two levels up from this file (dashboard/tabs/settings.py).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ENV_PATH = _REPO_ROOT / ".env"
@@ -34,6 +36,27 @@ _SETTINGS_JSON_PATH = _REPO_ROOT / "config" / "settings.json"
 # Masked placeholder shown when a secret already exists; leaving the field at
 # this value on Save means "keep the existing secret unchanged".
 _MASK = "********"
+
+
+def _status_chip(label: str, present: bool) -> str:
+    """A small colored 'set / missing' pill for a secret's presence."""
+    color = ACCENT if present else DANGER
+    text = "đã đặt" if present else "chưa đặt"
+    return (
+        f'<span style="display:inline-block;margin:0 8px 6px 0;padding:3px 10px;'
+        f'border-radius:999px;border:1px solid {color};color:{color};'
+        f'font-size:0.78rem;font-weight:700;">{label}: {text}</span>'
+    )
+
+
+def _section_label(text: str) -> None:
+    """Render an uppercase form-section divider label."""
+    st.markdown(
+        f'<div style="color:{MUTED};font-size:0.76rem;font-weight:700;'
+        'text-transform:uppercase;letter-spacing:0.05em;margin:6px 0 2px;">'
+        f"{text}</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def _read_env() -> dict[str, str]:
@@ -121,7 +144,16 @@ def render() -> None:
     from dashboard.utils.headless import _read_user_id  # noqa: PLC0415
     existing_user_id = _read_user_id()
 
+    # Live status chips so the user sees what's configured before editing.
+    st.markdown(
+        _status_chip("Gemini", has_gemini)
+        + _status_chip("Telegram", has_token)
+        + _status_chip("Chat ID", bool(env.get("TELEGRAM_CHAT_ID"))),
+        unsafe_allow_html=True,
+    )
+
     with st.form("settings_form"):
+        _section_label("🔑 Khóa bí mật")
         gemini_key = st.text_input(
             "GEMINI_API_KEY",
             value=_MASK if has_gemini else "",
@@ -138,6 +170,7 @@ def render() -> None:
             "TELEGRAM_CHAT_ID",
             value=env.get("TELEGRAM_CHAT_ID", ""),
         )
+        _section_label("📊 Tùy chọn mô hình")
         horizon_default = st.selectbox(
             "Khung thời gian mặc định",
             options=[5, 20],
@@ -151,6 +184,7 @@ def render() -> None:
             value=min(max(existing_threshold, 0.5), 0.95),
             step=0.05,
         )
+        _section_label("🆔 Dashboard")
         dashboard_user_id = st.text_input(
             "Dashboard user_id",
             value=existing_user_id,
