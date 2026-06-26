@@ -127,6 +127,7 @@ def test_app_boots_with_one_holding_renders_giu() -> None:
     assert not _tab_boundary_errors(at), (
         f"tab error boundary fired: {_tab_boundary_errors(at)}"
     )
-    # GIỮ rendered its holdings table + summary metric.
-    assert len(at.dataframe) >= 1
+    # GIỮ rendered its holdings rows (ticker + remove button) + summary metric.
+    assert any("VCB" in m.value for m in at.markdown)
+    assert any(b.label == "Gỡ" for b in at.button)
     assert any(m.label == "Vốn vào" for m in at.metric)

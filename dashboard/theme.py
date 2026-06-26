@@ -106,6 +106,19 @@ _GLOBAL_CSS = f"""
   }}
   .stButton > button:hover {{ filter: brightness(1.08); color: #06120e; }}
 
+  /* secondary buttons → danger-outline (destructive / non-primary actions) */
+  .stButton > button[kind="secondary"] {{
+    background: transparent;
+    color: {DANGER};
+    border: 1px solid {DANGER};
+    font-weight: 700;
+  }}
+  .stButton > button[kind="secondary"]:hover {{
+    background: {DANGER};
+    color: #1a0e0e;
+    filter: none;
+  }}
+
   /* sidebar */
   section[data-testid="stSidebar"] {{
     background: {SURFACE};

@@ -12,9 +12,9 @@ The add form pre-fills from the MUA tab's quick-add
 
 from __future__ import annotations
 
-import pandas as pd
 import streamlit as st
 
+from dashboard.theme import ACCENT, DANGER, MUTED
 from dashboard.utils.headless import (
     LOCAL_USER_ID,
     _pnl_ratio,
@@ -22,6 +22,17 @@ from dashboard.utils.headless import (
     portfolio_list,
     portfolio_remove,
 )
+
+# Column width ratios shared by the holdings header + each data row.
+_HOLDING_COLS = [1.2, 1, 1.4, 1, 1.1, 0.9]
+
+
+def _pnl_span(ratio: float | None) -> str:
+    """Colored PnL cell: teal for gains, red for losses, muted for N/A."""
+    if ratio is None:
+        return f'<span style="color:{MUTED};">N/A</span>'
+    color = ACCENT if ratio >= 0 else DANGER
+    return f'<span style="color:{color};font-weight:700;">{ratio:+.1%}</span>'
 
 
 @st.cache_data(ttl=30)
@@ -95,7 +106,16 @@ def render() -> None:
 
     open_positions = _open_positions()
 
-    rows: list[dict] = []
+    # Column header row.
+    head_cols = st.columns(_HOLDING_COLS)
+    for col, label in zip(head_cols, ["Mã", "KL", "Giá vào", "PnL", "Còn lại", ""]):
+        col.markdown(
+            f'<div style="color:{MUTED};font-size:0.72rem;font-weight:700;'
+            'text-transform:uppercase;letter-spacing:0.04em;">'
+            f"{label}</div>",
+            unsafe_allow_html=True,
+        )
+
     ratios: list[float] = []
     von_vao = 0.0
     for h in holdings:
@@ -107,24 +127,17 @@ def render() -> None:
         if ratio is not None:
             ratios.append(ratio)
         countdown = open_positions.get(ticker, {}).get("sessions_remaining", "-")
-        rows.append({
-            "Mã": ticker,
-            "KL": volume,
-            "Giá vào": f"{entry:,.0f}",
-            "PnL": f"{ratio:+.1%}" if ratio is not None else "N/A",
-            "Còn lại (phiên)": countdown,
-        })
 
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    # Per-row remove buttons.
-    st.caption("Gỡ vị thế:")
-    remove_cols = st.columns(len(holdings))
-    for col, h in zip(remove_cols, holdings):
-        if col.button(f"Gỡ {h['ticker']}", key=f"remove_{h['ticker']}"):
-            portfolio_remove(LOCAL_USER_ID, h["ticker"])
+        row = st.columns(_HOLDING_COLS)
+        row[0].markdown(f"**{ticker}**")
+        row[1].markdown(f"{volume:,}")
+        row[2].markdown(f"{entry:,.0f}")
+        row[3].markdown(_pnl_span(ratio), unsafe_allow_html=True)
+        row[4].markdown(str(countdown))
+        if row[5].button("Gỡ", key=f"remove_{ticker}", type="secondary"):
+            portfolio_remove(LOCAL_USER_ID, ticker)
             _cached_holdings.clear()
-            st.toast(f"Đã gỡ {h['ticker']}.")
+            st.toast(f"Đã gỡ {ticker}.")
             st.rerun()
 
     # --- Summary cards --------------------------------------------------------
