@@ -142,6 +142,20 @@ _GLOBAL_CSS = f"""
   .qv-report hr {{
     border: none; border-top: 1px solid {BORDER}; margin: 12px 0;
   }}
+
+  /* skeleton placeholder (shown before a tab's heavy load is triggered) */
+  .qv-skel {{
+    height: 92px; border-radius: 14px; margin-bottom: 12px;
+    border: 1px solid {BORDER};
+    background: linear-gradient(100deg,
+      {SURFACE} 30%, {SURFACE_2} 50%, {SURFACE} 70%);
+    background-size: 200% 100%;
+    animation: qv-shimmer 1.4s ease-in-out infinite;
+  }}
+  @keyframes qv-shimmer {{
+    0% {{ background-position: 200% 0; }}
+    100% {{ background-position: -200% 0; }}
+  }}
 </style>
 """
 

@@ -17,7 +17,7 @@ from dashboard.utils.headless import (
     inference_for_holdings_headless,
     portfolio_list,
 )
-from dashboard.utils.thread_runner import run_in_thread
+from dashboard.utils.thread_runner import clear_cached, load_gate, run_in_thread
 
 
 def render() -> None:
@@ -31,6 +31,19 @@ def render() -> None:
         return
 
     tickers = [h["ticker"] for h in holdings]
+
+    # Defer the holdings inference until requested (it re-runs on every rerun
+    # otherwise — same hang as MUA).
+    if not load_gate(
+        "ban",
+        prompt="Bấm để phân tích bán/giữ cho danh mục hiện tại.",
+        button_label="Phân tích danh mục",
+    ):
+        return
+
+    if st.button("🔄 Làm mới", key="ban_refresh"):
+        clear_cached(inference_for_holdings_headless, tickers)
+        st.rerun()
 
     html = run_in_thread(
         inference_for_holdings_headless,

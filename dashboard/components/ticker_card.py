@@ -17,6 +17,14 @@ from dashboard.components.signal_bar import render_signal_bar
 from dashboard.theme import action_color
 
 
+def render_skeleton_cards(n: int = 3) -> None:
+    """Render ``n`` shimmering placeholder cards (pre-load empty state)."""
+    st.markdown(
+        '<div class="qv-skel"></div>' * max(0, n),
+        unsafe_allow_html=True,
+    )
+
+
 def _action_badge(action: str) -> str:
     color = action_color(action)
     return (

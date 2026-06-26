@@ -43,6 +43,44 @@ def _cache_key(fn: Callable[..., Any], args: tuple[Any, ...]) -> str:
     return f"_thread_{fn.__name__}_{digest}"
 
 
+def _request_key(name: str) -> str:
+    """Session_state flag key for a tab's load-gate."""
+    return f"_load_requested_{name}"
+
+
+def load_gate(
+    name: str,
+    *,
+    prompt: str,
+    button_label: str = "Tải dữ liệu",
+) -> bool:
+    """Defer heavy work until the user explicitly asks for it.
+
+    Streamlit executes every tab body on every rerun, so an unconditional
+    ``run_in_thread`` call fires its inference the instant the app opens — even
+    when the user only wanted another tab. This gate renders a prompt + button
+    and returns ``False`` until clicked; once clicked it latches ``True`` for the
+    session so cached results keep rendering across reruns.
+    """
+    if st.session_state.get(_request_key(name)):
+        return True
+    st.info(prompt)
+    if st.button(button_label, key=f"loadbtn_{name}", use_container_width=True):
+        st.session_state[_request_key(name)] = True
+        st.rerun()
+    return False
+
+
+def clear_cached(fn: Callable[..., Any], *args: Any) -> None:
+    """Drop the cached result/timestamp/future for one (fn, args) pair.
+
+    Lets a tab's "refresh" button force a fresh background run on the next rerun.
+    """
+    key = _cache_key(fn, args)
+    for suffix in ("", "_ts", "_fut"):
+        st.session_state.pop(key + suffix, None)
+
+
 def run_in_thread(
     fn: Callable[..., Any],
     *args: Any,

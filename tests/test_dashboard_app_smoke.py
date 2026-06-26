@@ -47,8 +47,17 @@ def _sync_run_in_thread(fn, *args, label: str = "", ttl=None, **kwargs):
     return fn(*args, **kwargs)
 
 
-def _boot(giu_holdings: list[dict] | None = None) -> AppTest:
-    """Render ``dashboard/app.py`` under AppTest with all heavy seams stubbed."""
+def _boot(
+    giu_holdings: list[dict] | None = None,
+    *,
+    requests: list[str] | None = None,
+) -> AppTest:
+    """Render ``dashboard/app.py`` under AppTest with all heavy seams stubbed.
+
+    ``requests`` pre-sets the per-tab load-gate flags (e.g. ``["mua"]``) so a
+    test can exercise the post-click render path; by default every gate is
+    closed, matching a fresh app open.
+    """
     holdings = list(giu_holdings or [])
     with ExitStack() as stack:
         # MUA — synchronous, empty buy-signal list (no daily_inference / models).
@@ -70,7 +79,10 @@ def _boot(giu_holdings: list[dict] | None = None) -> AppTest:
         stack.enter_context(
             patch("dashboard.tabs.audit._cached_postmortem", lambda uid, days: "")
         )
-        return AppTest.from_file(_APP_PATH).run(timeout=30)
+        at = AppTest.from_file(_APP_PATH)
+        for name in requests or []:
+            at.session_state[f"_load_requested_{name}"] = True
+        return at.run(timeout=30)
 
 
 def _tab_boundary_errors(at: AppTest) -> list[str]:
@@ -87,9 +99,23 @@ def test_app_boots_six_tabs_clean() -> None:
     assert not _tab_boundary_errors(at), (
         f"tab error boundary fired: {_tab_boundary_errors(at)}"
     )
-    # Main shell + MUA seam actually executed (empty signals → info message).
-    # Title now renders via the styled theme.page_header (st.markdown), not st.title.
+    # Main shell rendered. Title now renders via the styled theme.page_header
+    # (st.markdown), not st.title.
     assert any("Quant V4 Dashboard" in m.value for m in at.markdown)
+    # Heavy tabs defer behind a load-gate on a fresh open — MUA shows its prompt
+    # and does NOT run inference until requested.
+    assert any("Bấm để tải tín hiệu mua" in i.value for i in at.info)
+
+
+def test_gated_tabs_render_when_requested() -> None:
+    """With the load-gate flags pre-set, the heavy tab seams run without error."""
+    at = _boot(requests=["mua", "ban", "audit"])
+
+    assert not at.exception, f"uncaught: {[e.value for e in at.exception]}"
+    assert not _tab_boundary_errors(at), (
+        f"tab error boundary fired: {_tab_boundary_errors(at)}"
+    )
+    # MUA seam executed (empty signals → "no signals" info, past the gate).
     assert any("Không có tín hiệu" in i.value for i in at.info)
 
 

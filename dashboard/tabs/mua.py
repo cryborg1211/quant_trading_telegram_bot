@@ -16,9 +16,9 @@ import re
 
 import streamlit as st
 
-from dashboard.components.ticker_card import render_ticker_card
+from dashboard.components.ticker_card import render_skeleton_cards, render_ticker_card
 from dashboard.utils.headless import daily_inference_headless
-from dashboard.utils.thread_runner import run_in_thread
+from dashboard.utils.thread_runner import clear_cached, load_gate, run_in_thread
 
 # Pull a leading integer out of a hold label like "30 phiên" / "T+20" / "20".
 _HOLD_DAYS_RE = re.compile(r"(\d+)")
@@ -49,6 +49,20 @@ def render() -> None:
         key="mua_horizon",
     )
     horizon = 5 if horizon_label == "T+5" else 20
+
+    # Defer the ~1-min inference until the user asks — otherwise it would fire
+    # the moment the app opens (every tab body runs on every rerun).
+    if not load_gate(
+        "mua",
+        prompt="Bấm để tải tín hiệu mua (chạy mô hình, có thể mất ~1 phút).",
+        button_label="Tải tín hiệu MUA",
+    ):
+        render_skeleton_cards(3)
+        return
+
+    if st.button("🔄 Làm mới", key="mua_refresh"):
+        clear_cached(daily_inference_headless, horizon)
+        st.rerun()
 
     # Background, TTL-cached inference. Returns (report_html, signal_list).
     _html, signal_list = run_in_thread(

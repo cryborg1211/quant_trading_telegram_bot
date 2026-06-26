@@ -12,6 +12,7 @@ import streamlit as st
 
 from dashboard.components.report_card import render_report_html
 from dashboard.utils.headless import LOCAL_USER_ID
+from dashboard.utils.thread_runner import load_gate
 
 _WINDOW_DAYS = {"Tuần": 7, "Tháng": 30}
 
@@ -37,6 +38,18 @@ def render() -> None:
         key="audit_window",
     )
     days = _WINDOW_DAYS[window]
+
+    # Defer the post-mortem (heavy import + Gemini call) until requested.
+    if not load_gate(
+        "audit",
+        prompt="Bấm để chạy đánh giá lại (gọi mô hình, cần GEMINI_API_KEY).",
+        button_label="Chạy đánh giá",
+    ):
+        return
+
+    if st.button("🔄 Làm mới", key="audit_refresh"):
+        _cached_postmortem.clear()
+        st.rerun()
 
     html = _cached_postmortem(LOCAL_USER_ID, days)
     render_report_html(html)
