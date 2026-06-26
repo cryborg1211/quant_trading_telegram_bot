@@ -37,7 +37,7 @@ python main.py --task crawl_hose --force-crawl
 - Takes a while (~350 tickers, ~45s hard cap each). Per-ticker failures are
   logged to `logs/crawler_errors.txt` and skipped — re-run to backfill them.
 
-## 2. Daily refresh — incremental
+## 2. Daily refresh — incremental 
 
 Fetch only the last N calendar days (small overlap absorbs late corrections):
 
