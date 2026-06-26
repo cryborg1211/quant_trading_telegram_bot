@@ -190,14 +190,21 @@ def main(
     configure_logging()
     t0 = time.perf_counter()
 
+    # Per-seed grid CSV so multi-seed runs never mix rows into one file. The
+    # baseline/const sidecars are already seed-keyed via _baseline_path /
+    # _constants_path (which derive from the un-suffixed out_path).
+    grid_path = out_path.with_name(
+        f"{out_path.stem}_s{seed_idx}_h{hold_days}{out_path.suffix}")
+
     LOGGER.info("=" * 72)
     LOGGER.info(" GARCH-HMM BRAKE SWEEP | floors=%s  caps=%s  states=%d  seed_idx=%d",
                 floors, caps, n_states, seed_idx)
+    LOGGER.info(" grid CSV: %s", grid_path.name)
     LOGGER.info("=" * 72)
 
     # ── Resume bookkeeping (crash-durable; restarts are cheap) ───────────
     all_cells = [(cap, floor) for cap in caps for floor in floors]
-    done_rows, done_keys = _load_done(out_path)
+    done_rows, done_keys = _load_done(grid_path)
     remaining = [(c, f) for (c, f) in all_cells if _cell_key(c, f) not in done_keys]
     baseline_path = _baseline_path(out_path, seed_idx, hold_days)
     consts_path = _constants_path(out_path, seed_idx, hold_days)
@@ -279,7 +286,7 @@ def main(
                 "d_total_ret": round(m["total_ret"] - m_base["total_ret"], 2),
             }
             # Append IMMEDIATELY so a power-off only loses the in-flight cell.
-            _append_row(out_path, row, write_header=not out_path.exists())
+            _append_row(grid_path, row, write_header=not grid_path.exists())
             rows.append(row)
             LOGGER.info("Cell saved (%d/%d total)", len(rows), len(all_cells))
 
