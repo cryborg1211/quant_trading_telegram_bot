@@ -294,6 +294,31 @@ def _format_move(pct: float) -> str:
     return f"🟡 ĐI NGANG {pct:+.1f}%"
 
 
+def _summarize_hit_rate(rows: list[dict[str, Any]]) -> str | None:
+    """Aggregate win/loss line over the priced rows, or ``None`` if none priced.
+
+    Counts each graded ticker by its move using the same ±0.5% flat band as
+    ``_format_move``. Win-rate = up / (up + down) — flat names are excluded from
+    the denominator so a sideways tape doesn't dilute the directional hit-rate.
+    Also reports the mean return across all graded rows.
+    """
+    priced = [r for r in rows if not r.get("error") and r.get("pct") is not None]
+    if not priced:
+        return None
+    up = sum(1 for r in priced if r["pct"] > 0.5)
+    down = sum(1 for r in priced if r["pct"] < -0.5)
+    flat = len(priced) - up - down
+    avg = sum(r["pct"] for r in priced) / len(priced)
+    decisive = up + down
+    win_rate = (up / decisive * 100.0) if decisive else 0.0
+    win_str = f"{win_rate:.0f}%" if decisive else "—"
+    return (
+        f"\n<b>Tỷ lệ đúng:</b> {win_str} "
+        f"(🟢 {up} / 🔴 {down} / 🟡 {flat} đi ngang, {len(priced)} mã)\n"
+        f"<b>Lợi nhuận TB:</b> {avg:+.1f}%"
+    )
+
+
 def _build_audit_report(rows: list[dict[str, Any]], days: int, truncated: bool) -> str:
     """Build the final HTML report shown to the user."""
     header = (
@@ -305,6 +330,9 @@ def _build_audit_report(rows: list[dict[str, Any]], days: int, truncated: bool) 
         return f"{header}\n\n<i>Không có mã nào để hậu kiểm.</i>"
 
     blocks: list[str] = [header]
+    summary = _summarize_hit_rate(rows)
+    if summary:
+        blocks.append(summary)
     for r in rows:
         ticker = html.escape(r["ticker"])
         if r.get("error"):

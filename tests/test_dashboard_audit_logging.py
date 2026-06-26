@@ -57,3 +57,34 @@ def test_portfolio_add_audit_failure_does_not_raise():
     # The portfolio INSERT was still attempted (COUNT check + INSERT >= 2 calls).
     assert engine.conn.execute.call_count >= 2
     engine.log_user_action.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+# Aggregate hit-rate summary (#4) — caption promised win/loss; now delivered.
+# --------------------------------------------------------------------------- #
+
+def test_hit_rate_excludes_flat_from_denominator():
+    """Win-rate = up / (up + down); flat (±0.5%) names not in denominator."""
+    from src.utils.audit_evaluator import _summarize_hit_rate
+
+    rows = [
+        {"ticker": "A", "pct": 3.0},    # up
+        {"ticker": "B", "pct": -2.0},   # down
+        {"ticker": "C", "pct": 4.0},    # up
+        {"ticker": "D", "pct": 0.1},    # flat — excluded from win denominator
+        {"ticker": "E", "error": "x"},  # error — excluded entirely
+    ]
+    out = _summarize_hit_rate(rows)
+    assert out is not None
+    # decisive = 2 up + 1 down = 3 → 2/3 = 67%; 4 priced rows total.
+    assert "67%" in out
+    assert "🟢 2 / 🔴 1 / 🟡 1" in out
+    assert "4 mã" in out
+
+
+def test_hit_rate_none_when_nothing_priced():
+    """No priced rows → None (so the report omits the summary block)."""
+    from src.utils.audit_evaluator import _summarize_hit_rate
+
+    assert _summarize_hit_rate([{"ticker": "A", "error": "no price"}]) is None
+    assert _summarize_hit_rate([]) is None
