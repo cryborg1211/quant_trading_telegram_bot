@@ -1277,6 +1277,7 @@ def _dispatch_signals(
     broadcast: bool,
     bot: TelegramBot,
     strategy: dict | None = None,
+    exposure_scalar: float = 1.0,
 ) -> list[dict]:
     """Per-ticker signal build + Telegram dispatch loop.
 
@@ -1334,6 +1335,12 @@ def _dispatch_signals(
                     and _regime in PENALTY_REGIMES):
                 _w = _w * REGIME_PENALTY_FACTOR
                 LOGGER.info("[Regime] %s PENALTY regime %s -> weight x0.5", ticker, _regime)
+            # ── GARCH-HMM macro exposure brake (stacks with regime sizing) ──
+            # Market-wide multiplier ∈ [floor, 1.0]; 1.0 = no brake (disabled or
+            # fail-open). Complementary to the price-regime sizing above: this
+            # reads MACRO breadth, that reads price microstructure.
+            if exposure_scalar != 1.0:
+                _w = _w * exposure_scalar
             _status = "MUA"
             _ly_do = ""
 
@@ -1498,6 +1505,14 @@ def run_trade_execution(
         except Exception:  # noqa: BLE001 — dispatch must not die on artifact issues
             _strategy = None
 
+        # GARCH-HMM macro exposure brake — one market-wide scalar for the day.
+        # Fail-open: returns 1.0 (no brake) when disabled or on any failure.
+        try:
+            from src.bot.garch_brake import live_exposure_scalar  # noqa: PLC0415
+            _exposure_scalar = live_exposure_scalar()
+        except Exception:  # noqa: BLE001 — never let the brake break dispatch
+            _exposure_scalar = 1.0
+
         dispatched_signals = _dispatch_signals(
             top_buy_signals=top_buy_signals,
             all_sentiments=all_sentiments,
@@ -1510,6 +1525,7 @@ def run_trade_execution(
             broadcast=broadcast,
             bot=bot,
             strategy=_strategy,
+            exposure_scalar=_exposure_scalar,
         )
         sent = len(dispatched_signals)
         LOGGER.info("Telegram alerts dispatched: %s (broadcast=%s)", sent, broadcast)

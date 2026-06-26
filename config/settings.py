@@ -82,6 +82,16 @@ class TradingConfig:
     # treatment filter applied by scripts/analyze_sentiment_paperlog.py. It does
     # NOT gate captures; the full candidate cross-section is always logged.
     sentiment_entry_threshold: float = 0.7
+    # GARCH-HMM macro exposure brake: when True, _dispatch_signals scales each
+    # MUA weight by a market-wide exposure multiplier = clip(P(Bull), floor, 1.0)
+    # from src/bot/garch_brake.py (GARCH(1,1)+HMM overlay, models/saved/
+    # garch_hmm_v4_weights.joblib). Benchmark (seed 0, T+5 bear OOS): regime+garch
+    # was the best defense (Sharpe -0.36→+0.005). FAIL-OPEN: any data/model failure
+    # returns 1.0 (full exposure) so the live pipeline never breaks. Stacks WITH
+    # regime_sizing (complementary: price-regime × macro-breadth). Kill-switch:
+    # set "garch_brake_enabled": false in settings.json + restart.
+    garch_brake_enabled: bool = True
+    garch_brake_floor: float = 0.2
 
 
 @dataclass
