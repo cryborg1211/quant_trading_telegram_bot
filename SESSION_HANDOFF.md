@@ -1,115 +1,72 @@
-# SESSION HANDOFF — 2026-06-29 (Quant Engine V4)
-
-## NEXT TASK = AUDIT THIS SESSION'S WORK
-All work below is **UNCOMMITTED** in the working tree (HEAD = `96fdeb2`, branch
-`main`). Next session: review the diff for correctness before committing. Code
-graph rebuilt 2026-06-29 (2351 nodes / 23154 edges / 261 files) — use
-`detect_changes` + `get_review_context` against the working tree.
+# SESSION HANDOFF — 2026-06-30 (Quant Engine V4)
 
 ## STATE NOW
-- Branch **`main`** @ `96fdeb2`. Nothing from this session committed yet.
-- Test suite: **473 passed** (was 417 at session start; +56 net new).
+- Branch **`main`**. Two commits landed this session; working tree clean except the
+  untracked `real_backtest/result.json` (a generated backtest artifact — intentionally
+  NOT committed).
+- Test suite: **481 passed** (was 473; +8 from the new mr_features leak tests).
 - Python: `C:\Users\caokh\AppData\Local\Programs\Python\Python311\python.exe`
   (polars/ML/pytest/streamlit). conda has NO polars. PowerShell only.
-- `streamlit` app is RUNNING (holds a lock on `data/quant_v6_core.duckdb`) →
-  any direct DuckDB read from a 2nd process fails until it's closed.
+- Code graph rebuilt on each commit (2363 FTS rows).
 
-## CHANGED FILES (the audit surface)
+## WHAT LANDED THIS SESSION
 
-### Dashboard fixes (3 bugs, user-reported live)
-- `dashboard/app.py` — **module-not-found fix.** `streamlit run` puts the script
-  dir (`dashboard/`) on `sys.path`, not repo root → `import dashboard.*` failed.
-  Added `sys.path.insert(0, _REPO_ROOT)` guard before the dashboard imports.
-- `dashboard/tabs/mua.py` — **"could not convert '22,600 VND'" crash.** Serve
-  path (`main.py:1350`) stores `signal["price"]` as Telegram-display text; MUA's
-  raw `float()` choked. Routed both price reads through existing
-  `headless._parse_price`. Serve format untouched (bot still gets its string).
+### `6f12a46` — feat: dashboard fixes, fan-chart, accuracy auditor, Gemini 503 resilience
+The previously-uncommitted 2026-06-29 work, audited then committed:
+- Dashboard: `app.py` sys.path guard, `mua.py` price via `headless._parse_price`.
+- Fan-chart: candlestick + 12 Monte Carlo GBM paths + neon median; per-ticker
+  `crc32` seed (fixed the shared-seed clone bug); new `price_lookup.ohlc_history`.
+- Accuracy auditor: `src/utils/accuracy_audit.py` (read-only confusion matrix over
+  `sentiment_entry_paperlog`) + `/audit_accuracy` bot command.
+- Gemini 503: `sentiment_crawler._generate_content` tenacity retry (transient-only),
+  reusable `score_payload`, `scripts/backfill_sentiment_503.py`, `tenacity==9.1.4`.
 
-### Fan-chart redesign — `dashboard/utils/fan_chart.py` (TradingView-style)
-- Replaced history line with `go.Candlestick` (#22c55e / #ef4444); removed shaded
-  fan bands; added **12 Monte Carlo GBM paths** + neon median (#00F2FE);
-  rangeslider + 1M/3M/6M/ALL rangeselector; crosshair spikes
-  (`spikemode="toaxis+across"` — `"both"` is NOT valid plotly); transparent bg;
-  enterprise strings + `st.columns(3)` metric strip (Volatility / Expected T+5
-  Median / current price) in `dashboard/tabs/tam_nhin.py`.
-- **Per-ticker MC seed** (`_ticker_seed` = `crc32(ticker)`, not `hash()` which is
-  process-salted). FIXED a real bug: a single shared seed `_MC_SEED=7` made every
-  ticker draw the IDENTICAL standard-normal sequence → all fans were one cloned
-  shape scaled by price. Now DCM ≠ VHM, still stable across reruns.
-- `src/data/price_lookup.py` — new `ohlc_history(ticker, n)` (candles need OHLC;
-  `close_history` only returned closes). Mirrors the single-shard read contract.
+### `9e4a755` — refactor: remove dead helpers, add mr_features leak tests
+Outcome of the whole-project graph audit (2351 nodes / 261 files):
+- **No correctness bugs found.** Serve crawler refactor preserves `_score_item`
+  parity; `mr_features` / fan-chart / accuracy-audit math correct;
+  `VNCostModel.simulate` rigorous (check order, VN microstructure, T+2.5 settlement).
+- **Dead code removed** (graph + grep confirmed zero callers, not in any `__all__`):
+  `price_lookup.close_history` (orphaned by the fan-chart→`ohlc_history` switch),
+  `walk_forward.rejection_histogram`, `vn_cost_model.round_trip_cost_pct` +
+  `rejection_breakdown`.
+- **Spared on purpose** (uncalled but documented public/serve API): `apply_to_signals`,
+  `V3BotInference.signals`/`buy_list`, `PortfolioConstructor`, `volatility_target_weights`.
+- **Test gap closed:** lifted the `mr_features` V-shape oversold + look-ahead-leak
+  check out of `__main__` into `tests/test_mr_features_leak.py` (8 tests). CI now runs
+  the leak guard.
 
-### Model accuracy auditor (NEW — paperlog-integrated, READ-ONLY)
-- `src/utils/accuracy_audit.py` — confusion-matrix analytics over the EXISTING
-  `sentiment_entry_paperlog` (no new table, no serve-path write). `classify_outcome`
-  (BUY+R>0=TP, BUY+R≤0=FP, SELL/HOLD+R≤0=TN, SELL/HOLD+R>0=FN), `summarize_accuracy`
-  (BUY Precision, Defensive Recall), `build_accuracy_report` (15-row 🟢🔴🔵 table).
-  Realized return = `ret_20d`; settled = `outcome_filled=TRUE`.
-- `src/utils/telegram_bot.py` — new `/audit_accuracy` command (system-wide; paperlog
-  is global, no user_id). **`/audit_weekly` left untouched** (keeps last session's
-  post-mortem + engine-picks grading).
-- ⚠️ Was a consolidated user spec to build a NEW `model_predictions_audit` table +
-  patch capture in 3 serve routes + `settle_matured_predictions`. REJECTED as
-  redundant (paperlog already captures+settles) and bug-prone (spec's calendar-add
-  settlement reintroduces the fixed temporal flaw). User approved the lean path.
-
-### Gemini 503 resilience + backfill
-- `src/crawlers/sentiment_crawler.py` — extracted the Gemini call into
-  `_generate_content`, `@retry`-wrapped (tenacity: `wait_exponential(1..60)`,
-  `stop_after_attempt(5)`, retry ONLY on transient via `_is_transient_gemini_error`
-  = 503/502/504/UNAVAILABLE/OVERLOADED). New reusable `score_payload`; `_score_item`
-  now delegates to it. 4xx / JSON-parse errors are NOT retried.
-- `scripts/backfill_sentiment_503.py` — re-scores `reason LIKE 'Gemini fallback%'`
-  rows, UPDATEs by `url`. Dry-run default; `--commit` to write. ⚠️ NOTE: user added
-  a `time.sleep(10)` at the end of `backfill_503()` (rate-limit pacing?) — this makes
-  the 3 backfill unit tests sleep 10s each. Harmless but slow; flag if it bites CI.
-- `requirements.txt` — pinned `tenacity==9.1.4` (was installed, unpinned).
-
-### Tests (+56)
-- `tests/test_dashboard_fan_chart.py` — rewritten for candlestick + MC paths +
-  per-ticker-seed divergence + crc32 stability.
-- `tests/test_accuracy_audit.py` (16) — matrix, precision/recall, query contract.
-- `tests/test_sentiment_resilience.py` (15) — retry/give-up/no-retry-on-4xx,
-  clamp, fallback, backfill recover/skip/dry-run.
+## AUDIT LESSON (durable)
+The code-review-graph `dead_code` mode is **noisy** — lazy imports (`fetch_latest_market_news`
+called via in-handler import), scipy callbacks (`objective`/`objective_grad`), sklearn CV
+API (`get_n_splits`/`from_triple_barrier`), and `@property` accessors all read as
+false-dead. ALWAYS grep the whole repo (incl tests + scripts) before deleting anything
+the tool flags.
 
 ## NOT DONE (deferred, explicit user calls)
-- **Arbitration risk-gate** (cross-check classifier vs path-median vs sentiment).
-  User reviewed; decided NOT a new file — harden existing
-  `make_final_decision` (quant_agent_arbitrator.py:923): tighten sentiment veto
-  −0.5→−0.2 + add `expected_return` param. Then said "leave it aside." UNSTARTED.
-  Needs kill-switch + A/B before default-on (touches degree-84 serve hub).
+- **Arbitration risk-gate** (cross-check classifier vs path-median vs sentiment). User
+  said "leave it aside." Plan: harden existing `make_final_decision`
+  (quant_agent_arbitrator.py:923) — tighten sentiment veto −0.5→−0.2 + add
+  `expected_return` param. Needs kill-switch + A/B (degree-84 serve hub). UNSTARTED.
 - Wiring `accuracy_audit` into the dashboard Audit tab (currently bot-only).
-- Committing ANY of this session's work.
-
-## AUDIT TARGETS / RISK NOTES for next session
-1. **Serve-path touch:** only `sentiment_crawler.py` (refactor) + `telegram_bot.py`
-   (new command) are serve-side. fan_chart/mua/tam_nhin/accuracy_audit are
-   read-only/dashboard. Confirm the crawler refactor preserves `_score_item`
-   output exactly (parity test: full suite green).
-2. **Empty-data caveats:** `dispatched_signals` and the new accuracy report are
-   EMPTY until a live cron broadcast + T+20 maturity. Code unit-tested; needs real
-   data to show non-empty.
-3. **Transparent fan-chart bg** was the cause of an earlier "unreadable font"
-   report; re-introduced per explicit redesign spec. All text colors now explicit
-   light (#A3AED0) so it reads on the dark container. If it goes unreadable again,
-   that's why.
-4. **`backfill_sentiment_503.py` `time.sleep(10)`** — user-added; slows the 3
-   backfill tests. Not a bug, but verify intent during audit.
+- **Open nit:** a band-safety unit test for `round_to_tick` after the band-clip in
+  `VNCostModel.simulate` — theoretical one-tick-past-wall edge, unconfirmed.
+- `backfill_sentiment_503.py` `time.sleep(10)` is user-added and ineffective as pacing
+  (fires once after the loop, slows 3 tests); left as-is pending user intent.
 
 ## ENV GOTCHAS (CRITICAL)
 - git-bash BROKEN → **PowerShell only** for git/python/pytest.
-- PowerShell native-arg quirk: embedded `"` in a `@'...'@` here-string to
-  `git commit -m` re-splits into pathspecs → commit fails. Keep messages quote-free.
+- PowerShell native-arg quirk: keep `git commit -m` messages quote-free (embedded `"` in
+  a `@'...'@` here-string re-splits into pathspecs → commit fails).
 - python = explicit `C:\Users\caokh\AppData\Local\Programs\Python\Python311\python.exe`.
 - Prefix heavy runs: `$env:PYTHONIOENCODING="utf-8"`.
-- code-review-graph post-commit hook → cp1252 `UnicodeEncodeError` = COSMETIC,
-  commit succeeds.
+- code-review-graph post-commit hook → cp1252 `UnicodeEncodeError` = COSMETIC; the
+  commit still succeeds.
 - DuckDB locked while streamlit runs — close it before any 2nd-process DB read.
 
 ## KEY CMDS
-- tests: `python -m pytest -q` (473 pass)
-- new-work tests only: `python -m pytest tests/test_accuracy_audit.py tests/test_sentiment_resilience.py tests/test_dashboard_fan_chart.py -q`
+- tests: `python -m pytest -q` (481 pass)
+- leak tests: `python -m pytest tests/test_mr_features_leak.py -q`
 - launch dashboard: `streamlit run dashboard/app.py`
-- 503 backfill (preview): `python scripts/backfill_sentiment_503.py`  (add `--commit` to write)
 - accuracy report smoke: `python -c "from src.utils.accuracy_audit import build_accuracy_report; print(build_accuracy_report())"`
 - rebuild graph: code-review-graph `build_or_update_graph_tool(full_rebuild=True)`
