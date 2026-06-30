@@ -17,7 +17,7 @@ import re
 import streamlit as st
 
 from dashboard.components.ticker_card import render_skeleton_cards, render_ticker_card
-from dashboard.utils.headless import daily_inference_headless
+from dashboard.utils.headless import _parse_price, daily_inference_headless
 from dashboard.utils.thread_runner import clear_cached, load_gate, run_in_thread
 
 # Pull a leading integer out of a hold label like "30 phiên" / "T+20" / "20".
@@ -80,7 +80,9 @@ def render() -> None:
         clicked = render_ticker_card(
             ticker=str(sig.get("ticker", "N/A")),
             action=str(sig.get("action", "MUA")),
-            price=float(sig.get("price", 0.0) or 0.0),
+            # Serve path stores price as Telegram-display text ("22,600 VND");
+            # _parse_price strips the separators + currency suffix → float.
+            price=_parse_price(sig.get("price")),
             prob_up=float(sig.get("prob_up", 0.0) or 0.0),
             prob_side=float(sig.get("prob_side", 0.0) or 0.0),
             prob_down=float(sig.get("prob_down", 0.0) or 0.0),
@@ -92,7 +94,7 @@ def render() -> None:
         if clicked:
             st.session_state["giu_prefill"] = {
                 "ticker": str(sig.get("ticker", "")),
-                "price": float(sig.get("price", 0.0) or 0.0),
+                "price": _parse_price(sig.get("price")),
             }
             st.toast(f"Đã chọn {sig.get('ticker')} → mở tab GIỮ để xác nhận.")
             st.rerun()

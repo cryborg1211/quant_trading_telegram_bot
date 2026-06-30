@@ -29,20 +29,17 @@ tested directly.
 from __future__ import annotations
 
 import math
+import zlib
 from dataclasses import dataclass
+from datetime import date, timedelta
 
+import numpy as np
 import plotly.graph_objects as go
 
-# Accent teal (matches dashboard.theme.ACCENT = #2dd4a7) as an RGB triple so we
-# can vary the fill alpha per band.
-_ACCENT_RGB = (45, 212, 167)
-_MEDIAN_RGB = (45, 212, 167)
-_HIST_RGB = (139, 149, 165)  # theme.MUTED
-
-# z multipliers ≈ 50% / 80% / 95% central intervals (narrow → wide).
+# z multipliers ≈ 50% / 80% / 95% central intervals (narrow → wide). Retained
+# because `project_fan` still computes the analytic bands (unit-tested); the
+# figure no longer DRAWS them — it renders Monte Carlo paths instead.
 _DEFAULT_Z_LEVELS = (0.674, 1.282, 1.960)
-# Per-band fill alpha, keyed by position narrow→wide: inner darkest, outer faint.
-_BAND_ALPHAS = (0.34, 0.20, 0.10)
 
 
 @dataclass(frozen=True)
@@ -115,101 +112,188 @@ def project_fan(
     )
 
 
+# TradingView-style palette.
+_CANDLE_UP = "#22c55e"
+_CANDLE_DOWN = "#ef4444"
+_PATH_UP = "rgba(16, 185, 129, 0.2)"    # semi-transparent green (winning paths)
+_PATH_DOWN = "rgba(239, 68, 68, 0.2)"   # semi-transparent red (losing paths)
+_MEDIAN_NEON = "#00F2FE"                # bold neon median trajectory
+_SPIKE_COLOR = "#A3AED0"
+_TEXT_MUTED = "#A3AED0"                  # enterprise muted slate (axis/legend/title)
+_FONT_FAMILY = "Inter, Segoe UI, San Francisco, Arial"
+_N_MC_PATHS = 12
+# Base seed mixed with a per-ticker hash. A SINGLE shared seed would make every
+# ticker draw the identical standard-normal sequence, so all fans would share
+# one wiggle shape (only scaled by mu/sigma/s0). Mixing the ticker in gives each
+# symbol its own stable-but-distinct stream — still jitter-free across reruns.
+_MC_SEED_BASE = 7
+
+
+def _ticker_seed(ticker: str, base: int = _MC_SEED_BASE) -> int:
+    """Stable per-ticker seed (process-independent, unlike ``hash``).
+
+    ``zlib.crc32`` is deterministic across interpreter runs (Python's built-in
+    ``hash`` is salted per-process), so the same ticker reproduces the same fan
+    on every launch while different tickers diverge.
+    """
+    return (base ^ zlib.crc32(ticker.strip().upper().encode())) & 0xFFFFFFFF
+
+
+def _business_days_after(last: date, n: int) -> list[date]:
+    """The next ``n`` weekday dates strictly after ``last`` (skips Sat/Sun).
+
+    A cheap stand-in for the VN trading calendar — good enough to give the
+    forecast a real datetime x-axis so the rangeselector month buttons work.
+    """
+    out: list[date] = []
+    cur = last
+    while len(out) < n:
+        cur = cur + timedelta(days=1)
+        if cur.weekday() < 5:  # 0=Mon … 4=Fri
+            out.append(cur)
+    return out
+
+
+def simulate_gbm_paths(
+    proj: FanProjection,
+    n_paths: int = _N_MC_PATHS,
+    *,
+    ticker: str = "",
+    seed: int | None = None,
+) -> list[list[float]]:
+    """Simulate ``n_paths`` GBM price walks from S0 over the projection horizon.
+
+    Each path draws ``horizon`` i.i.d. daily log-returns ``~ N(mu, sigma)`` and
+    compounds them: ``price_t = S0·exp(Σ r)``. The RNG seed defaults to a
+    per-``ticker`` value so each symbol gets its own distinct path shape while
+    staying stable across Streamlit reruns; pass ``seed`` to override (tests).
+    Returns one list of ``horizon`` prices per path (S0 anchor added by caller).
+    """
+    horizon = len(proj.days)
+    rng_seed = _ticker_seed(ticker) if seed is None else seed
+    rng = np.random.default_rng(rng_seed)
+    rets = rng.normal(proj.mu, proj.sigma, size=(n_paths, horizon))
+    walks = proj.s0 * np.exp(np.cumsum(rets, axis=1))
+    return [row.tolist() for row in walks]
+
+
 def build_fan_figure(
-    closes: list[float],
+    ohlc: list[tuple[object, float, float, float, float]],
     proj: FanProjection,
     *,
     ticker: str = "",
+    n_paths: int = _N_MC_PATHS,
 ) -> go.Figure:
-    """Build the dark-themed Plotly fan chart.
+    """Build the TradingView-style candlestick + Monte-Carlo-path forecast.
 
-    The x-axis is a trading-session index: history runs ``-(N-1)…0`` (0 = today
-    = T_now), the forecast runs ``0…H``. Anchoring every forward series at
-    ``(0, S0)`` makes the fan emanate from a single point at today.
+    ``ohlc`` is ascending ``(date, open, high, low, close)`` history. The
+    forecast extends real business days past the last candle so the x-axis is a
+    true datetime axis (required by the rangeselector month buttons). Instead of
+    shaded confidence bands, the forecast is drawn as ``n_paths`` thin GBM walks
+    (green = closes up, red = closes down) plus one bold neon median line.
     """
     fig = go.Figure()
 
-    # --- History (solid muted line up to today) ------------------------------
-    hist_x = list(range(-(len(closes) - 1), 1))  # … -2, -1, 0
+    hist_dates = [row[0] for row in ohlc]
+    last_date = hist_dates[-1] if hist_dates else date.today()
+
+    # --- Candlestick history --------------------------------------------------
     fig.add_trace(
-        go.Scatter(
-            x=hist_x,
-            y=list(closes),
-            mode="lines",
-            name="Lịch sử",
-            line=dict(color=f"rgb{_HIST_RGB}", width=2),
-            hovertemplate="Phiên %{x}: %{y:,.2f}<extra></extra>",
+        go.Candlestick(
+            x=hist_dates,
+            open=[row[1] for row in ohlc],
+            high=[row[2] for row in ohlc],
+            low=[row[3] for row in ohlc],
+            close=[row[4] for row in ohlc],
+            name="Lịch sử giá (OHLC)",
+            increasing_line_color=_CANDLE_UP,
+            increasing_fillcolor=_CANDLE_UP,
+            decreasing_line_color=_CANDLE_DOWN,
+            decreasing_fillcolor=_CANDLE_DOWN,
+            whiskerwidth=0.5,
         )
     )
 
     s0 = proj.s0
-    fwd_x = [0, *proj.days]  # anchor the fan at today (x=0, y=S0)
+    fwd_dates = _business_days_after(last_date, len(proj.days))
+    fan_x = [last_date, *fwd_dates]  # anchor every forward series at today (S0)
 
-    # --- Fan bands (wide → narrow so the narrow inner band paints on top) -----
-    # alphas are keyed narrow→wide; reverse alongside the reversed band order.
-    n_bands = len(proj.bands)
-    for idx in range(n_bands - 1, -1, -1):
-        band = proj.bands[idx]
-        alpha = _BAND_ALPHAS[idx] if idx < len(_BAND_ALPHAS) else 0.10
-        upper = [s0, *band.upper]
-        lower = [s0, *band.lower]
-        # Upper edge: invisible line, no fill.
+    # --- Monte Carlo paths (thin, semi-transparent, branch from T_now) --------
+    # Seed off the ticker so DCM and VHM get distinct shapes (not one cloned
+    # wiggle scaled by price), yet each stays stable across reruns.
+    paths = simulate_gbm_paths(proj, n_paths, ticker=ticker)
+    for i, walk in enumerate(paths):
+        terminal_up = walk[-1] >= s0
+        color = _PATH_UP if terminal_up else _PATH_DOWN
         fig.add_trace(
             go.Scatter(
-                x=fwd_x, y=upper, mode="lines",
-                line=dict(width=0), hoverinfo="skip",
-                showlegend=False,
-            )
-        )
-        # Lower edge: fill up to the immediately-preceding upper trace.
-        fig.add_trace(
-            go.Scatter(
-                x=fwd_x, y=lower, mode="lines",
-                line=dict(width=0),
-                fill="tonexty",
-                fillcolor=f"rgba{(*_ACCENT_RGB, alpha)}",
-                name=f"±{band.z:.2f}σ",
+                x=fan_x,
+                y=[s0, *walk],
+                mode="lines",
+                line=dict(color=color, width=1),
+                name="Đường giả lập (Simulated Paths)" if i == 0 else None,
+                legendgroup="mc_paths",
+                showlegend=(i == 0),  # one legend entry for the whole bundle
                 hoverinfo="skip",
             )
         )
 
-    # --- Median (dashed accent line) -----------------------------------------
+    # --- Median trajectory (bold neon dashed) --------------------------------
     fig.add_trace(
         go.Scatter(
-            x=fwd_x, y=[s0, *proj.median], mode="lines",
-            name="Trung vị dự báo",
-            line=dict(color=f"rgb{_MEDIAN_RGB}", width=2, dash="dash"),
-            hovertemplate="T+%{x}: %{y:,.2f}<extra></extra>",
+            x=fan_x,
+            y=[s0, *proj.median],
+            mode="lines",
+            name="Kịch bản trung vị (Expected Median)",
+            line=dict(color=_MEDIAN_NEON, width=3, dash="dash"),
+            hovertemplate="%{x|%d/%m}: %{y:,.2f}<extra></extra>",
         )
     )
 
-    # --- T_now / T+5 / T+20 reference markers --------------------------------
-    fig.add_vline(x=0, line=dict(color="rgba(230,232,235,0.45)", width=1))
-    for h, label in ((5, "T+5"), (proj.days[-1], f"T+{proj.days[-1]}")):
-        if h <= proj.days[-1]:
-            fig.add_vline(
-                x=h, line=dict(color="rgba(139,149,165,0.45)", width=1, dash="dot")
-            )
-            fig.add_annotation(
-                x=h, y=1.0, yref="paper", showarrow=False, text=label,
-                font=dict(color="rgb(139,149,165)", size=11), yanchor="bottom",
-            )
-
-    title = f"Quạt dự báo kỹ thuật — {ticker}" if ticker else "Quạt dự báo kỹ thuật"
+    title = (
+        f"Quỹ đạo dự phóng biến động giá — {ticker}"
+        if ticker
+        else "Quỹ đạo dự phóng biến động giá"
+    )
     fig.update_layout(
         template="plotly_dark",
-        title=dict(text=title, font=dict(size=16)),
+        # Title pinned top-left; the horizontal legend is right-aligned and
+        # pushed clear of the title AND the bottom range-selector buttons.
+        title=dict(text=title, y=0.98, yanchor="top", x=0),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="rgb(230,232,235)"),
-        margin=dict(l=10, r=10, t=46, b=10),
-        height=460,
+        # Enterprise font enforced globally (axis / legend / title inherit).
+        font=dict(family=_FONT_FAMILY, color=_TEXT_MUTED),
+        margin=dict(t=100, b=40, l=60, r=40),
+        height=480,
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-        xaxis=dict(
-            title="Phiên giao dịch (0 = hôm nay)",
-            gridcolor="rgba(42,49,66,0.6)", zeroline=False,
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.08, xanchor="right", x=1,
+            font=dict(size=11, color=_TEXT_MUTED),
         ),
-        yaxis=dict(title="Giá (nghìn đồng)", gridcolor="rgba(42,49,66,0.6)"),
+        xaxis=dict(
+            type="date",
+            gridcolor="rgba(42,49,66,0.6)",
+            # Professional crosshair: a dotted spike that tracks the cursor.
+            showspikes=True, spikemode="toaxis+across", spikethickness=1,
+            spikecolor=_SPIKE_COLOR, spikedash="dot", spikesnap="cursor",
+            rangeslider=dict(visible=True),
+            rangeselector=dict(
+                bgcolor="#1a1f2b", activecolor="#2dd4a7",
+                font=dict(color="rgb(230,232,235)"),
+                bordercolor="rgba(42,49,66,0.8)", borderwidth=1,
+                buttons=[
+                    dict(count=1, label="1M", step="month", stepmode="backward"),
+                    dict(count=3, label="3M", step="month", stepmode="backward"),
+                    dict(count=6, label="6M", step="month", stepmode="backward"),
+                    dict(step="all", label="ALL"),
+                ],
+            ),
+        ),
+        yaxis=dict(
+            title="Giá (nghìn đồng)", gridcolor="rgba(42,49,66,0.6)",
+            showspikes=True, spikemode="toaxis+across", spikethickness=1,
+            spikecolor=_SPIKE_COLOR, spikedash="dot",
+        ),
     )
     return fig

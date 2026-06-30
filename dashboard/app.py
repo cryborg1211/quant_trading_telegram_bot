@@ -12,6 +12,7 @@ Run with:  streamlit run dashboard/app.py
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -26,6 +27,12 @@ load_dotenv(override=True)
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _DATA_DIR = _REPO_ROOT / "data"
 _DATA_FRESH_SECONDS = 86400 * 3  # parquet considered fresh if < 3 days old
+
+# `streamlit run dashboard/app.py` puts the script's dir (dashboard/) on
+# sys.path, NOT the repo root — so `import dashboard.*` fails. Prepend the repo
+# root so the package resolves.
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from dashboard.tabs import (  # noqa: E402 - import after load_dotenv by design
     audit,

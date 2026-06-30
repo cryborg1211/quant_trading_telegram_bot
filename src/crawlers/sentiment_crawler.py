@@ -10,11 +10,32 @@ from urllib.parse import urlparse
 
 import duckdb  # type: ignore[import-untyped]
 import pandas as pd
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from config.settings import CONFIG
 from src.data import price_lookup  # fresh-parquet liquidity ranking (stock_ohlcv retired)
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _is_transient_gemini_error(exc: BaseException) -> bool:
+    """True for transient Gemini server errors worth retrying (503 / UNAVAILABLE).
+
+    The new google-genai SDK raises ``ServerError`` with a numeric ``code`` for
+    5xx responses; older paths surface the status only in the message. Match
+    both, and NEVER retry client-side faults (4xx, JSON parse, bad key) — those
+    are permanent and would just burn the budget.
+    """
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if code in (502, 503, 504):
+        return True
+    text = str(exc).upper()
+    return any(tok in text for tok in ("503", "502", "504", "UNAVAILABLE", "OVERLOADED"))
 
 try:
     import feedparser
@@ -383,28 +404,55 @@ class SentimentCrawler:
         except Exception:
             return set()
 
-    def _score_item(self, item: NewsItem) -> dict:
+    @retry(
+        reraise=True,
+        retry=retry_if_exception(_is_transient_gemini_error),
+        wait=wait_exponential(multiplier=1, min=1, max=60),
+        stop=stop_after_attempt(5),
+    )
+    def _generate_content(self, user_message: str) -> str:
+        """Single Gemini call, retried with exponential backoff on 503/UNAVAILABLE.
+
+        Only the network call lives here so tenacity retries the TRANSIENT
+        failure and nothing else — JSON parsing / clamping happen in the caller
+        and a parse error is never retried. After 5 exhausted attempts the last
+        transient error is re-raised (``reraise=True``) for the caller to fall
+        back on.
+        """
+        response = self._client.models.generate_content(
+            model=self.model_name,
+            contents=user_message,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=DEFAULT_PROMPT,
+                response_mime_type="application/json",
+                temperature=0.0,
+            ),
+        )
+        return (response.text or "").strip()
+
+    def score_payload(
+        self, *, ticker: str | None, dt: date, title: str, content: str
+    ) -> dict:
+        """Score one article via Gemini → clamped {sentiment_score, magnitude, reason}.
+
+        Reusable scoring core shared by the live crawl (`_score_item`) and the
+        503 backfill script. On persistent failure (transient retries exhausted
+        OR a permanent error) returns a neutral payload whose ``reason`` is
+        prefixed ``Gemini fallback:`` — the exact marker the backfill query
+        targets.
+        """
         score = {"sentiment_score": 0.0, "magnitude": 0.0, "reason": "Neutral fallback"}
         if self._client is not None and genai_types is not None:
-            # DEFAULT_PROMPT is passed as system_instruction; user message contains only
-            # the article data so the model can focus on content, not instructions.
+            # DEFAULT_PROMPT is the system_instruction; the user message carries
+            # only article data so the model focuses on content, not directions.
             user_message = (
-                f"TICKER: {item.ticker or 'MARKET_WIDE'}\n"
-                f"DATE: {item.date.isoformat()}\n"
-                f"TITLE: {item.title}\n"
-                f"CONTENT: {item.text[: CONFIG.sentiment.article_char_limit]}"
+                f"TICKER: {ticker or 'MARKET_WIDE'}\n"
+                f"DATE: {dt.isoformat()}\n"
+                f"TITLE: {title}\n"
+                f"CONTENT: {content[: CONFIG.sentiment.article_char_limit]}"
             )
             try:
-                response = self._client.models.generate_content(
-                    model=self.model_name,
-                    contents=user_message,
-                    config=genai_types.GenerateContentConfig(
-                        system_instruction=DEFAULT_PROMPT,
-                        response_mime_type="application/json",
-                        temperature=0.0,
-                    ),
-                )
-                raw = (response.text or "").strip()
+                raw = self._generate_content(user_message)
                 # response_mime_type="application/json" avoids markdown fences,
                 # but keep the strip as a defensive fallback.
                 raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -415,11 +463,22 @@ class SentimentCrawler:
                     "reason": str(parsed.get("reason", ""))[:1000],
                 }
             except Exception as exc:
-                LOGGER.warning("[SentimentCrawler] Gemini scoring failed for %s: %s", item.url, exc)
+                LOGGER.warning("[SentimentCrawler] Gemini scoring failed (%s): %s", title[:60], exc)
                 score["reason"] = f"Gemini fallback: {exc}"
 
-        sentiment = max(-1.0, min(1.0, float(score["sentiment_score"])))
-        magnitude = max(0.0, min(1.0, float(score["magnitude"])))
+        score["sentiment_score"] = max(-1.0, min(1.0, float(score["sentiment_score"])))
+        score["magnitude"] = max(0.0, min(1.0, float(score["magnitude"])))
+        return score
+
+    def _score_item(self, item: NewsItem) -> dict:
+        score = self.score_payload(
+            ticker=item.ticker,
+            dt=item.date,
+            title=item.title,
+            content=item.text,
+        )
+        sentiment = score["sentiment_score"]
+        magnitude = score["magnitude"]
         # Market-wide RSS items carry no ticker — use the MARKET_WIDE sentinel
         # (same label the LLM prompt uses) so the NOT NULL filter in
         # _append_rows keeps them instead of dropping every RSS row.

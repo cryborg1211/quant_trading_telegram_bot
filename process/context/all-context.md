@@ -1,6 +1,6 @@
 # Quant Engine V4.0 - All Context
 
-Last updated: 2026-06-19
+Last updated: 2026-06-29
 
 This file is the root context entrypoint for the repo.
 
@@ -62,7 +62,7 @@ For most substantial tasks:
 | Group | Entry point | Scope |
 |---|---|---|
 | `planning/` | `process/context/planning/all-planning.md` | plan-shape calibration, planning examples, SIMPLE vs COMPLEX reference docs |
-| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 238 tests, in-memory DuckDB stubs, debugging quick-ref |
+| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 473 tests, in-memory DuckDB stubs, debugging quick-ref |
 
 ## Task Routing Table
 
@@ -205,7 +205,7 @@ stock_price_v3/
 - **Bot:** python-telegram-bot 22.7 (async PTB framework)
 - **HTTP:** aiohttp 3.13, requests 2.33
 - **Config:** python-dotenv 1.2 (.env), dataclass-based settings with JSON overrides
-- **Testing:** pytest (238 tests, in-memory DuckDB stubs)
+- **Testing:** pytest (473 tests, in-memory DuckDB stubs)
 - **Deployment:** Bare metal VPS — systemd (bot), cron (daily pipeline at 15:30 ICT Mon–Fri)
 
 ## Key Patterns and Conventions
@@ -230,6 +230,10 @@ stock_price_v3/
 
 **Sentiment-entry paper-log:** `sentiment_entry_paperlog` DuckDB table (+ `seq_sentiment_entry_id` sequence) captures the full candidate cross-section on every daily pipeline run (`source='daily'`) and every `/verify` invocation (`source='verify'`). Columns: per-horizon model probabilities, `decision_5d` argmax, `sentiment_score`, `entry_close`, `ret_3d`, `ret_20d`, `outcome_filled`. Backfill is PROGRESSIVE (fixed 2026-06-22, `_backfill_paperlog_outcomes`): `ret_3d` fills once the T+3 window matures (scan gate `_PAPERLOG_SHORT_MATURE_DAYS`=4 calendar days), `ret_20d` at `_PAPERLOG_MATURE_DAYS`=21 days; `outcome_filled` flips TRUE only when the terminal T+20 return lands (rows with only `ret_3d` stay pending). Uses `price_lookup`; see `doc/audit_paperlog_temporal_flaw.md`. Config knobs: `CONFIG.trading.sentiment_entry_enabled` (default True) / `sentiment_entry_threshold` (default 0.7, analysis-time reference only — all rows are logged regardless). Analysis: `scripts/analyze_sentiment_paperlog.py`. Tests: `tests/test_sentiment_paperlog.py` (10 tests). Shipped 2026-06-16; `source='daily'` row not yet confirmed in production (requires one live cron run at 15:30 ICT).
 
+**Model accuracy auditor (2026-06-29):** `src/utils/accuracy_audit.py` — READ-ONLY confusion-matrix analytics layered on top of `sentiment_entry_paperlog` (no new table, no serve-path write). `classify_outcome` maps each settled row to TP/FP/TN/FN (BUY=positive class: BUY+R>0=TP, BUY+R≤0=FP, SELL/HOLD+R≤0=TN, SELL/HOLD+R>0=FN), `summarize_accuracy` yields BUY Precision = TP/(TP+FP) and Defensive Recall = TN/(TN+FN), `build_accuracy_report` renders a 🟢🔴🔵 last-15 table. Realized return = `ret_20d`; settled = `outcome_filled=TRUE`; prefers arbitrated `final_decision`, falls back to `decision_5d`. Decision encoding (shared with the arbitrator): `0=SELL/EXIT, 1=HOLD, 2=BUY`. Wired to a NEW bot command `/audit_accuracy` (system-wide — paperlog is global, no user_id); `/audit_weekly` is unchanged (post-mortem + engine-picks). Tests: `tests/test_accuracy_audit.py` (16). A consolidated spec to build a parallel `model_predictions_audit` table was deliberately REJECTED as redundant with the paperlog + temporal-flaw-prone.
+
+**Gemini 503 resilience (2026-06-29):** `sentiment_crawler._generate_content` is the single Gemini call, `tenacity @retry` wrapped — `wait_exponential(multiplier=1, min=1, max=60)`, `stop_after_attempt(5)`, retry ONLY on transient errors via `_is_transient_gemini_error` (503/502/504/UNAVAILABLE/OVERLOADED by `.code` or message); 4xx + JSON-parse errors are never retried. Reusable scoring core extracted to `SentimentCrawler.score_payload` (shared by `_score_item` + the backfill). On exhausted retries it falls back to a neutral row with `reason='Gemini fallback: ...'`. Backfill of historically corrupted rows: `scripts/backfill_sentiment_503.py` (re-scores `reason LIKE 'Gemini fallback%'` from stored `title` — NO `text_raw` column exists — UPDATEs by `url`; dry-run default, `--commit` to write). `tenacity==9.1.4` pinned. Tests: `tests/test_sentiment_resilience.py` (15).
+
 **Telegram formatting:** Strict 4096-char limit. HTML mode with careful tag closure. Long reports split into multiple messages.
 
 **Hub nodes (highest blast radius):**
@@ -247,7 +251,9 @@ stock_price_v3/
 
 **Deprecated:** `alpha360_generator.py` is gutted in V4.0 — system is purely tabular.
 
-**Local dashboard (new program, 2026-06-19):** Streamlit dashboard for a single Windows laptop user. Package root: `dashboard/` (new, not yet created — P1 scope). No-polling architecture: send-only Telegram alerter, no PTB ApplicationBuilder anywhere in `dashboard/`. Reuses `main.daily_inference(broadcast=False)`, `verify_single_ticker`, `inference_for_holdings`, `PortfolioManager`, `signal_ledger`, `audit_evaluator.run_post_mortem`. Installer: Inno Setup `setup.exe` (P4 scope) — no PyInstaller.
+**Local dashboard (new program, 2026-06-19):** Streamlit dashboard for a single Windows laptop user. Package root: `dashboard/`. No-polling architecture: send-only Telegram alerter, no PTB ApplicationBuilder anywhere in `dashboard/`. Reuses `main.daily_inference(broadcast=False)`, `verify_single_ticker`, `inference_for_holdings`, `PortfolioManager`, `signal_ledger`, `audit_evaluator.run_post_mortem`. Tabs: `mua/ban/giu/verify/audit/settings/tam_nhin`. Launch: `streamlit run dashboard/app.py` — `app.py` prepends repo-root to `sys.path` (streamlit puts only the script dir on path). Dashboard reads of serve-built signal dicts must coerce the Telegram-display `price` string via `headless._parse_price` (serve stores `"22,600 VND"` text). Installer: Inno Setup `setup.exe` (P4 scope) — no PyInstaller.
+
+**Tầm Nhìn fan-chart (2026-06-29):** `dashboard/tabs/tam_nhin.py` + `dashboard/utils/fan_chart.py` — TradingView-style pure-technical forecast: `go.Candlestick` history + 12 Monte Carlo GBM paths + neon median (no shaded bands), rangeslider/rangeselector, crosshair spikes (`spikemode="toaxis+across"`). `project_fan` still computes analytic bands (unit-tested) but the figure draws MC paths instead. MC seed is per-ticker (`_ticker_seed` = `crc32(ticker)`, NOT `hash()` which is process-salted) — a single shared seed made every ticker render one cloned wiggle shape. Needs OHLC, so `price_lookup.ohlc_history(ticker, n)` was added alongside `close_history`. Tests: `tests/test_dashboard_fan_chart.py`.
 
 ## Environment and Configuration
 

@@ -71,11 +71,65 @@ def test_non_positive_prices_filtered() -> None:
     assert math.isfinite(proj.median[0])
 
 
-def test_build_figure_returns_traces() -> None:
-    closes = _ramp()
+def _ohlc(n: int = 60, start: float = 50.0, step: float = 0.1) -> list:
+    """Synthetic ascending OHLC rows (date, open, high, low, close)."""
+    from datetime import date, timedelta
+
+    d0 = date(2026, 1, 1)
+    out = []
+    for i in range(n):
+        c = start + step * i
+        out.append((d0 + timedelta(days=i), c - 0.05, c + 0.1, c - 0.1, c))
+    return out
+
+
+def test_build_figure_candlestick_and_mc_paths() -> None:
+    ohlc = _ohlc()
+    closes = [row[4] for row in ohlc]
     proj = project_fan(closes, horizon=20)
-    fig = build_fan_figure(closes, proj, ticker="HPG")
+    fig = build_fan_figure(ohlc, proj, ticker="HPG", n_paths=12)
     assert isinstance(fig, go.Figure)
-    # history + median + 2 traces per band (upper edge + filled lower edge).
-    assert len(fig.data) == 2 + 2 * len(proj.bands)
-    assert any(getattr(t, "fill", None) == "tonexty" for t in fig.data)
+    # 1 candlestick + 12 Monte Carlo paths + 1 neon median = 14 traces.
+    assert len(fig.data) == 14
+    assert any(isinstance(t, go.Candlestick) for t in fig.data)
+    # No legacy shaded fan band survives.
+    assert not any(getattr(t, "fill", None) == "tonexty" for t in fig.data)
+    # The bold neon median is present at width 3.
+    assert any(
+        getattr(getattr(t, "line", None), "color", None) == "#00F2FE"
+        and getattr(getattr(t, "line", None), "width", None) == 3
+        for t in fig.data
+    )
+
+
+def test_simulate_gbm_paths_shape_and_determinism() -> None:
+    from dashboard.utils.fan_chart import simulate_gbm_paths
+
+    proj = project_fan(_ramp(), horizon=20)
+    a = simulate_gbm_paths(proj, 12, ticker="HPG")
+    b = simulate_gbm_paths(proj, 12, ticker="HPG")
+    assert len(a) == 12 and all(len(p) == 20 for p in a)
+    assert a == b  # same ticker → deterministic across calls (no rerun jitter)
+
+
+def test_simulate_gbm_paths_differ_by_ticker() -> None:
+    # Root-cause guard: a shared seed made every ticker clone one wiggle shape.
+    # Normalise out s0/mu/sigma scaling by comparing the standardised SHAPE of
+    # the first path — different tickers must yield different shapes.
+    from dashboard.utils.fan_chart import simulate_gbm_paths
+
+    proj = project_fan(_ramp(), horizon=20)
+    dcm = simulate_gbm_paths(proj, 12, ticker="DCM")
+    vhm = simulate_gbm_paths(proj, 12, ticker="VHM")
+    assert dcm != vhm
+    # Even path-0 (same proj, so same mu/sigma/s0) must diverge → proves the
+    # underlying random draws differ, not just a scalar rescale.
+    assert dcm[0] != vhm[0]
+
+
+def test_ticker_seed_is_process_stable() -> None:
+    # crc32-based seed must NOT depend on PYTHONHASHSEED (unlike builtin hash).
+    from dashboard.utils.fan_chart import _ticker_seed
+
+    assert _ticker_seed("DCM") == _ticker_seed("dcm")  # normalised upper
+    assert _ticker_seed("DCM") != _ticker_seed("VHM")

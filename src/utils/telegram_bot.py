@@ -136,6 +136,7 @@ HELP_TEXT = (
     "➖ <b>/remove</b> <i>[Mã]</i> — Xóa cổ phiếu khỏi danh mục "
     "(VD: <code>/remove VNE</code>).\n"
     "📅 <b>/audit_weekly</b> — Xem lại hiệu quả các quyết định 7 ngày qua.\n"
+    "🎯 <b>/audit_accuracy</b> — Độ chính xác mô hình (ma trận nhầm lẫn, Precision/Recall).\n"
     "🗓️ <b>/audit_monthly</b> — Xem lại hiệu quả các quyết định 30 ngày qua.\n"
     "📰 <b>/news</b> — Tổng hợp tin tức thị trường mới nhất.\n"
     "💬 <b>/feedback</b> <i>[Nội dung]</i> — Gửi góp ý trực tiếp đến Admin.\n"
@@ -1323,6 +1324,46 @@ async def audit_monthly_command(update: Update, context: ContextTypes.DEFAULT_TY
     await _run_audit_command(update, command_label="audit_monthly", days=30)
 
 
+async def audit_accuracy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
+    """Confusion-matrix accuracy audit of the model's OWN settled predictions.
+
+    System-wide (paperlog is global, not user-scoped): grades every settled
+    forward prediction in `sentiment_entry_paperlog` into TP/FP/TN/FN and reports
+    BUY precision + defensive recall + the last 15 settled positions. Read-only.
+    """
+    if update.message is None:
+        return
+    _log_request("/audit_accuracy", update)
+
+    wait_msg = await update.message.reply_text(
+        "⏳ Đang chấm điểm độ chính xác mô hình "
+        "<i>(ma trận nhầm lẫn trên các dự báo đã chốt T+20)</i>...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    try:
+        from src.utils.accuracy_audit import build_accuracy_report  # noqa: PLC0415
+
+        report_html: str = await asyncio.to_thread(build_accuracy_report)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("/audit_accuracy crashed")
+        await wait_msg.edit_text(
+            f"❌ <b>Lỗi hậu kiểm:</b> <code>{html.escape(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not report_html or not report_html.strip():
+        await wait_msg.edit_text(
+            "📭 <b>Chưa có dự báo nào đã chốt (T+20) để hậu kiểm.</b>\n"
+            "<i>Cần ít nhất một dự báo đủ ~21 ngày để chốt kết quả.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await _send_or_reply_chunks(update, wait_msg, _split_html_report(report_html))
+
+
 async def rebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
     """Fetch live holdings and reply with an AI portfolio rebalance recommendation."""
     if update.message is None:
@@ -1486,6 +1527,7 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("add", "Thêm cổ phiếu vào danh mục (VD: /add VNE 1000 32.5)"),
     BotCommand("remove", "Xóa cổ phiếu khỏi danh mục (VD: /remove VNE)"),
     BotCommand("audit_weekly", "Hậu kiểm /verify & /add trong 7 ngày qua"),
+    BotCommand("audit_accuracy", "Độ chính xác mô hình — TP/FP/TN/FN, Precision/Recall"),
     BotCommand("audit_monthly", "Hậu kiểm /verify & /add trong 30 ngày qua"),
     BotCommand("news", "Tổng hợp tin tức từ 20 nguồn gần nhất"),
     BotCommand("feedback", "Gửi góp ý trực tiếp đến Admin (VD: /feedback ...)"),
@@ -1612,6 +1654,7 @@ def build_application() -> Application:
     # Post-mortem audit — weekly/monthly review of /verify + /add accuracy.
     app.add_handler(CommandHandler("audit_weekly", audit_weekly_command))
     app.add_handler(CommandHandler("audit_monthly", audit_monthly_command))
+    app.add_handler(CommandHandler("audit_accuracy", audit_accuracy_command))
 
     # --- Phase 4 ---
     app.add_handler(CommandHandler("rebalance", rebalance_command))

@@ -19,20 +19,19 @@ _HISTORY_SESSIONS = 120
 _HORIZON = 20
 
 
-def _load_closes(ticker: str) -> list[float]:
-    """Recent close series for ``ticker`` (empty list on any failure)."""
+def _load_ohlc(ticker: str) -> list[tuple[object, float, float, float, float]]:
+    """Recent ``(date, open, high, low, close)`` history (``[]`` on failure)."""
     from src.data import price_lookup  # noqa: PLC0415 — lazy heavy import
 
-    history = price_lookup.close_history(ticker, n=_HISTORY_SESSIONS)
-    return [c for _date, c in history]
+    return price_lookup.ohlc_history(ticker, n=_HISTORY_SESSIONS)
 
 
 def render() -> None:
     """Render the Tầm Nhìn Thuật Toán (technical fan-chart) tab."""
     st.header("Tầm Nhìn Thuật Toán")
     st.caption(
-        "Dự báo kỹ thuật thuần túy (mô hình GBM từ chính lịch sử giá) — "
-        "KHÔNG dùng AI / tin tức, vẽ tức thì."
+        "Hệ thống mô phỏng Monte Carlo dựa trên mô hình hình học Geometric "
+        "Brownian Motion (GBM) từ chuỗi tỷ suất sinh lợi lịch sử."
     )
 
     ticker = st.text_input("Mã cổ phiếu", key="fan_ticker").strip().upper()
@@ -40,29 +39,42 @@ def render() -> None:
         st.info("Nhập một mã để xem quạt dự báo T+5 / T+20.")
         return
 
-    closes = _load_closes(ticker)
-    if len(closes) < 2:
+    ohlc = _load_ohlc(ticker)
+    if len(ohlc) < 2:
         st.warning(
             f"Không đủ dữ liệu giá cho {ticker} để dựng dự báo "
             "(cần ít nhất 2 phiên)."
         )
         return
 
+    closes = [row[4] for row in ohlc]
     try:
         proj = project_fan(closes, horizon=_HORIZON)
     except ValueError:
         st.warning(f"Dữ liệu giá của {ticker} không hợp lệ để dự báo.")
         return
 
-    fig = build_fan_figure(closes, proj, ticker=ticker)
+    # --- Metric strip (BELOW input, ABOVE chart) -----------------------------
+    sigma_daily = proj.sigma
+    current_price = proj.s0
+    has_t5 = len(proj.median) >= 5
+    t5_median = proj.median[4] if has_t5 else current_price
+    t5_pct = (t5_median / current_price - 1.0) if current_price else 0.0
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric(
+        label="Độ biến động ngày (Volatility)",
+        value=f"{sigma_daily:.2%}",
+        help="σ tính từ chuỗi log-returns",
+    )
+    m2.metric(
+        label="Expected T+5 Median",
+        value=f"{t5_median:,.2f}",
+        delta=f"{t5_pct:.1%}",
+    )
+    m3.metric(label=f"Thị giá hiện tại ({ticker})", value=f"{current_price:,.2f}")
+
+    fig = build_fan_figure(ohlc, proj, ticker=ticker)
     # theme=None: keep the figure's own dark layout (Streamlit's theme override
     # would otherwise restyle the fan colors).
     st.plotly_chart(fig, use_container_width=True, theme=None)
-
-    drift_pct = (proj.median[4] / proj.s0 - 1.0) * 100.0 if len(proj.median) >= 5 else 0.0
-    st.caption(
-        f"σ ngày ≈ {proj.sigma * 100:.2f}%  ·  trung vị T+5 ≈ {proj.median[4]:,.2f} "
-        f"({drift_pct:+.1f}%)  ·  giá hiện tại {proj.s0:,.2f}"
-        if len(proj.median) >= 5
-        else f"σ ngày ≈ {proj.sigma * 100:.2f}%  ·  giá hiện tại {proj.s0:,.2f}"
-    )

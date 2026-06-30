@@ -1,60 +1,115 @@
-# SESSION HANDOFF — 2026-06-26 (Quant Engine V4)
+# SESSION HANDOFF — 2026-06-29 (Quant Engine V4)
+
+## NEXT TASK = AUDIT THIS SESSION'S WORK
+All work below is **UNCOMMITTED** in the working tree (HEAD = `96fdeb2`, branch
+`main`). Next session: review the diff for correctness before committing. Code
+graph rebuilt 2026-06-29 (2351 nodes / 23154 edges / 261 files) — use
+`detect_changes` + `get_review_context` against the working tree.
 
 ## STATE NOW
-- Branch **`main`** @ `bb24146`, **pushed to origin** (github.com/cryborg1211/quant_trading_telegram_bot). `HEAD == origin/main`.
-- Working tree: handoff edit pending; plan file `process/features/local-dashboard/active/audit-engine-picks_PLAN_26-06-26.md` still in **active/** (DONE — ready to archive to completed/).
-- Untracked (other thread, leave alone): `scripts/benchmark_defense_layers.py`-era reports + `garch_hmm_brake_sweep_s1_h5.csv`.
-- Test suite: **417 passed**.
-- **NEXT TASK = UI/UX of the Streamlit dashboard** (pointers below).
+- Branch **`main`** @ `96fdeb2`. Nothing from this session committed yet.
+- Test suite: **473 passed** (was 417 at session start; +56 net new).
+- Python: `C:\Users\caokh\AppData\Local\Programs\Python\Python311\python.exe`
+  (polars/ML/pytest/streamlit). conda has NO polars. PowerShell only.
+- `streamlit` app is RUNNING (holds a lock on `data/quant_v6_core.duckdb`) →
+  any direct DuckDB read from a 2nd process fails until it's closed.
 
-## DONE THIS SESSION — Audit-system overhaul (3 commits, pushed)
-Audited + fixed the post-mortem audit system end-to-end:
-- `94d66a1` **fix(dashboard): feed audit_log** — verify logged on the RUN (was: only on the rare Telegram-push button); `/add` now writes an `add` audit row in `headless.portfolio_add` (was: none → dead NET-PnL branch). +2 tests.
-- `f717cb1` **feat(dashboard): win/loss hit-rate** — `_summarize_hit_rate` in `audit_evaluator.py`; win-rate = up/(up+down), flat excluded, mean return. Caption promised it, report lacked it. +2 tests.
-- `88db58e` **feat(audit): grade engine's own picks** — `run_post_mortem` now appends an engine-picks section grading the GLOBAL `dispatched_signals` ledger (cron-written, no user_id) entry→exit, NET of round-trip; exit = close on hold_days-th trading session after dispatch (matured) else latest close (provisional). Reuses hit-rate. READ-ONLY — no dispatch/serve change. +5 tests.
+## CHANGED FILES (the audit surface)
 
-### Audit-system scorecard (was broken → now)
-| # | Problem | Status |
-|---|---|---|
-| 1 | verify logged only on Telegram push | ✅ logs on run |
-| 2 | `/add` wrote no audit row | ✅ logs `add` |
-| 3 | engine's own picks never graded | ✅ grades `dispatched_signals` ledger |
-| 4 | caption promised hit-rate, none shown | ✅ win/loss summary |
-| 5 | zero tests on audit path | ✅ 9 tests (`tests/test_dashboard_audit_logging.py`) |
-| 7 | stale `stock_ohlcv` docstring | ✅ fixed |
-| 4b | user-cmd section not horizon-aligned (T_now=today) | ⏳ deferred (semantic redesign) |
+### Dashboard fixes (3 bugs, user-reported live)
+- `dashboard/app.py` — **module-not-found fix.** `streamlit run` puts the script
+  dir (`dashboard/`) on `sys.path`, not repo root → `import dashboard.*` failed.
+  Added `sys.path.insert(0, _REPO_ROOT)` guard before the dashboard imports.
+- `dashboard/tabs/mua.py` — **"could not convert '22,600 VND'" crash.** Serve
+  path (`main.py:1350`) stores `signal["price"]` as Telegram-display text; MUA's
+  raw `float()` choked. Routed both price reads through existing
+  `headless._parse_price`. Serve format untouched (bot still gets its string).
 
-### ⚠️ Audit operational caveats
-- `dispatched_signals` ledger = **0 rows right now** → engine-picks section is invisible until a live cron broadcast dispatch books signals (15:30 ICT, paper-only). Code correct + unit-tested; just needs real data.
-- Dashboard user namespace = `LOCAL_USER_ID = "local"`. Bot-era audit rows (telegram id) won't appear under "local" — expected.
-- `suggest_buy` bot command still logs with NULL ticker (`telegram_bot.py:638`) → filtered out. Left as-is: the ledger supersedes it for grading. Only revisit if per-command audit is wanted (serve-path change).
+### Fan-chart redesign — `dashboard/utils/fan_chart.py` (TradingView-style)
+- Replaced history line with `go.Candlestick` (#22c55e / #ef4444); removed shaded
+  fan bands; added **12 Monte Carlo GBM paths** + neon median (#00F2FE);
+  rangeslider + 1M/3M/6M/ALL rangeselector; crosshair spikes
+  (`spikemode="toaxis+across"` — `"both"` is NOT valid plotly); transparent bg;
+  enterprise strings + `st.columns(3)` metric strip (Volatility / Expected T+5
+  Median / current price) in `dashboard/tabs/tam_nhin.py`.
+- **Per-ticker MC seed** (`_ticker_seed` = `crc32(ticker)`, not `hash()` which is
+  process-salted). FIXED a real bug: a single shared seed `_MC_SEED=7` made every
+  ticker draw the IDENTICAL standard-normal sequence → all fans were one cloned
+  shape scaled by price. Now DCM ≠ VHM, still stable across reruns.
+- `src/data/price_lookup.py` — new `ohlc_history(ticker, n)` (candles need OHLC;
+  `close_history` only returned closes). Mirrors the single-shard read contract.
 
-## ALSO LANDED (parallel thread, on main, pushed)
-- `f1cf636` **benchmark complete** — 7 defense arms scored; `regime+garch` WON (Sharpe −0.364→+0.005, MaxDD −55%→−26%). `macro_hmm` HURTS (killed). Single-seed bear-OOS, breakeven ≠ alpha.
-- `bb24146` **GARCH-HMM brake wired into live dispatch, default-ON.** (Note: the f1cf636 handoff had recommended default-OFF until multi-seed confirm; the wiring shipped default-ON. ⚠️ Multi-seed (seeds 1–3) still NOT confirmed — seed-1 has 2/9 cells cached. If revisiting risk posture, that gap stands.)
+### Model accuracy auditor (NEW — paperlog-integrated, READ-ONLY)
+- `src/utils/accuracy_audit.py` — confusion-matrix analytics over the EXISTING
+  `sentiment_entry_paperlog` (no new table, no serve-path write). `classify_outcome`
+  (BUY+R>0=TP, BUY+R≤0=FP, SELL/HOLD+R≤0=TN, SELL/HOLD+R>0=FN), `summarize_accuracy`
+  (BUY Precision, Defensive Recall), `build_accuracy_report` (15-row 🟢🔴🔵 table).
+  Realized return = `ret_20d`; settled = `outcome_filled=TRUE`.
+- `src/utils/telegram_bot.py` — new `/audit_accuracy` command (system-wide; paperlog
+  is global, no user_id). **`/audit_weekly` left untouched** (keeps last session's
+  post-mortem + engine-picks grading).
+- ⚠️ Was a consolidated user spec to build a NEW `model_predictions_audit` table +
+  patch capture in 3 serve routes + `settle_matured_predictions`. REJECTED as
+  redundant (paperlog already captures+settles) and bug-prone (spec's calendar-add
+  settlement reintroduces the fixed temporal flaw). User approved the lean path.
 
-## NEXT — UI/UX of the dashboard (this is the next box)
-Streamlit single-user local app. Package root `dashboard/`. No-polling, send-only Telegram.
-- Entry: `dashboard/app.py` (tab router). Launch: `streamlit run dashboard/app.py`.
-- Theme: `dashboard/theme.py` + `.streamlit/config.toml` — **dark-premium theme already shipped** (`836cbc7`). Build UI work ON this theme.
-- Tabs (`dashboard/tabs/`): `mua.py` (buy signals), `ban.py` (sell/hold), `giu.py` (holdings/portfolio), `verify.py` (single-ticker check), `audit.py` (post-mortem), `settings.py`.
-- Components (`dashboard/components/`): `ticker_card.py` (signal card — main visual unit), `signal_bar.py`.
-- Wrappers: `dashboard/utils/headless.py` (preview-safe inference, `broadcast=False persist=False`), `thread_runner.py` (background + TTL cache so UI doesn't freeze).
-- Known UI debt: `src/reports/builders.py:326` hardcodes `5 ngày tới` instead of `{SHORT_HORIZON_DAYS}` (Telegram report text).
-- Suggest: start UI/UX work with the `vc-frontend-design` skill / `vc-ui-ux-designer` agent. Screenshot current tabs first (Streamlit running) to baseline before redesign.
+### Gemini 503 resilience + backfill
+- `src/crawlers/sentiment_crawler.py` — extracted the Gemini call into
+  `_generate_content`, `@retry`-wrapped (tenacity: `wait_exponential(1..60)`,
+  `stop_after_attempt(5)`, retry ONLY on transient via `_is_transient_gemini_error`
+  = 503/502/504/UNAVAILABLE/OVERLOADED). New reusable `score_payload`; `_score_item`
+  now delegates to it. 4xx / JSON-parse errors are NOT retried.
+- `scripts/backfill_sentiment_503.py` — re-scores `reason LIKE 'Gemini fallback%'`
+  rows, UPDATEs by `url`. Dry-run default; `--commit` to write. ⚠️ NOTE: user added
+  a `time.sleep(10)` at the end of `backfill_503()` (rate-limit pacing?) — this makes
+  the 3 backfill unit tests sleep 10s each. Harmless but slow; flag if it bites CI.
+- `requirements.txt` — pinned `tenacity==9.1.4` (was installed, unpinned).
 
-## ENV GOTCHAS (CRITICAL — these cost whole sessions)
-- **LAPTOP DIES CONSTANTLY** (power-off + RAM exhaustion). All heavy scripts are resumable (per-cell/arm cache) — relaunch same command. Keep plugged + awake.
-- git-bash BROKEN → **PowerShell only** for git/python/pytest. Bash tool fails on quotes.
-- **PowerShell native-arg quirk:** embedded `"` inside a `@'...'@` here-string passed to `git commit -m` gets re-split into pathspecs → commit fails. Keep commit messages quote-free (use `--` not quoted phrases).
-- python = `C:\Users\caokh\AppData\Local\Programs\Python\Python311\python.exe` (has polars/ML/pytest/streamlit). conda has NO polars. **Always explicit path.**
+### Tests (+56)
+- `tests/test_dashboard_fan_chart.py` — rewritten for candlestick + MC paths +
+  per-ticker-seed divergence + crc32 stability.
+- `tests/test_accuracy_audit.py` (16) — matrix, precision/recall, query contract.
+- `tests/test_sentiment_resilience.py` (15) — retry/give-up/no-retry-on-4xx,
+  clamp, fallback, backfill recover/skip/dry-run.
+
+## NOT DONE (deferred, explicit user calls)
+- **Arbitration risk-gate** (cross-check classifier vs path-median vs sentiment).
+  User reviewed; decided NOT a new file — harden existing
+  `make_final_decision` (quant_agent_arbitrator.py:923): tighten sentiment veto
+  −0.5→−0.2 + add `expected_return` param. Then said "leave it aside." UNSTARTED.
+  Needs kill-switch + A/B before default-on (touches degree-84 serve hub).
+- Wiring `accuracy_audit` into the dashboard Audit tab (currently bot-only).
+- Committing ANY of this session's work.
+
+## AUDIT TARGETS / RISK NOTES for next session
+1. **Serve-path touch:** only `sentiment_crawler.py` (refactor) + `telegram_bot.py`
+   (new command) are serve-side. fan_chart/mua/tam_nhin/accuracy_audit are
+   read-only/dashboard. Confirm the crawler refactor preserves `_score_item`
+   output exactly (parity test: full suite green).
+2. **Empty-data caveats:** `dispatched_signals` and the new accuracy report are
+   EMPTY until a live cron broadcast + T+20 maturity. Code unit-tested; needs real
+   data to show non-empty.
+3. **Transparent fan-chart bg** was the cause of an earlier "unreadable font"
+   report; re-introduced per explicit redesign spec. All text colors now explicit
+   light (#A3AED0) so it reads on the dark container. If it goes unreadable again,
+   that's why.
+4. **`backfill_sentiment_503.py` `time.sleep(10)`** — user-added; slows the 3
+   backfill tests. Not a bug, but verify intent during audit.
+
+## ENV GOTCHAS (CRITICAL)
+- git-bash BROKEN → **PowerShell only** for git/python/pytest.
+- PowerShell native-arg quirk: embedded `"` in a `@'...'@` here-string to
+  `git commit -m` re-splits into pathspecs → commit fails. Keep messages quote-free.
+- python = explicit `C:\Users\caokh\AppData\Local\Programs\Python\Python311\python.exe`.
 - Prefix heavy runs: `$env:PYTHONIOENCODING="utf-8"`.
-- code-review-graph post-commit hook → cp1252 `UnicodeEncodeError` = **COSMETIC, commit succeeds.**
-- Subagents only get (broken) Bash → can't run python. **Orchestrator runs + commits.**
+- code-review-graph post-commit hook → cp1252 `UnicodeEncodeError` = COSMETIC,
+  commit succeeds.
+- DuckDB locked while streamlit runs — close it before any 2nd-process DB read.
 
 ## KEY CMDS
-- tests: `python -m pytest -q` (417 pass)
-- audit tests only: `python -m pytest tests/test_dashboard_audit_logging.py -q`
+- tests: `python -m pytest -q` (473 pass)
+- new-work tests only: `python -m pytest tests/test_accuracy_audit.py tests/test_sentiment_resilience.py tests/test_dashboard_fan_chart.py -q`
 - launch dashboard: `streamlit run dashboard/app.py`
-- smoke audit report: `python -c "from src.utils.audit_evaluator import run_post_mortem; print(run_post_mortem('local',30))"`
-- resume brake sweep (multi-seed): `python scripts/sweep_garch_hmm_brake.py --floors 0.1,0.2,0.3 --caps 0.94,0.96,0.98 --seed-idx N`
+- 503 backfill (preview): `python scripts/backfill_sentiment_503.py`  (add `--commit` to write)
+- accuracy report smoke: `python -c "from src.utils.accuracy_audit import build_accuracy_report; print(build_accuracy_report())"`
+- rebuild graph: code-review-graph `build_or_update_graph_tool(full_rebuild=True)`

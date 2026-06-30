@@ -164,6 +164,36 @@ def close_history(
         return []
 
 
+def ohlc_history(
+    ticker: str, n: int = 120, conn: Any | None = None
+) -> list[tuple[Any, float, float, float, float]]:
+    """Last ``n`` ``(date, open, high, low, close)`` rows, ascending by date.
+
+    OHLC sibling of :func:`close_history` for the candlestick fan-chart. Same
+    single-shard read + clean-degrade-to-``[]`` contract. Rows with any NULL
+    OHLC field are dropped so Plotly's candlestick never receives a gap.
+    """
+    src = _shard_source(ticker)
+    if src is None:
+        return []
+    try:
+        with _conn_ctx(conn) as c:
+            rows = c.execute(
+                f"SELECT CAST(date AS DATE) AS d, open, high, low, close FROM {src} "
+                "WHERE open IS NOT NULL AND high IS NOT NULL "
+                "AND low IS NOT NULL AND close IS NOT NULL ORDER BY d DESC LIMIT ?",
+                [int(n)],
+            ).fetchall()
+        return [
+            (r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4]))
+            for r in reversed(rows)
+            if r and None not in r[1:]
+        ]
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("price_lookup.ohlc_history(%s) failed: %s", ticker, exc)
+        return []
+
+
 def trading_dates_after(ref_date: Any, conn: Any | None = None) -> list[Any]:
     """DISTINCT trading dates STRICTLY AFTER ``ref_date``, sorted ASC.
 
