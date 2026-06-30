@@ -941,12 +941,3 @@ class WalkForwardEngine:
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Convenience: rejection histogram
-# ─────────────────────────────────────────────────────────────────────────────
-
-def rejection_histogram(result: WalkForwardResult) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for r in result.rejections:
-        out[r["reason"]] = out.get(r["reason"], 0) + 1
-    return out

@@ -133,44 +133,14 @@ def latest_close(ticker: str, conn: Any | None = None) -> float | None:
         return None
 
 
-def close_history(
-    ticker: str, n: int = 120, conn: Any | None = None
-) -> list[tuple[Any, float]]:
-    """Last ``n`` ``(date, close)`` rows for ``ticker``, ascending by date.
-
-    Reads the single per-ticker shard (no glob). Used by the technical
-    fan-chart forecast. Returns ``[]`` on a malformed ticker, missing shard, or
-    read failure so the caller degrades cleanly to a "no data" message.
-    """
-    src = _shard_source(ticker)
-    if src is None:
-        return []
-    try:
-        with _conn_ctx(conn) as c:
-            rows = c.execute(
-                f"SELECT CAST(date AS DATE) AS d, close FROM {src} "
-                "WHERE close IS NOT NULL ORDER BY d DESC LIMIT ?",
-                [int(n)],
-            ).fetchall()
-        # Query is DESC (newest first) so the LIMIT keeps the most recent n;
-        # reverse to ascending for plotting.
-        return [
-            (r[0], float(r[1]))
-            for r in reversed(rows)
-            if r and r[1] is not None
-        ]
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("price_lookup.close_history(%s) failed: %s", ticker, exc)
-        return []
-
-
 def ohlc_history(
     ticker: str, n: int = 120, conn: Any | None = None
 ) -> list[tuple[Any, float, float, float, float]]:
     """Last ``n`` ``(date, open, high, low, close)`` rows, ascending by date.
 
-    OHLC sibling of :func:`close_history` for the candlestick fan-chart. Same
-    single-shard read + clean-degrade-to-``[]`` contract. Rows with any NULL
+    Single-shard ``(date, O, H, L, C)`` reader for the candlestick fan-chart.
+    Clean-degrade-to-``[]`` contract (malformed ticker / missing shard / read
+    failure). Rows with any NULL
     OHLC field are dropped so Plotly's candlestick never receives a gap.
     """
     src = _shard_source(ticker)
