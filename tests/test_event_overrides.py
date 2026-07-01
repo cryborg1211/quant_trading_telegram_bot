@@ -62,6 +62,17 @@ def test_bear_veto_hard_blocks_strong_signal():
     assert "TIN X" in ov["AAA"]["status"]            # HỦY BỎ (TIN XẤU)
 
 
+def test_bear_veto_boundary_exact_threshold_not_vetoed():
+    # Condition is `< EVENT_BEAR_SENTIMENT`; exactly -0.5 must NOT veto.
+    # Mirrors make_final_decision's tested contract (test_arbitrator.py
+    # test_boundary_sentiment_minus_0_5_not_overridden) — the two veto
+    # layers must agree at this boundary.
+    preds = _preds(AAA=0.52)
+    sents = {"AAA": {"sentiment_score": EVENT_BEAR_SENTIMENT}}
+    ov, rescued = build_event_overrides(preds, sents, UNIVERSE, top_buy_signals=["AAA"])
+    assert ov == {} and rescued == []
+
+
 def test_normal_signal_no_override():
     preds = _preds(AAA=0.52)
     sents = {"AAA": {"sentiment_score": 0.10}}        # neutral news

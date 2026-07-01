@@ -292,8 +292,7 @@ def mr_score_tickers(tickers: list[str]) -> dict[str, dict[str, Any]]:
 # (the artifact filename embeds the horizon to prevent cross-horizon overwrite).
 # Loader is cached per horizon so the bot keeps a hot in-memory copy of each.
 _V3_BUNDLE_PATHS: dict[int, Path] = {
-    3:  Path("models/saved/v3_ensemble_3d.joblib"),
-    5:  Path("models/saved/v3_ensemble_5d.joblib"),   # retired short horizon (kept loadable)
+    5:  Path("models/saved/v3_ensemble_5d.joblib"),   # verify-only short horizon
     20: Path("models/saved/v3_ensemble_20d.joblib"),
 }
 # Short horizon = /verify-only cross-check model (T+5, recovered 16-06-26).
@@ -1035,7 +1034,7 @@ def daily_inference(
     # SECONDARY horizon = arbitrator cross-check ONLY; it must NEVER abort the
     # PRIMARY command.  If the OTHER brain's artifact is missing or version-
     # mismatched, degrade to an empty dict (evaluate_trades_batch falls back to
-    # the primary probs per-ticker).  Short horizon = T+3 (verify-only model);
+    # the primary probs per-ticker).  Short horizon = T+5 (verify-only model);
     # it serves here purely as the arbitrator's second opinion.
     _secondary_h = 20 if int(horizon) == SHORT_HORIZON else SHORT_HORIZON
     try:
@@ -1219,12 +1218,12 @@ def build_event_overrides(
         if t in overrides:
             continue
         ss = float(all_sentiments.get(t, {}).get("sentiment_score", 0.0) or 0.0)
-        if ss <= EVENT_BEAR_SENTIMENT:
+        if ss < EVENT_BEAR_SENTIMENT:
             overrides[t] = {
                 "status": "HỦY BỎ (TIN XẤU)",
                 "weight": 0.0,
                 "ly_do": (
-                    f"Kỹ thuật ủng hộ MUA nhưng tin tức RẤT xấu (sentiment={ss:+.2f} ≤ "
+                    f"Kỹ thuật ủng hộ MUA nhưng tin tức RẤT xấu (sentiment={ss:+.2f} < "
                     f"{EVENT_BEAR_SENTIMENT:+.2f}) → PHỦ QUYẾT, chặn lệnh (0% NAV)."
                 ),
             }
@@ -1242,7 +1241,7 @@ def _tranche_signal_fields(strategy: dict | None, n_picks: int, horizon: int = 2
     if not strategy or strategy.get("mode") != "tranche":
         return {}
     book_hold = int(strategy.get("hold_days", 30))
-    # Short-horizon cards (T+3/T+5) size AND hold on their own horizon; the
+    # Short-horizon cards (T+5) size AND hold on their own horizon; the
     # primary (>=20) keeps the validated 30-session book (every artifact ships
     # hold_days=30). Cohort weight = NAV/(hold*picks), capped at the 20% per-name
     # NAV ceiling (src/bot/sizing.DEFAULT_NAV_CAP) so e.g. a 3-day single pick
@@ -1698,7 +1697,7 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
     # universe so the cross-sectional `_xsz` ranks are non-degenerate.  The
     # predictions dict below is keyed by ticker, so we slice the RESULT instead.
 
-    # --- Step 2: Stacking GBDT inference (T+3 short primary + 20d cross-check) ---
+    # --- Step 2: Stacking GBDT inference (T+5 short primary + 20d cross-check) ---
     try:
         stacking_5d, _, _, _, _ = predict_v3_horizon(latest_df, SHORT_HORIZON)
     except Exception as exc:  # noqa: BLE001
