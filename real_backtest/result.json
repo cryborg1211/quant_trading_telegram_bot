@@ -1,0 +1,509 @@
+[
+  {
+    "ticker": "PLX",
+    "prediction_date": "2026-06-03 00:00:00",
+    "price_at_prediction": 40200.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "GAS",
+    "prediction_date": "2026-06-03 00:00:00",
+    "price_at_prediction": 84800.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "BVH",
+    "prediction_date": "2026-06-03 00:00:00",
+    "price_at_prediction": 68100.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "BCM",
+    "prediction_date": "2026-06-04 00:00:00",
+    "price_at_prediction": 53700.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "FPT",
+    "prediction_date": "2026-06-04 00:00:00",
+    "price_at_prediction": 76500.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "BVH",
+    "prediction_date": "2026-06-04 00:00:00",
+    "price_at_prediction": 69700.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "BCM",
+    "prediction_date": "2026-06-04 00:00:00",
+    "price_at_prediction": 53700.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "FPT",
+    "prediction_date": "2026-06-04 00:00:00",
+    "price_at_prediction": 76500.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "BVH",
+    "prediction_date": "2026-06-04 00:00:00",
+    "price_at_prediction": 69700.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+  "ticker": "MWG",
+  "prediction_date": "2026-06-16 00:00:00",
+  "price_at_prediction": 76400.0,
+  "decision": "HOLD",
+  "horizon": 3,
+  "nav": null,
+  "actual_price_at_t": null,
+  "is_correct": null
+  },
+  {
+    "ticker": "SSB",
+    "prediction_date": "2026-06-30 00:00:00",
+    "price_at_prediction": 14800.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "VIB",
+    "prediction_date": "2026-06-30 00:00:00",
+    "price_at_prediction": 16250.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "MBB",
+    "prediction_date": "2026-06-30 00:00:00",
+    "price_at_prediction": 25300.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+  "ticker": "SSI",
+  "prediction_date": "2026-06-16 00:00:00",
+  "price_at_prediction": 27050.0,
+  "decision": "SELL",
+  "horizon": 3,
+  "nav": null,
+  "actual_price_at_t": null,
+  "is_correct": null
+},
+{
+    "ticker": "SSB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 14900.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "VIB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 16400.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "BID",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 42950.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },{
+    "ticker": "SSB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 14900.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "VIB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 16400.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "BID",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 42950.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },{
+    "ticker": "SSB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 14900.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "VIB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 16400.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "BID",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 42950.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },{
+    "ticker": "SSB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 14900.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "VIB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 16400.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "BID",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 42950.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },{
+    "ticker": "SSB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 14900.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "VIB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 16400.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "BID",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 42950.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  }, {
+    "ticker": "SSB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 14900.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "VIB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 16400.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "BID",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 42950.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },{
+    "ticker": "SSB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 14900.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "VIB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 16400.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "BID",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 42950.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  }, {
+    "ticker": "SSB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 14900.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "VIB",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 16400.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "BID",
+    "prediction_date": "2026-06-18 00:00:00",
+    "price_at_prediction": 42950.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  }, 
+  {
+  "ticker": "VIC",
+  "prediction_date": "2026-06-18 00:00:00",
+  "price_at_prediction": 192000.0,
+  "decision": "HOLD",
+  "horizon": 5,
+  "nav": null,
+  "actual_price_at_t": null,
+  "is_correct": null
+},
+{
+  "ticker": "VHM",
+  "prediction_date": "2026-06-19 00:00:00",
+  "price_at_prediction": 144400.0,
+  "decision": "BUY",
+  "horizon": 5,
+  "nav": "1.7%",
+  "actual_price_at_t": null,
+  "is_correct": null
+},{
+  "ticker": "VHM",
+  "prediction_date": "2026-06-19 00:00:00",
+  "price_at_prediction": 144400.0,
+  "decision": "BUY",
+  "horizon": 5,
+  "nav": "1.7%",
+  "actual_price_at_t": null,
+  "is_correct": null
+},
+  {
+    "ticker": "VIC",
+    "prediction_date": "2026-06-19 00:00:00",
+    "price_at_prediction": 205500.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "VJC",
+    "prediction_date": "2026-06-19 00:00:00",
+    "price_at_prediction": 140500.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "VHM",
+    "prediction_date": "2026-06-19 00:00:00",
+    "price_at_prediction": 145300.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  }, 
+  {
+    "ticker": "VHM",
+    "prediction_date": "2026-06-19 00:00:00",
+    "price_at_prediction": 145300.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "VRE",
+    "prediction_date": "2026-06-19 00:00:00",
+    "price_at_prediction": 29350.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },
+  {
+    "ticker": "SSB",
+    "prediction_date": "2026-06-19 00:00:00",
+    "price_at_prediction": 14900.0,
+    "decision": "REJECT",
+    "horizon": 5,
+    "nav": null,
+    "actual_price_at_t": null,
+    "is_correct": null
+  },{
+  "ticker": "MWG",
+  "prediction_date": "2026-06-21 00:00:00",
+  "price_at_prediction": 78000.0,
+  "decision": "HOLD",
+  "horizon": 5,
+  "nav": null,
+  "actual_price_at_t": null,
+  "is_correct": null
+},{
+  "ticker": "BCM",
+  "prediction_date": "2026-06-25 00:00:00",
+  "price_at_prediction": 52800.0,
+  "decision": "BUY",
+  "horizon": 5,
+  "nav": "5.0%",
+  "actual_price_at_t": null,
+  "is_correct": null
+},{
+  "ticker": "SSB",
+  "prediction_date": "2026-06-25 00:00:00",
+  "price_at_prediction": 15150.0,
+  "decision": "BUY",
+  "horizon": 5,
+  "nav": "5.0%",
+  "actual_price_at_t": null,
+  "is_correct": null
+},{
+  "ticker": "VHM",
+  "prediction_date": "2026-06-29 00:00:00",
+  "price_at_prediction": 156010.0,
+  "decision": "HOLD",
+  "horizon": 5,
+  "nav": null,
+  "actual_price_at_t": null,
+  "is_correct": null
+},{
+  "ticker": "VIC",
+  "prediction_date": "2026-06-29 00:00:00",
+  "price_at_prediction": 228000.0,
+  "decision": "HOLD",
+  "horizon": 5,
+  "nav": null,
+  "actual_price_at_t": null,
+  "is_correct": null
+}
+]

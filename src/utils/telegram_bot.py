@@ -129,7 +129,7 @@ HELP_TEXT = (
     "📒 <b>/exits</b> — Vị thế tranche đang mở + số phiên còn lại.\n"
     "🔴 <b>/suggest_sell</b> — Đánh giá NÊN BÁN hay GIỮ danh mục của bạn.\n"
     "⚖️ <b>/rebalance</b> — Tư vấn cơ cấu lại danh mục hiện tại.\n"
-    "🔍 <b>/verify</b> <i>[Mã]</i> — Soi nhanh 1 cổ phiếu, mô hình T+3 &amp; T+20 "
+    "🔍 <b>/verify</b> <i>[Mã]</i> — Soi nhanh 1 cổ phiếu, mô hình T+5 &amp; T+20 "
     "(VD: <code>/verify HPG</code>).\n"
     "➕ <b>/add</b> <i>[Mã] [Số lượng] [Giá]</i> — Thêm cổ phiếu vào danh mục "
     "(VD: <code>/add VNE 1000 32.5</code>).\n"
@@ -1029,7 +1029,7 @@ async def exits_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Run ad-hoc short-horizon (T+3) quant + LLM-sentiment analysis on a single ticker.
+    """Run ad-hoc short-horizon (T+5) quant + LLM-sentiment analysis on a single ticker.
 
     Use case: a user hears a rumor / sees news and wants instant verification
     before manually trading. Output combines the 5d Stacking GBDT prediction
@@ -1523,7 +1523,7 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("exits", "Vị thế tranche đang mở + số phiên còn lại"),
     BotCommand("suggest_sell", "Lấy khuyến nghị BÁN/HOLD cho danh mục cá nhân"),
     BotCommand("rebalance", "AI tư vấn cơ cấu danh mục hiện tại"),
-    BotCommand("verify", "Kiểm định nhanh 1 cổ phiếu — T+3 & T+20 (VD: /verify HPG)"),
+    BotCommand("verify", "Kiểm định nhanh 1 cổ phiếu — T+5 & T+20 (VD: /verify HPG)"),
     BotCommand("add", "Thêm cổ phiếu vào danh mục (VD: /add VNE 1000 32.5)"),
     BotCommand("remove", "Xóa cổ phiếu khỏi danh mục (VD: /remove VNE)"),
     BotCommand("audit_weekly", "Hậu kiểm /verify & /add trong 7 ngày qua"),
