@@ -73,7 +73,16 @@ def render() -> None:
     )
 
     if not signal_list:
-        st.info("Không có tín hiệu mua cho khung thời gian này.")
+        # Post-arbitration empty book: serve now returns the monitoring-only
+        # top-3 report (Telegram HTML) instead of nothing — render it so the
+        # dashboard matches the bot's behaviour.
+        if _html and _html.strip():
+            with st.container(border=True):
+                st.markdown(
+                    _html.replace("\n", "<br>"), unsafe_allow_html=True,
+                )
+        else:
+            st.info("Không có tín hiệu mua cho khung thời gian này.")
         return
 
     for sig in signal_list:
@@ -90,6 +99,7 @@ def render() -> None:
             weight_pct=float(sig.get("suggested_weight", 0.0) or 0.0) * 100.0,
             hold_days=_hold_days(sig, horizon),
             on_add_click=True,
+            sig=sig,  # full dict → Telegram-card parity sections
         )
         if clicked:
             st.session_state["giu_prefill"] = {

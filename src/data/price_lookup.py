@@ -135,13 +135,14 @@ def latest_close(ticker: str, conn: Any | None = None) -> float | None:
 
 def ohlc_history(
     ticker: str, n: int = 120, conn: Any | None = None
-) -> list[tuple[Any, float, float, float, float]]:
-    """Last ``n`` ``(date, open, high, low, close)`` rows, ascending by date.
+) -> list[tuple[Any, float, float, float, float, float]]:
+    """Last ``n`` ``(date, open, high, low, close, volume)`` rows, ascending.
 
-    Single-shard ``(date, O, H, L, C)`` reader for the candlestick fan-chart.
-    Clean-degrade-to-``[]`` contract (malformed ticker / missing shard / read
-    failure). Rows with any NULL
-    OHLC field are dropped so Plotly's candlestick never receives a gap.
+    Single-shard OHLCV reader for the candlestick fan-chart (volume feeds the
+    TV-style volume pane). Clean-degrade-to-``[]`` contract (malformed ticker /
+    missing shard / read failure). Rows with any NULL OHLC field are dropped so
+    Plotly's candlestick never receives a gap; a NULL volume degrades to 0.0
+    (that session's volume bar just renders empty).
     """
     src = _shard_source(ticker)
     if src is None:
@@ -149,15 +150,17 @@ def ohlc_history(
     try:
         with _conn_ctx(conn) as c:
             rows = c.execute(
-                f"SELECT CAST(date AS DATE) AS d, open, high, low, close FROM {src} "
+                f"SELECT CAST(date AS DATE) AS d, open, high, low, close, volume "
+                f"FROM {src} "
                 "WHERE open IS NOT NULL AND high IS NOT NULL "
                 "AND low IS NOT NULL AND close IS NOT NULL ORDER BY d DESC LIMIT ?",
                 [int(n)],
             ).fetchall()
         return [
-            (r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4]))
+            (r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4]),
+             float(r[5]) if r[5] is not None else 0.0)
             for r in reversed(rows)
-            if r and None not in r[1:]
+            if r and None not in r[1:5]
         ]
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("price_lookup.ohlc_history(%s) failed: %s", ticker, exc)
