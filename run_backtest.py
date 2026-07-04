@@ -80,7 +80,10 @@ def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
                      pt_sigma: float | None = None,
                      sl_sigma: float | None = None,
                      use_regime_sizing: bool = False,
-                     use_nav_tier_cap: bool = False) -> WalkForwardConfig:
+                     use_nav_tier_cap: bool = False,
+                     admission_mode: str = "cross_sectional",
+                     admission_floor: float = 0.45,
+                     admission_pool_cap: int = 6) -> WalkForwardConfig:
     """Pure WalkForwardConfig builder — extracted from `run_oos` so the
     mode/hold-days plumbing is unit-testable without running the engine.
 
@@ -102,6 +105,9 @@ def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
         tranche_sl_sigma=sl_sigma,
         use_regime_sizing=use_regime_sizing,
         use_nav_tier_cap=use_nav_tier_cap,
+        admission_mode=admission_mode,
+        admission_floor=admission_floor,
+        admission_pool_cap=admission_pool_cap,
         constraints=PortfolioConstraints(
             max_weight=cfg.max_weight, long_only=True,
             target_leverage=0.95, target_vol=cfg.target_vol),
@@ -117,7 +123,10 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
             pt_sigma: float | None = None,
             sl_sigma: float | None = None,
             use_regime_sizing: bool = False,
-            use_nav_tier_cap: bool = False) -> pd.DataFrame:
+            use_nav_tier_cap: bool = False,
+            admission_mode: str = "cross_sectional",
+            admission_floor: float = 0.45,
+            admission_pool_cap: int = 6) -> pd.DataFrame:
     """Walk-forward OOS using the pure-tabular ensemble oracle.
 
     The engine builds (n, 1, F) single-bar tensors internally (seq_len=1) and the
@@ -141,13 +150,18 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
 
     wf_cfg = _build_wf_config(tabular_features, cutoff, cfg, mode, hold_days,
                               pt_sigma, sl_sigma, use_regime_sizing,
-                              use_nav_tier_cap)
+                              use_nav_tier_cap, admission_mode, admission_floor,
+                              admission_pool_cap)
     eng = WalkForwardEngine(wf_cfg, oracle)
     # Soft HMM regime scaling: P(Bull) multiplies the daily target weights.
     result = eng.run(sub, corporate_actions=corporate_actions, p_bull_series=p_bull_series,
                      inference_cache=inference_cache)
     eq = result.equity_curve
     eq = eq[pd.to_datetime(eq["date"]).dt.date >= cutoff].reset_index(drop=True)
+    # Surface the serve-mirror admission diagnostic to in-process callers (the
+    # A/B grid) via pandas metadata — keeps the bare-DataFrame return contract
+    # that the threshold sweep in `main()` depends on unchanged.
+    eq.attrs["zero_candidate_days"] = int(result.zero_candidate_days)
     return eq
 
 
@@ -304,7 +318,10 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
          pt_sigma: float | None = None,
          sl_sigma: float | None = None,
          use_regime_sizing: bool = False,
-         use_nav_tier_cap: bool = False) -> None:
+         use_nav_tier_cap: bool = False,
+         admission_mode: str = "cross_sectional",
+         admission_floor: float = 0.45,
+         admission_pool_cap: int = 6) -> None:
     configure_logging()
     t_start = time.perf_counter()
     sweep_thresholds = list(sweep_thresholds or DEFAULT_SWEEP_THRESHOLDS)
@@ -396,7 +413,10 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
                                  mode=mode, hold_days=hold_days,
                                  pt_sigma=pt_sigma, sl_sigma=sl_sigma,
                                  use_regime_sizing=use_regime_sizing,
-                                 use_nav_tier_cap=use_nav_tier_cap)
+                                 use_nav_tier_cap=use_nav_tier_cap,
+                                 admission_mode=admission_mode,
+                                 admission_floor=admission_floor,
+                                 admission_pool_cap=admission_pool_cap)
                     m = equity_metrics(eq, cfg.initial_capital)
                     # Inline UP-precision @thr (no log spam)
                     if len(Xte_all) > 0:
@@ -761,7 +781,8 @@ def _export_only(cfg: RunConfig, tabular_features: list[str],
     LOGGER.info("=" * 100)
 
 
-def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None, float | None, bool]:
+def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
+                    float | None, bool, bool, str, float, int]:
     p = argparse.ArgumentParser(
         description="V4.0 Fast Evaluator — sweep + DSR/PBO on a frozen training checkpoint.")
     p.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH,
@@ -786,6 +807,18 @@ def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
     p.add_argument("--nav-tier-cap", action="store_true", default=False,
                    help="enable the discrete 20/60/80%% NAV portfolio deployment cap "
                         "(src/trading/risk_tier.py; A/B experiment — default off)")
+    p.add_argument("--admission-mode", choices=("cross_sectional", "absolute_gate"),
+                   default="cross_sectional",
+                   help="tranche admission rule: 'cross_sectional' = top-N above "
+                        "signal_threshold (default, unchanged); 'absolute_gate' = mirror "
+                        "serve's meta-gate (p_up >= --admission-floor first, cap the pool "
+                        "at --admission-pool-cap, then top-N; A/B experiment — default off)")
+    p.add_argument("--admission-floor", type=float, default=0.45,
+                   help="absolute P(UP) floor for --admission-mode absolute_gate "
+                        "(inclusive >=, mirrors serve's up_threshold; default 0.45)")
+    p.add_argument("--admission-pool-cap", type=int, default=6,
+                   help="survivor-pool cap before the top-N slice under absolute_gate "
+                        "(mirrors serve's _ARBITRATOR_POOL; default 6)")
     p.add_argument("--liquid-top-n", type=int, default=None, help="VN50 ADV gate (default 50)")
     p.add_argument("--max-positions", type=int, default=None)
     p.add_argument("--rebalance-frequency", type=int, default=None)
@@ -819,13 +852,16 @@ def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
              if a.sweep_thresholds else None)
     return (a.checkpoint, overrides, sweep, (not a.no_save), a.export_only,
             a.mode, a.hold_days, a.tranche_pt, a.tranche_sl, a.regime_sizing,
-            a.nav_tier_cap)
+            a.nav_tier_cap, a.admission_mode, a.admission_floor,
+            a.admission_pool_cap)
 
 
 if __name__ == "__main__":
     (_ckpt, _overrides, _sweep, _save, _export,
-     _mode, _hold, _pt, _sl, _regime, _tier_cap) = _cli()
+     _mode, _hold, _pt, _sl, _regime, _tier_cap,
+     _adm_mode, _adm_floor, _adm_cap) = _cli()
     main(_ckpt, eval_overrides=_overrides, sweep_thresholds=_sweep,
          save_bot_payload=_save, export_only=_export, mode=_mode, hold_days=_hold,
          pt_sigma=_pt, sl_sigma=_sl, use_regime_sizing=_regime,
-         use_nav_tier_cap=_tier_cap)
+         use_nav_tier_cap=_tier_cap, admission_mode=_adm_mode,
+         admission_floor=_adm_floor, admission_pool_cap=_adm_cap)

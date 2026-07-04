@@ -184,6 +184,27 @@ class WalkForwardConfig:
     # GOLDEN eval until the A/B vs. use_regime_sizing says it earns its keep.
     use_nav_tier_cap: bool = False
 
+    # ── SERVE-MIRROR ADMISSION (A/B experiment — default off) ────────────────
+    # Gates WHICH NAMES enter a tranche (orthogonal to use_nav_tier_cap, which
+    # gates HOW MUCH TOTAL NAV a tranche deploys). Two modes:
+    #   "cross_sectional" → UNCHANGED default: rank by P(UP), take the top
+    #       `max_positions` names above `signal_threshold` every trading day
+    #       (the validated tranche book — a low relative floor that the top-N
+    #       book saturates against, so a day almost always deploys SOMETHING).
+    #   "absolute_gate"   → mirrors serve's `main.predict_v3_horizon` meta-gate:
+    #       filter today's ranked candidates to `p_up >= admission_floor` FIRST
+    #       (an ABSOLUTE floor, inclusive `>=` matching serve's `meta_gate`),
+    #       cap the survivor list at `admission_pool_cap` (serve's
+    #       `_ARBITRATOR_POOL=6`), THEN take the top `max_positions` of that
+    #       capped/filtered list. When zero names clear the floor the day
+    #       deploys NOTHING and the budget stays cash — mirroring serve's
+    #       zero-candidate-day fall-to-cash economics (NOT its Vietnamese-text
+    #       monitoring card, a display-layer concern out of scope here).
+    # Default "cross_sectional" ⇒ existing `_tranche_day` admission byte-for-byte.
+    admission_mode: str = "cross_sectional"
+    admission_floor: float = 0.45
+    admission_pool_cap: int = 6
+
     # OOS gate: only place trades on/after this date.  Days before it are still
     # iterated (NAV marked, corporate actions applied, features/cov built from
     # them) so the engine has lookback, but NO trade is initiated until the
@@ -247,6 +268,12 @@ class WalkForwardResult:
     metrics: dict
     final_nav: float
     final_cash: float
+    # Serve-mirror admission diagnostic (A/B experiment). Number of OOS trading
+    # days where the `absolute_gate` admission filter produced an EMPTY survivor
+    # list (nothing cleared `admission_floor`) so the tranche budget stayed cash.
+    # Always 0 for `admission_mode="cross_sectional"` (no absolute floor), so the
+    # default preserves the existing result contract for every other caller.
+    zero_candidate_days: int = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -294,6 +321,9 @@ class WalkForwardEngine:
         # A tranche expires `tranche_hold_days` trading days after entry; its
         # positions are then sold (retrying daily on rejection / missing print).
         self._tranches: list[dict] = []
+        # Serve-mirror admission diagnostic: OOS days where the `absolute_gate`
+        # survivor list was empty (budget stayed cash). Reset per `run()`.
+        self._zero_candidate_days: int = 0
 
     # ── Public entrypoint ──────────────────────────────────────────────────
     def run(
@@ -330,6 +360,7 @@ class WalkForwardEngine:
 
         self.cash = self.config.initial_capital
         self._prev_nav = self.config.initial_capital
+        self._zero_candidate_days = 0
 
         for i, D in enumerate(self.calendar):
             self._dividend_cash_today = 0.0
@@ -741,8 +772,12 @@ class WalkForwardEngine:
            (retrying daily until empty — halts, band floors, and ATC volume
            caps just defer the exit).
         3. BUY today's tranche: NAV/`tranche_hold_days` × P(Bull), split
-           equally across the day's top `max_positions` names above
-           `signal_threshold`.
+           equally across the day's admitted names. Admission depends on
+           `admission_mode`: "cross_sectional" (default) takes the top
+           `max_positions` above `signal_threshold`; "absolute_gate" filters to
+           `p_up >= admission_floor` first, caps at `admission_pool_cap`, then
+           takes the top `max_positions` (empty survivor list ⇒ zero orders,
+           budget stays cash, `zero_candidate_days` incremented).
 
         Position record: {"qty", "entry_price", "entry_vol", "exit_pending"}.
         """
@@ -802,8 +837,24 @@ class WalkForwardEngine:
             return n_orders, n_fills, n_rej
 
         order_idx = np.argsort(p_up)[::-1]
-        picks = [tickers[j] for j in order_idx
-                 if p_up[j] >= cfg.signal_threshold][:cfg.max_positions]
+        if cfg.admission_mode == "absolute_gate":
+            # Serve-mirror admission: ABSOLUTE floor first (inclusive `>=`,
+            # matching serve's `meta_gate`), cap the survivor pool at
+            # `admission_pool_cap` (serve's `_ARBITRATOR_POOL`), THEN take the
+            # top `max_positions` of that capped/filtered list. An empty survivor
+            # list deploys nothing (budget stays cash) — mirrors serve's
+            # zero-candidate-day fall-to-cash economics.
+            survivors = [tickers[j] for j in order_idx
+                         if p_up[j] >= cfg.admission_floor][:cfg.admission_pool_cap]
+            if not survivors:
+                self._zero_candidate_days += 1
+                return n_orders, n_fills, n_rej
+            picks = survivors[:cfg.max_positions]
+        else:
+            # "cross_sectional" — UNCHANGED default: top-N above the relative
+            # `signal_threshold` floor (byte-for-byte the pre-A/B admission).
+            picks = [tickers[j] for j in order_idx
+                     if p_up[j] >= cfg.signal_threshold][:cfg.max_positions]
         if not picks:
             return n_orders, n_fills, n_rej
 
@@ -931,6 +982,7 @@ class WalkForwardEngine:
             metrics=metrics,
             final_nav=float(eq["nav"].iloc[-1]) if len(eq) else self.cash,
             final_cash=self.cash,
+            zero_candidate_days=self._zero_candidate_days,
         )
 
     def _metrics(self, eq: pd.DataFrame) -> dict:
