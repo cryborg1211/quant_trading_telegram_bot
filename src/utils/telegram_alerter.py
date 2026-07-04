@@ -120,8 +120,17 @@ class TelegramBot:
         `reasoning_vi`); the old Điểm cộng / Điểm trừ / Kết luận three-line block
         (which restated the same points) is gone.  Shared verbatim by the push
         alert AND the interactive /suggest_buy report (_build_combined_report).
+
+        TWO LAYOUTS, ONE FUNCTION (backward compat by field presence):
+          • legacy — signal dicts without attribution fields render the
+            pre-attribution card byte-for-byte (old tests + old artifacts);
+          • attribution — when `_dispatch_signals` supplies the overlay fields
+            (garch_scalar / arb_note_vi / risk_tier_*), the card gains the
+            unified 4-section contract: Header → Xác suất (model) →
+            Lớp giám sát (regime/GARCH/arbitrator) → Triển khai danh mục
+            (risk tier + sizing + hold rule).
         """
-        date_str = datetime.now().strftime("%d/%m/%Y")
+        date_str = datetime.now().strftime("%d/%m/%Y %H:%M")
 
         def esc(key: str, default: str = "") -> str:
             return html.escape(str(signal_data.get(key, default)))
@@ -194,17 +203,91 @@ class TelegramBot:
 
         source_line = format_source_links(signal_data.get("article_urls", []) or [])
 
+        # ── Attribution fields (unified 4-section contract) ──────────────
+        # All optional: absent → legacy layout, no stray "N/A" lines.
+        base_decision = signal_data.get("base_decision_vi")
+        garch_scalar = signal_data.get("garch_scalar")
+        arb_note = signal_data.get("arb_note_vi")
+        tier_label = signal_data.get("risk_tier_label_vi")
+        tier_pct = signal_data.get("risk_tier_pct")
+
+        garch_line = ""
+        if garch_scalar is not None:
+            try:
+                _gs = float(garch_scalar)
+                _gs_txt = (f"Đang phanh — hạ tỷ trọng ×{_gs:.2f}" if _gs < 1.0
+                           else "Không kích hoạt (×1.00)")
+                garch_line = f"Phanh biến động GARCH: <b>{_gs_txt}</b>"
+            except (TypeError, ValueError):
+                garch_line = ""
+
+        has_attribution = bool(garch_line or arb_note or
+                               (tier_label and tier_pct is not None))
+
+        base_line = ""
+        if base_decision:
+            base_line = (f"Phân loại gốc của mô hình: "
+                         f"<b>{html.escape(str(base_decision))}</b>\n")
+
+        if not has_attribution:
+            # Legacy layout — pre-attribution card, unchanged structure.
+            return (
+                f"<b>KHUYẾN NGHỊ MUA — {ticker}</b>\n"
+                f"{horizon_label} Model  |  Khuyến nghị đi vốn: <b>{sizing_str}</b>\n"
+                f"{regime_line}"
+                f"{hold_line}"
+                f"{event_line}"
+                f"{date_str}  |  Vùng giá: <b>{price}</b>\n"
+                f"\n"
+                f"<b>Xác suất xu hướng ({horizon_label})</b>\n"
+                f"{trend_line}\n"
+                f"{base_line}"
+                f"\n"
+                f"<b>Nhận định</b>\n"
+                f"{analysis}\n"
+                f"\n"
+                f"{source_line}"
+            )
+
+        # ── Unified 4-section card ────────────────────────────────────────
+        oversight_lines = []
+        if regime_line:
+            oversight_lines.append(regime_line.rstrip("\n"))
+        regime_action = signal_data.get("regime_action_vi")
+        if regime_action:
+            oversight_lines.append(
+                f"Điều chỉnh theo pha: {html.escape(str(regime_action))}")
+        if garch_line:
+            oversight_lines.append(garch_line)
+        if arb_note:
+            oversight_lines.append(f"Trọng tài tin tức: {html.escape(str(arb_note))}")
+        oversight_block = ""
+        if oversight_lines:
+            oversight_block = ("<b>Lớp giám sát</b>\n"
+                               + "\n".join(oversight_lines) + "\n\n")
+
+        deploy_lines = []
+        if tier_label and tier_pct is not None:
+            deploy_lines.append(
+                f"Hạng rủi ro thị trường: <b>{html.escape(str(tier_label))}</b> "
+                f"(trần {int(tier_pct)}% NAV toàn danh mục)")
+        deploy_lines.append(f"Khuyến nghị đi vốn: <b>{sizing_str}</b>")
+        if hold_line:
+            deploy_lines.append(hold_line.rstrip("\n"))
+        deploy_block = ("<b>Triển khai danh mục</b>\n"
+                        + "\n".join(deploy_lines) + "\n\n")
+
         return (
             f"<b>KHUYẾN NGHỊ MUA — {ticker}</b>\n"
-            f"{horizon_label} Model  |  Khuyến nghị đi vốn: <b>{sizing_str}</b>\n"
-            f"{regime_line}"
-            f"{hold_line}"
+            f"{horizon_label} Model  |  {date_str}  |  Vùng giá: <b>{price}</b>\n"
             f"{event_line}"
-            f"{date_str}  |  Vùng giá: <b>{price}</b>\n"
             f"\n"
             f"<b>Xác suất xu hướng ({horizon_label})</b>\n"
             f"{trend_line}\n"
+            f"{base_line}"
             f"\n"
+            f"{oversight_block}"
+            f"{deploy_block}"
             f"<b>Nhận định</b>\n"
             f"{analysis}\n"
             f"\n"

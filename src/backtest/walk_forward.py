@@ -79,6 +79,7 @@ from src.trading.regime_policy import (
     PENALTY_REGIMES,
     REGIME_PENALTY_FACTOR,
 )
+from src.trading.risk_tier import apply_nav_tier_cap, classify_risk_tier
 
 LOGGER = logging.getLogger("backtest.walk_forward")
 
@@ -172,6 +173,16 @@ class WalkForwardConfig:
     # serve INTENT via the scale-invariant factor instead. Default False ⇒ no
     # allocation change (existing behaviour byte-for-byte).
     use_regime_sizing: bool = False
+
+    # ── DISCRETE NAV-TIER PORTFOLIO CAP (A/B experiment — UNVALIDATED) ───────
+    # When True, each day's NEW tranche budget is clamped so TOTAL deployment
+    # (nav − cash) never exceeds the discrete tier cap from
+    # src/trading/risk_tier.py: RISK_HIGH 20% / RISK_MID 60% / RISK_LOW 80% of
+    # NAV, classified from that day's P(Bull). Existing positions are never
+    # force-liquidated — a tier downgrade bleeds down as tranches expire.
+    # Default False ⇒ existing behaviour byte-for-byte. Do not enable in the
+    # GOLDEN eval until the A/B vs. use_regime_sizing says it earns its keep.
+    use_nav_tier_cap: bool = False
 
     # OOS gate: only place trades on/after this date.  Days before it are still
     # iterated (NAV marked, corporate actions applied, features/cov built from
@@ -799,6 +810,14 @@ class WalkForwardEngine:
         p_bull = float(np.clip(self._p_bull.get(D, 1.0), 0.0, 1.0))
         nav = self._compute_nav(D)
         budget = (nav / cfg.tranche_hold_days) * p_bull
+        if cfg.use_nav_tier_cap:
+            # Discrete portfolio cap (risk_tier.py): clamp NEW deployment so
+            # total invested (nav − cash) stays under the tier ceiling. Uses
+            # the same p_bull the budget already scales by; no per-ticker
+            # regime input here (market-wide cap, not a per-name rule).
+            tier = classify_risk_tier(p_bull)
+            deployed = nav - max(self.cash, 0.0)
+            budget = apply_nav_tier_cap(budget, nav, deployed, tier)
         budget = min(budget, max(self.cash, 0.0) / (1.0 + cfg.fee_buffer))
         if budget <= 0:
             return n_orders, n_fills, n_rej

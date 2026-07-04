@@ -75,3 +75,68 @@ def test_card_escapes_malicious_ticker():
 def test_card_escapes_conclusion_html():
     c = _card(conclusion="<b>x</b>")
     assert "&lt;b&gt;x&lt;/b&gt;" in c and "<b>x</b>" not in c
+
+
+# ── Unified 4-section attribution card (02-07-26) ──────────────────────────
+
+_ATTRIBUTION = dict(
+    base_decision_vi="MUA (BUY)",
+    regime_action_vi="Không điều chỉnh",
+    garch_scalar=0.85,
+    arb_note_vi="Không can thiệp",
+    risk_tier="RISK_MID",
+    risk_tier_pct=60,
+    risk_tier_label_vi="TRUNG BÌNH — thận trọng",
+    market_regime=3,
+    regime_label="Strong Trend",
+)
+
+
+def test_attribution_card_renders_all_four_sections():
+    c = _card(**_ATTRIBUTION)
+    assert "KHUYẾN NGHỊ MUA — HPG" in c                    # header
+    assert "Xác suất xu hướng (T+5)" in c                   # model section
+    assert "Phân loại gốc của mô hình: <b>MUA (BUY)</b>" in c
+    assert "<b>Lớp giám sát</b>" in c                       # overlay section
+    assert "Pha thị trường: <b>Strong Trend</b> (Regime 3)" in c
+    assert "Điều chỉnh theo pha: Không điều chỉnh" in c
+    assert "Phanh biến động GARCH: <b>Đang phanh — hạ tỷ trọng ×0.85</b>" in c
+    assert "Trọng tài tin tức: Không can thiệp" in c
+    assert "<b>Triển khai danh mục</b>" in c                # deployment section
+    assert ("Hạng rủi ro thị trường: <b>TRUNG BÌNH — thận trọng</b> "
+            "(trần 60% NAV toàn danh mục)") in c
+    assert "Khuyến nghị đi vốn: <b>20.0% NAV</b>" in c      # sizing moved here
+
+
+def test_attribution_card_stays_institutional():
+    c = _card(**_ATTRIBUTION)
+    assert not _EMOJI.search(c)
+    assert "•" not in c and "&nbsp;" not in c
+    assert "N/A" not in c
+
+
+def test_attribution_garch_idle_renders_inactive():
+    c = _card(**{**_ATTRIBUTION, "garch_scalar": 1.0})
+    assert "Phanh biến động GARCH: <b>Không kích hoạt (×1.00)</b>" in c
+
+
+def test_attribution_fields_are_escaped():
+    c = _card(**{**_ATTRIBUTION, "arb_note_vi": "<script>"})
+    assert "&lt;script&gt;" in c and "<script>" not in c
+
+
+def test_legacy_card_unchanged_without_attribution_fields():
+    # No attribution fields → legacy layout: sizing stays on the top line,
+    # no section headers appear.
+    c = _card()
+    assert "Khuyến nghị đi vốn: <b>20.0% NAV</b>" in c
+    assert "Lớp giám sát" not in c
+    assert "Triển khai danh mục" not in c
+    assert "Phân loại gốc" not in c
+
+
+def test_attribution_card_keeps_hold_rule_in_deployment():
+    c = _card(**_ATTRIBUTION, hold_label="30 phiên (đến ~24/07/2026)")
+    assert "Nắm giữ: <b>30 phiên" in c
+    # hold guidance lives inside the deployment section now
+    assert c.index("<b>Triển khai danh mục</b>") < c.index("Nắm giữ:")

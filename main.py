@@ -41,6 +41,7 @@ from src.models.quant_agent_arbitrator import (
 )
 from src.trading.portfolio_manager import PortfolioManager
 from src.trading import signal_ledger
+from src.trading.risk_tier import classify_risk_tier
 from src.trading.regime_policy import (
     NO_TRADE_REGIMES,
     PENALTY_REGIMES,
@@ -1299,6 +1300,15 @@ def _tranche_signal_fields(strategy: dict | None, n_picks: int, horizon: int = 2
     return fields
 
 
+# Argmax class → VN display label for the card's "Phân loại gốc" line.
+# Shares the arbitrator/paperlog decision encoding: 0=SELL, 1=HOLD, 2=BUY.
+_BASE_DECISION_VI: dict[int, str] = {
+    0: "BÁN (SELL)",
+    1: "GIỮ (HOLD)",
+    2: "MUA (BUY)",
+}
+
+
 def _dispatch_signals(
     top_buy_signals: list[str],
     all_sentiments: dict[str, Any],
@@ -1323,6 +1333,16 @@ def _dispatch_signals(
     hold-horizon / barrier guidance to the card; None keeps legacy behavior.
     """
     tranche_fields = _tranche_signal_fields(strategy, len(top_buy_signals), horizon)
+    # Market-wide risk tier for the card's "Triển khai danh mục" section
+    # (DISPLAY-ONLY — no sizing enforcement until the backtest A/B validates
+    # the tier cap; see src/trading/risk_tier.py EVIDENCE STATUS). p_bull
+    # proxy = the GARCH exposure scalar (its 0.2 floor sits below both tier
+    # thresholds, so the clip never flips a tier); brake disabled/fail-open
+    # ⇒ None ⇒ fail-neutral RISK_MID.
+    _tier = classify_risk_tier(
+        exposure_scalar
+        if getattr(CONFIG.trading, "garch_brake_enabled", False) else None,
+    )
     dispatched_signals: list[dict] = []
     for ticker in top_buy_signals:
         exec_price = live_exec_prices.get(ticker)
@@ -1345,6 +1365,8 @@ def _dispatch_signals(
             _w = float(_ov["weight"])
             _status = _ov["status"]
             _ly_do = _ov["ly_do"]
+            _regime_action_vi = "Ưu tiên tín hiệu sự kiện (bỏ qua điều chỉnh regime)"
+            _arb_note_vi = f"Can thiệp sự kiện: {_status}"
         else:
             # ── Regime-conditional sizing (serve/backtest parity) ──────────────
             # else-branch ONLY → event overrides above keep precedence. Mirrors
@@ -1363,11 +1385,14 @@ def _dispatch_signals(
             _w = tranche_fields.get(
                 "suggested_weight",
                 suggested_weight(float(_p5[2]), market_regime=_regime))
+            _regime_action_vi = "Không điều chỉnh"
+            _arb_note_vi = "Không can thiệp"
             if (CONFIG.trading.regime_sizing_enabled
                     and tranche_fields
                     and _regime is not None
                     and _regime in PENALTY_REGIMES):
                 _w = _w * REGIME_PENALTY_FACTOR
+                _regime_action_vi = "Hạ 50% tỷ trọng (regime phạt)"
                 LOGGER.info("[Regime] %s PENALTY regime %s -> weight x0.5", ticker, _regime)
             # ── GARCH-HMM macro exposure brake (stacks with regime sizing) ──
             # Market-wide multiplier ∈ [floor, 1.0]; 1.0 = no brake (disabled or
@@ -1378,11 +1403,20 @@ def _dispatch_signals(
             _status = "MUA"
             _ly_do = ""
 
+        _base_idx = max(range(3), key=lambda i: _p5[i])
         signal_data = {
             "action": "MUA",
             "ticker": ticker,
             "price": f"{exec_price:,.0f} VND",
             "horizon_label": f"T+{int(horizon)}",
+            # ── Attribution contract (unified card + downstream audit) ────
+            "base_decision_vi": _BASE_DECISION_VI[_base_idx],
+            "regime_action_vi": _regime_action_vi,
+            "garch_scalar": float(exposure_scalar),
+            "arb_note_vi": _arb_note_vi,
+            "risk_tier": _tier.name,
+            "risk_tier_pct": _tier.nav_cap_pct,
+            "risk_tier_label_vi": _tier.label_vi,
             "suggested_weight": _w,
             "status": _status,
             "ly_do": _ly_do,
