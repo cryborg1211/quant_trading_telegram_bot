@@ -657,8 +657,15 @@ async def _suggest_buy_dispatch(update: Update, horizon: int) -> None:
         return
 
     try:
+        # persist=False: this is an interactive preview call (user tapped
+        # /suggest_buy5 or /suggest_buy20), NOT the daily cron run. Without
+        # this, every manual invocation phantom-executes into the shared
+        # automated `portfolio`/`trade_history` ledger (user_id="cron") via
+        # PortfolioManager.process_daily_trades — same class of bug the
+        # dashboard's persist gate (test_dashboard_persist_gate.py) already
+        # fixes for the local-dashboard preview path.
         report_html, signal_data_list = await asyncio.to_thread(
-            daily_inference, broadcast=False, horizon=int(horizon),
+            daily_inference, broadcast=False, horizon=int(horizon), persist=False,
         )
     except FileNotFoundError as exc:
         LOGGER.exception("/%s: V3 horizon=%d bundle missing", cmd, horizon)
