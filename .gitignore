@@ -29,6 +29,8 @@ data/alpha360_features.parquet
 models/stacking/
 # Auto-saved timestamped model backups (churn — regenerated every retrain, "do not index")
 models/saved/backups/
+# CatBoost training scratch dir (recreated every fit)
+catboost_info/
 
 # --- Logs ---
 logs/
