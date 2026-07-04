@@ -1899,6 +1899,7 @@ def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> No
       1. ingest the day's HOSE OHLCV (market-hour guarded; `force_crawl` bypasses;
          `days_back` limits to the last N days — e.g. 1 for previous-day-only);
       1b. refresh the daily macro series (DXY / USD-VND / SP500 → macro_daily.parquet);
+      1c. refresh the daily foreign-flow snapshot (khoi ngoai → foreign_flow_daily.parquet);
       2. refresh daily LLM news sentiment;
       3. run the daily inference (T+20 tranche Top-3 broadcast);
       4. alert tranche cohorts whose hold horizon has elapsed (signal ledger).
@@ -1923,6 +1924,21 @@ def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> No
             update_macro_daily(days_back=days_back)
         except Exception:  # noqa: BLE001 — macro is best-effort
             LOGGER.exception("[macro] daily refresh failed — continuing EOD pipeline.")
+
+    # 1c. Daily foreign-flow snapshot (SSI iBoard → data/foreign_flow_daily.parquet).
+    #     Non-critical, same best-effort contract as 1b. Data collection only —
+    #     not wired into build_features/serve; accumulating daily now so a
+    #     future EDA pass has real multi-day history to test (see
+    #     scripts/eda_flow_features.py). By the time this cron step runs
+    #     (full_pipeline is scheduled ~15:30 ICT) the exchange is well past
+    #     both MARKET_CLOSE and the crawler's own 15:00 safe-crawl buffer, so
+    #     this is the settled EOD snapshot, not a partial-session one.
+    with timed_step("Foreign-flow daily refresh"):
+        try:
+            from src.data.foreign_flow_crawler import update_foreign_flow_daily
+            update_foreign_flow_daily()
+        except Exception:  # noqa: BLE001 — foreign-flow collection is best-effort
+            LOGGER.exception("[foreign_flow] daily refresh failed — continuing EOD pipeline.")
 
     # 2. Daily LLM news sentiment.
     with timed_step("Fetching daily LLM sentiment"):
