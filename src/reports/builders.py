@@ -282,6 +282,7 @@ def _build_fallback_observability_report_vi(
     fallback_reasons: dict,
     mr_scores: dict | None = None,
     live_prices: dict | None = None,
+    horizon_days: int = SHORT_HORIZON_DAYS,
 ) -> str:
     """Vietnamese 'weak-market' observability report (HTML, the bot's
     Telegram parse mode).
@@ -290,9 +291,16 @@ def _build_fallback_observability_report_vi(
     (`daily_inference`) returns this BEFORE `run_trade_execution`, so there
     is no portfolio / RL / dispatch side effect. The header and per-ticker
     flag make it impossible to mistake these for actionable BUYs.
+
+    ``horizon_days`` labels the probability line — `stacking_predictions_5d`
+    is the PRIMARY-horizon prediction dict despite its legacy "5d" name
+    (daily_inference(horizon=20) puts the T+20 probs there), so the caller
+    MUST pass its actual horizon or the report mislabels T+20 numbers as
+    "5 ngày tới".
     """
     out = [
-        "<b>[⚠️ CẢNH BÁO: THỊ TRƯỜNG XẤU - KHÔNG CÓ ĐIỂM MUA AN TOÀN]</b>",
+        f"<b>[⚠️ CẢNH BÁO: THỊ TRƯỜNG XẤU - KHÔNG CÓ ĐIỂM MUA AN TOÀN "
+        f"(T+{int(horizon_days)})]</b>",
         "<i>⛔ KHÔNG GIAO DỊCH — danh sách dưới đây chỉ để theo dõi thị "
         "trường. Hôm nay không mã nào đủ tốt để vào lệnh.</i>",
         "",
@@ -323,7 +331,7 @@ def _build_fallback_observability_report_vi(
         out += [
             f"<b>{i}. {html.escape(t)}{tag}</b>",
             f"   • <b>Giá hiện tại:</b> {html.escape(price_str)}",
-            f"   • <b>Đánh giá xu hướng ({SHORT_HORIZON_DAYS} ngày tới):</b> "
+            f"   • <b>Đánh giá xu hướng ({int(horizon_days)} ngày tới):</b> "
             f"Cửa Tăng <b>{p_up:.1f}%</b> | Đi Ngang {p_sd:.1f}% | "
             f"Cửa Giảm {p_dn:.1f}%",
             f"   • <b>Trạng thái:</b> ❌ HỦY BỎ TÍN HIỆU"

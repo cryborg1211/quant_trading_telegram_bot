@@ -1088,6 +1088,7 @@ def daily_inference(
             fallback_reasons,
             mr_scores,
             live_prices=fb_prices,
+            horizon_days=int(horizon),
         )
         LOGGER.warning(
             "[FallbackObservability] Returning monitoring-only report for %s "
@@ -1155,6 +1156,40 @@ def daily_inference(
         event_overrides=event_overrides,
         persist=persist,
     )
+
+    if not dispatched_signals and not (report_html or "").strip():
+        # Post-arbitration empty book: NEVER answer with a bare "no signal"
+        # line — surface the day's 3 best names as flagged monitoring-only
+        # cards instead (same contract as the weak-market fallback report;
+        # user-visible parity between /suggest_buy5 and the T+20 flow).
+        _DEC_VI = {0: "BÁN", 1: "GIỮ"}
+        pool = candidate_tickers or [t for t, _ in sorted_preds[:3]]
+        monitor = sorted(
+            pool,
+            key=lambda t: float(stacking_predictions_5d.get(t, [0, 0, 0])[2]),
+            reverse=True,
+        )[:3]
+        reasons = {}
+        for t in monitor:
+            d = final_decisions.get(t)
+            reasons[t] = (
+                f"Trọng tài AI từ chối MUA — nghiêng về {_DEC_VI[d]} sau khi "
+                "đối chiếu tin tức."
+                if d in _DEC_VI
+                else "Chưa đủ điều kiện MUA sau bộ lọc xác suất + thanh khoản "
+                     "+ tin tức."
+            )
+        mr_scores = mr_score_tickers(monitor)
+        fb_prices = _get_live_exec_prices(latest_df, monitor)
+        report_html = _build_fallback_observability_report_vi(
+            monitor, stacking_predictions_5d, all_sentiments, reasons,
+            mr_scores, live_prices=fb_prices, horizon_days=int(horizon),
+        )
+        LOGGER.info(
+            "[NoBuyMonitor] empty post-arbitration book — returning "
+            "monitoring-only top-3 report for %s", monitor,
+        )
+
     LOGGER.info("Dual-horizon daily inference completed in %.2fs.", time.perf_counter() - total_start)
     return report_html, dispatched_signals
 
