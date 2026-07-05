@@ -42,6 +42,7 @@ from src.models.quant_agent_arbitrator import (
 from src.trading.portfolio_manager import PortfolioManager
 from src.trading import signal_ledger
 from src.trading.risk_tier import classify_risk_tier
+from src.trading.serve_universe import liquid_universe
 from src.trading.regime_policy import (
     NO_TRADE_REGIMES,
     PENALTY_REGIMES,
@@ -854,11 +855,79 @@ def _backfill_paperlog_outcomes(db: Any) -> int:
 
 # VN30 constituents — STRICT live universe gate (avoid noisy mid-caps → false
 # signals in weak markets). Update on the quarterly VN30 review.
+# NOTE: As of the serve/ADV-alignment change, this frozenset is the FALLBACK /
+# kill-switch universe (used when CONFIG.trading.serve_universe_mode == "vn30",
+# or as the degrade target when the dynamic ADV universe is empty/errors). The
+# PRIMARY live universe is now the dynamic top-N trailing-ADV set resolved by
+# `_resolve_candidate_universe` → `src/trading/serve_universe.liquid_universe`.
 _VN30_UNIVERSE: frozenset[str] = frozenset({
     "ACB", "BCM", "BID", "BVH", "CTG", "FPT", "GAS", "GVR", "HDB", "HPG",
     "MBB", "MSN", "MWG", "PLX", "POW", "SAB", "SHB", "SSB", "SSI", "STB",
     "TCB", "TPB", "VCB", "VHM", "VIB", "VIC", "VJC", "VNM", "VPB", "VRE",
 })
+
+
+def _resolve_candidate_universe(ohlcv_pl: "pl.DataFrame") -> frozenset[str]:
+    """Resolve the serve candidate universe per CONFIG.trading.serve_universe_mode.
+
+    Precedence / degrade (never crashes daily_inference — always yields a usable
+    frozenset, falling back to _VN30_UNIVERSE on any failure):
+
+      1. mode == "adv_top_n": call liquid_universe(...) on the already-loaded
+         live OHLCV panel.
+         - non-empty result → use it.
+         - EMPTY (insufficient ADV history) → WARNING, fall back to _VN30_UNIVERSE.
+         - liquid_universe raises → ERROR (with exc), fall back to _VN30_UNIVERSE.
+      2. mode == "vn30": use _VN30_UNIVERSE directly (no ADV computation).
+      3. any other/invalid mode string → treat as "vn30" plus an invalid-value
+         warning (fail toward the proven-safe old universe).
+
+    Args:
+        ohlcv_pl: The live OHLCV Polars panel already loaded by daily_inference
+            (ticker/date/open/high/low/close/volume).
+
+    Returns:
+        The resolved candidate-universe frozenset to hand to _select_candidates.
+    """
+    cfg = CONFIG.trading
+    mode = str(getattr(cfg, "serve_universe_mode", "vn30"))
+
+    if mode == "vn30":
+        LOGGER.info("[UniverseGate] resolved mode=vn30 size=%d (static VN30 kill-switch).",
+                    len(_VN30_UNIVERSE))
+        return _VN30_UNIVERSE
+
+    if mode != "adv_top_n":
+        LOGGER.warning(
+            "[UniverseGate] invalid serve_universe_mode=%r — falling back to "
+            "static VN30 list.", mode,
+        )
+        return _VN30_UNIVERSE
+
+    top_n = int(getattr(cfg, "serve_liquid_top_n", 50))
+    adv_window = int(getattr(cfg, "serve_adv_window", 20))
+    try:
+        universe = liquid_universe(ohlcv_pl, top_n=top_n, adv_window=adv_window)
+    except Exception as exc:  # noqa: BLE001 — degrade-not-crash (see docstring)
+        LOGGER.error(
+            "[UniverseGate] liquid_universe raised (%s: %s) — falling back to "
+            "static VN30 list.", exc.__class__.__name__, exc,
+        )
+        return _VN30_UNIVERSE
+
+    if not universe:
+        LOGGER.warning(
+            "[UniverseGate] ADV universe empty (insufficient history) — falling "
+            "back to static VN30 list.",
+        )
+        return _VN30_UNIVERSE
+
+    _top10 = sorted(universe)[:10]
+    LOGGER.info(
+        "[UniverseGate] resolved mode=adv_top_n size=%d top10(alpha)=%s",
+        len(universe), _top10,
+    )
+    return universe
 
 
 def _select_candidates(
@@ -876,10 +945,15 @@ def _select_candidates(
     liquid_tickers: set[str] = {
         str(t) for t in predictions if str(t).upper() in vn30_universe
     }
-    LOGGER.info("[VN30Gate] %s / %s predicted tickers are in VN30.",
-                len(liquid_tickers), len(predictions))
+    LOGGER.info(
+        "[UniverseGate] universe_size=%d | %s / %s predicted tickers in universe.",
+        len(vn30_universe), len(liquid_tickers), len(predictions),
+    )
     if not liquid_tickers:
-        LOGGER.warning("[VN30Gate] no predicted ticker in VN30 — using all predictions as fallback.")
+        LOGGER.warning(
+            "[UniverseGate] no predicted ticker in the resolved universe — "
+            "using all predictions as fallback.",
+        )
         liquid_tickers = set(predictions.keys())
 
     universe_tickers: set[str] = set(liquid_tickers)
@@ -1062,8 +1136,14 @@ def daily_inference(
     bottom_3_str = " | ".join([f"{t}: {p[2] * 100:.2f}%" for t, p in bottom_3_sorted])
     LOGGER.info("[StackingGBDT] BOTTOM 3 RISK: %s", bottom_3_str)
 
+    # Resolve the serve candidate universe ONCE from the already-loaded live
+    # panel (dynamic top-N ADV by default; degrades to _VN30_UNIVERSE on
+    # empty/error/invalid-mode — never crashes here). See
+    # _resolve_candidate_universe + src/trading/serve_universe.liquid_universe.
+    resolved_universe = _resolve_candidate_universe(live_pl)
+
     candidate_tickers, universe_tickers, fallback_mode, fallback_reasons = _select_candidates(
-        stacking_predictions_5d, meta_gate_5d, _VN30_UNIVERSE, max_candidates
+        stacking_predictions_5d, meta_gate_5d, resolved_universe, max_candidates
     )
 
     horizon_predictions = {"5d": stacking_predictions_5d, "20d": stacking_predictions_20d}

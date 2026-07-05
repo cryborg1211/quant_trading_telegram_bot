@@ -44,7 +44,10 @@
     "default_telegram_id": "default_user",
     "regime_sizing_enabled": true,
     "sentiment_entry_enabled": true,
-    "sentiment_entry_threshold": 0.7
+    "sentiment_entry_threshold": 0.7,
+    "serve_universe_mode": "vn30",
+    "serve_liquid_top_n": 50,
+    "serve_adv_window": 20
   },
   "crawler": {
     "stock_start_date": "2016-01-01",

@@ -92,6 +92,19 @@ class TradingConfig:
     # set "garch_brake_enabled": false in settings.json + restart.
     garch_brake_enabled: bool = True
     garch_brake_floor: float = 0.2
+    # Serve candidate universe mode. "adv_top_n" (DEFAULT ON) resolves the live
+    # candidate pool dynamically via src/trading/serve_universe.liquid_universe
+    # (top serve_liquid_top_n names by trailing serve_adv_window-day $-ADV) —
+    # the SAME universe definition the validated tranche backtest runs under
+    # (WalkForwardConfig.liquid_top_n=50, adv_window=20). "vn30" is the
+    # kill-switch: it uses the static _VN30_UNIVERSE frozenset in main.py (old
+    # behavior) and is ALSO the degrade target. Any OTHER string → treated as
+    # "vn30" plus a warning (fail toward the proven-safe old universe, never
+    # toward the unvalidated new one). Kill-switch: set "serve_universe_mode":
+    # "vn30" in settings.json + restart to disable.
+    serve_universe_mode: str = "adv_top_n"
+    serve_liquid_top_n: int = 50   # backtest-validated N (WalkForwardConfig.liquid_top_n)
+    serve_adv_window: int = 20     # backtest-validated trailing window (WalkForwardConfig.adv_window)
 
 
 @dataclass
