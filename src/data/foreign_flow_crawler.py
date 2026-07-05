@@ -35,10 +35,14 @@ SOURCE HONESTY (verified live this session — 2026-07-01)
 
 RETRY / EMPTY-200 CONTRACT
 ───────────────────────────
-`_fetch_with_retry` retries transient errors only (timeout, connection,
-5xx) -- never 4xx or a malformed/empty 200 body, since retrying those just
-burns the rate limit for no benefit. A 200 with an empty payload is a
-DISTINCT, logged case (not an exception) -- e.g. an exchange holiday.
+`_fetch_ssi_hose_snapshot` retries transient errors only (timeout,
+connection, and 5xx server errors via `_is_retryable_5xx`) -- never 4xx or
+a malformed/empty 200 body, since retrying those just burns the rate limit
+for no benefit. A 5xx matters here specifically because this source has NO
+historical backfill (see SOURCE HONESTY): a transient 503 that isn't
+retried becomes a permanent one-day hole in the accumulating dataset. A
+200 with an empty payload is a DISTINCT, logged case (not an exception) --
+e.g. an exchange holiday.
 """
 from __future__ import annotations
 
@@ -51,6 +55,7 @@ import polars as pl
 import requests
 from tenacity import (
     retry,
+    retry_if_exception,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
@@ -100,8 +105,24 @@ _TRANSIENT_EXC = (
 )
 
 
+def _is_retryable_5xx(exc: BaseException) -> bool:
+    """True for a 5xx server-side HTTPError -- transient, worth retrying.
+
+    `raise_for_status()` raises `requests.exceptions.HTTPError` for any 4xx/5xx.
+    Only 5xx (server fault, typically transient) should be retried; 4xx
+    (client fault -- bad path, auth, rate limit) is permanent for this call
+    and must propagate immediately so the caller degrades this run to no-op.
+    """
+    resp = getattr(exc, "response", None)
+    return (
+        isinstance(exc, requests.exceptions.HTTPError)
+        and resp is not None
+        and resp.status_code >= 500
+    )
+
+
 @retry(
-    retry=retry_if_exception_type(_TRANSIENT_EXC),
+    retry=retry_if_exception_type(_TRANSIENT_EXC) | retry_if_exception(_is_retryable_5xx),
     wait=wait_exponential(multiplier=1, min=1, max=30),
     stop=stop_after_attempt(4),
     reraise=True,
