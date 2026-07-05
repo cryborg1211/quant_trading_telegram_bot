@@ -45,7 +45,7 @@
     "regime_sizing_enabled": true,
     "sentiment_entry_enabled": true,
     "sentiment_entry_threshold": 0.7,
-    "serve_universe_mode": "vn30",
+    "serve_universe_mode": "adv_top_n",
     "serve_liquid_top_n": 50,
     "serve_adv_window": 20
   },
