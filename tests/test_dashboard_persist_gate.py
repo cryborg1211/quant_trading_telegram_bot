@@ -15,6 +15,9 @@ These tests pin that contract:
       performs all those writes — proving the gate is opt-in, not default-off.
     * Test C — ``daily_inference(..., persist=False)`` passes ``persist=False``
       straight through to ``run_trade_execution`` (default ``True`` otherwise).
+    * Test D — ``run_trade_execution(..., persist=False)`` never constructs
+      ``PortfolioManager`` and performs ZERO ``duckdb.connect`` attempts —
+      a preview must not grab the exclusive DB lock while run_bot.py holds it.
 
 All heavy serve dependencies are mocked. No real DuckDBEngine singleton, no
 parquet shards, and no Telegram / Gemini calls are made — the assertions are on
@@ -218,3 +221,48 @@ def test_daily_inference_persist_passthrough(
     mock_rte.assert_called_once()
     passed = mock_rte.call_args.kwargs.get("persist")
     assert passed is False, f"expected persist=False forwarded, got {passed!r}"
+
+
+# --------------------------------------------------------------------------- #
+# Test D — persist=False never constructs PortfolioManager / opens DuckDB
+# --------------------------------------------------------------------------- #
+
+def test_persist_false_zero_db_connections():
+    """persist=False → no PortfolioManager construction, no duckdb.connect.
+
+    Regression pin: ``PortfolioManager()`` used to be built BEFORE the
+    ``if persist:`` guard, so even a persist=False preview opened the live
+    DuckDB read-write (exclusive lock) and failed while run_bot.py was
+    running. Unlike Tests A/B this does NOT stub the write helpers behind
+    the persist gate — the gate itself must keep them unreachable — and it
+    spies on construction rather than method calls.
+    """
+    import main
+    import src.data.db_engine as db_engine_mod
+
+    connect_calls: list[tuple] = []
+
+    def _record_connect(*args, **kwargs):
+        # Record instead of raise: run_trade_execution's outer try/except
+        # would swallow an exception and mask the regression.
+        connect_calls.append((args, kwargs))
+        return MagicMock(name="duckdb_conn")
+
+    with (
+        patch.object(main, "PortfolioManager") as mock_pm,
+        patch.object(db_engine_mod.duckdb, "connect", side_effect=_record_connect),
+        patch.object(main, "_dispatch_signals", return_value=[]),
+        patch.object(main, "_build_feature_explanation", return_value=("", "")),
+        patch.object(main, "_load_v3_bot", return_value=MagicMock(strategy=None)),
+        patch.object(main, "TelegramBot", return_value=MagicMock()),
+        # Imported lazily inside run_trade_execution — patch at source module.
+        patch("src.bot.garch_brake.live_exposure_scalar", return_value=1.0),
+    ):
+        kwargs = _rte_kwargs()
+        kwargs["persist"] = False
+        main.run_trade_execution(**kwargs)
+
+    mock_pm.assert_not_called()
+    assert connect_calls == [], (
+        f"persist=False attempted {len(connect_calls)} DuckDB connection(s)"
+    )

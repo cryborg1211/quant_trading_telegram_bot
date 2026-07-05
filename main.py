@@ -1568,7 +1568,12 @@ def run_trade_execution(
     LOGGER.info("Starting Trade Execution (Portfolio Manager)...")
     dispatched_signals: list[dict] = []
     try:
-        manager = PortfolioManager()
+        # persist=False previews must never construct PortfolioManager: its
+        # DuckDBEngine grabs the exclusive DB lock and collides with a running
+        # run_bot.py. All `manager` reads below sit inside `if persist:` blocks.
+        manager: PortfolioManager | None = None
+        if persist:
+            manager = PortfolioManager()
         live_exec_prices = _get_live_exec_prices(latest_df, top_buy_signals)
 
         if not live_exec_prices:
