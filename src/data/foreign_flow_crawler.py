@@ -127,13 +127,17 @@ def _is_retryable_5xx(exc: BaseException) -> bool:
     stop=stop_after_attempt(4),
     reraise=True,
 )
-def _fetch_ssi_hose_snapshot(exchange: str = "HOSE") -> list[dict[str, Any]]:
+def fetch_ssi_hose_snapshot(exchange: str = "HOSE") -> list[dict[str, Any]]:
     """One live bulk call -- every HOSE ticker's current-session snapshot.
 
     Raises only on transient errors (retried) or a malformed non-200 (not
     retried, propagates to the caller who degrades to "no data this run").
     A 200 with an empty `data` array is returned as `[]`, not raised --
     the caller logs that distinctly (see `crawl_today`).
+
+    Public since 2026-07-06: the intraday_scanner reuses this exact one-place
+    retry policy rather than forking it. The private `_fetch_ssi_hose_snapshot`
+    name is kept below as a backwards-compatible alias.
     """
     r = requests.get(
         _SSI_EXCHANGE_URL.format(exchange=exchange),
@@ -142,6 +146,13 @@ def _fetch_ssi_hose_snapshot(exchange: str = "HOSE") -> list[dict[str, Any]]:
     r.raise_for_status()
     payload = r.json()
     return payload.get("data") or []
+
+
+# Backwards-compatible alias for the pre-2026-07-06 private name. Existing
+# callers (crawl_today, tests) reference `_fetch_ssi_hose_snapshot`; keep this
+# pointing at the public function so monkeypatch(ffc, "_fetch_ssi_hose_snapshot")
+# and monkeypatch(ffc, "fetch_ssi_hose_snapshot") both still work.
+_fetch_ssi_hose_snapshot = fetch_ssi_hose_snapshot
 
 
 def _hose_eod_bulletin_adapter() -> None:
@@ -283,4 +294,5 @@ def update_foreign_flow_daily(
 __all__ = [
     "crawl_today",
     "update_foreign_flow_daily",
+    "fetch_ssi_hose_snapshot",
 ]

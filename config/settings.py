@@ -92,6 +92,17 @@ class TradingConfig:
     # set "garch_brake_enabled": false in settings.json + restart.
     garch_brake_enabled: bool = True
     garch_brake_floor: float = 0.2
+    # Intraday attack scanner (monitoring-only): a repeating in-bot job that
+    # rescores the model on PROVISIONAL intraday bars during HOSE trading hours
+    # and sends a compact "top movers" card when something notable moves before
+    # the 15:30 EOD crawl. Writes NOTHING to parquet/DuckDB/paperlog, invokes NO
+    # arbitrator/Gemini — pure alert-only. Defaults OFF (this is a brand-new
+    # always-on background job with a new runtime dependency, so unlike the other
+    # kill-switches here it ships disabled; flip it on manually after restart).
+    # Kill-switch: set "intraday_scanner_enabled": true in settings.json + restart.
+    intraday_scanner_enabled: bool = False
+    intraday_scan_interval_min: int = 15   # cadence in minutes; clamped to [10, 30] at job registration
+    intraday_alert_delta_pp: float = 0.02  # |ΔP(UP)| >= this (in probability, 0.02 = 2pp) alerts a top-3 name
     # Serve candidate universe mode. "adv_top_n" (DEFAULT ON) resolves the live
     # candidate pool dynamically via src/trading/serve_universe.liquid_universe
     # (top serve_liquid_top_n names by trailing serve_adv_window-day $-ADV) —

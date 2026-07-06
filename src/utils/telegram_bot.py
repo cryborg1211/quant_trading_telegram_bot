@@ -124,7 +124,7 @@ EMPTY_PORTFOLIO_MESSAGE = (
 HELP_TEXT = (
     "🤖 <b>TRỢ LÝ ĐẦU TƯ — DANH SÁCH LỆNH</b>\n"
     "\n"
-    "<b>/suggest_buy20</b> — Khuyến nghị MUA T+20 (tranche, nắm giữ ~30 phiên).\n"
+    "<b>/suggest_buy20</b> — Khuyến nghị MUA T+20 (tranche, nắm giữ ~20 phiên).\n"
     "<b>/suggest_buy5</b> — Khuyến nghị MUA T+5 (tầm nhìn ngắn).\n"
     "📒 <b>/exits</b> — Vị thế tranche đang mở + số phiên còn lại.\n"
     "🔴 <b>/suggest_sell</b> — Đánh giá NÊN BÁN hay GIỮ danh mục của bạn.\n"
@@ -1525,7 +1525,7 @@ async def msg_id2_command(
 # The canonical command list pushed to Telegram via set_my_commands on startup.
 # This populates the "/" autocomplete menu in every chat.
 _BOT_COMMANDS: list[BotCommand] = [
-    BotCommand("suggest_buy20", "Khuyến nghị MUA T+20 — tranche ~30 phiên"),
+    BotCommand("suggest_buy20", "Khuyến nghị MUA T+20 — tranche ~20 phiên"),
     BotCommand("suggest_buy5", "Khuyến nghị MUA T+5 — tầm nhìn ngắn"),
     BotCommand("exits", "Vị thế tranche đang mở + số phiên còn lại"),
     BotCommand("suggest_sell", "Lấy khuyến nghị BÁN/HOLD cho danh mục cá nhân"),
@@ -1598,6 +1598,58 @@ async def msg_user2_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("✅ Đã gửi tin nhắn cho User (ID2) thành công!")
 
 
+_INTRADAY_STATE_KEY = "intraday_scanner_state"
+
+
+async def _intraday_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Repeating job: rescore on provisional intraday bars, alert on movement.
+
+    Thin async adapter around the pure/sync `intraday_scanner.run_scan`. Runs
+    the (I/O + model) scan OFF the event loop via `asyncio.to_thread` so command
+    handlers stay responsive, then broadcasts the card (if any) to BOTH chats
+    (ADMIN + USER) following the existing split-ID broadcast pattern. The whole
+    body is wrapped in a broad try/except that logs and swallows — a scan-cycle
+    failure must never propagate into PTB's job-queue surface or stop future
+    runs. Monitoring-only: it never writes to parquet/DuckDB/paperlog and never
+    invokes the arbitrator (all enforced inside intraday_scanner).
+    """
+    try:
+        from src.trading.intraday_scanner import ScannerState, run_scan  # noqa: PLC0415
+        from config.settings import CONFIG  # noqa: PLC0415
+
+        bot_data = context.application.bot_data
+        state = bot_data.get(_INTRADAY_STATE_KEY)
+        if state is None:
+            state = ScannerState()
+
+        delta_pp = float(getattr(CONFIG.trading, "intraday_alert_delta_pp", 0.02))
+        tz = str(getattr(CONFIG.trading, "timezone", "Asia/Ho_Chi_Minh"))
+
+        result = await asyncio.to_thread(
+            run_scan, state, datetime.now(), tz=tz, delta_pp=delta_pp,
+        )
+        bot_data[_INTRADAY_STATE_KEY] = result.state
+
+        if not result.card:
+            return
+
+        # Broadcast to BOTH chats (Admin + User). Skip an unset id silently.
+        for chat_id in (ADMIN_CHAT_ID, USER_CHAT_ID):
+            if not chat_id:
+                continue
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=result.card,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — one chat failing must not block the other
+                LOGGER.warning("[intraday_scanner] send to chat %s failed: %s", chat_id, exc)
+    except Exception:  # noqa: BLE001 — degrade-not-crash: never kill the job queue
+        LOGGER.exception("[intraday_scanner] scan cycle raised — swallowed, next cycle continues.")
+
+
 def build_application() -> Application:
     """Build the python-telegram-bot Application with every command handler wired up."""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -1667,7 +1719,63 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("rebalance", rebalance_command))
 
     app.add_error_handler(_on_error)
+
+    # --- Intraday attack scanner (monitoring-only, config-gated) ---
+    # Default OFF. When enabled, registers a repeating job that rescores the
+    # model on provisional intraday bars during HOSE trading hours and alerts on
+    # notable movement. Writes NOTHING to parquet/DuckDB/paperlog. Requires the
+    # PTB [job-queue] extra (APScheduler) — degrades gracefully (logs, stays off)
+    # if the extra is missing so the rest of the bot still builds.
+    _register_intraday_scanner(app)
+
     return app
+
+
+def _register_intraday_scanner(app: Application) -> None:
+    """Config-gated registration of the intraday scanner's repeating job.
+
+    Kill-switch precedence:
+      • CONFIG.trading.intraday_scanner_enabled is False (shipped default)
+        → skip registration entirely, log at INFO. Zero blast radius.
+      • enabled True AND app.job_queue is not None
+        → register run_repeating at the clamped interval (10–30 min).
+      • enabled True AND app.job_queue is None (the [job-queue] extra missing)
+        → log an ERROR explaining the missing extra and DO NOT crash. The
+          scanner stays permanently off until the dependency is installed.
+    """
+    from config.settings import CONFIG  # noqa: PLC0415
+
+    cfg = CONFIG.trading
+    if not getattr(cfg, "intraday_scanner_enabled", False):
+        LOGGER.info("[intraday_scanner] disabled (intraday_scanner_enabled=False) — no job registered.")
+        return
+
+    if app.job_queue is None:
+        LOGGER.error(
+            "[intraday_scanner] intraday_scanner_enabled=True but app.job_queue is None. "
+            "Install the PTB job-queue extra: pip install \"python-telegram-bot[job-queue]==22.7\". "
+            "Scanner stays OFF until then; the rest of the bot is unaffected."
+        )
+        return
+
+    interval_min = int(getattr(cfg, "intraday_scan_interval_min", 15))
+    clamped = max(10, min(30, interval_min))
+    if clamped != interval_min:
+        LOGGER.warning(
+            "[intraday_scanner] intraday_scan_interval_min=%d out of range [10, 30] — clamped to %d.",
+            interval_min, clamped,
+        )
+
+    app.job_queue.run_repeating(
+        callback=_intraday_scan_job,
+        interval=clamped * 60,
+        first=60,  # small startup delay so the bot finishes wiring before the first scan
+        name="intraday_scanner",
+    )
+    LOGGER.info(
+        "[intraday_scanner] enabled — repeating scan every %d min (HOSE trading hours only).",
+        clamped,
+    )
 
 
 def main() -> None:
