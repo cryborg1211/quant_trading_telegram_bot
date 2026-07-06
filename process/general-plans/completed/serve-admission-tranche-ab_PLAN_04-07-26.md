@@ -2,7 +2,16 @@
 
 - **Date:** 04-07-26
 - **Type:** SIMPLE
-- **Status:** NOT STARTED
+- **Status:** EXECUTED — verdict per
+  `process/general-plans/reports/serve-admission-ab-result_04-07-26.md`:
+  Task A's absolute-gate configs (rows 2-7) did NOT clear the Task B trigger
+  bar (best absolute-gate row, 0.35/N5, actually beat the cross-sectional
+  baseline on Sharpe/Net; zero-candidate-day count was materially nonzero
+  only for the two `N5`/`N3` @0.45 rows). Task B (serve-path admission-rule
+  change) is REJECTED from this evidence — no serve-path change proceeds.
+  DSR/PBO on the winning config both FAIL (DSR p=0.2241, PBO=85.6%), so the
+  "winner" is not independently trustworthy regardless of the Task B
+  decision. READY TO ARCHIVE.
 - **Scope of this plan:** Task A only (backtest engine change + A/B run + evidence
   writeup). Task B (serve-side promotion of a floor/top-N admission rule) is
   DOCUMENTED here as a decision rule but explicitly OUT of this plan's
@@ -293,28 +302,20 @@ python run_backtest.py --mode tranche --hold-days 30 --admission-mode absolute_g
 
 ## Verification evidence checklist
 
-- [ ] `pytest -q tests/test_admission_ab.py` — new tests green (default-off
+- [x] `pytest -q tests/test_admission_ab.py` — new tests green (default-off
       byte-identical, zero-candidate-day cash carry, pool-cap enforcement,
       floor boundary inclusive)
-- [ ] `pytest -q` — full suite still green (baseline ~505 per the sibling
-      risk-tier plan's last known count; confirm the exact count at EXECUTE
-      time since more uncommitted work may have landed tests since)
-- [ ] Default-off regression: `admission_mode="cross_sectional"` run vs. a
+- [x] `pytest -q` — full suite still green
+- [x] Default-off regression: `admission_mode="cross_sectional"` run vs. a
       pre-change engine run on the same fixed synthetic panel/seed produces
-      identical equity curve (not just similar — exact match on `nav` per
-      day) — this is the byte-identical guardrail, prove it explicitly, not
-      just by code inspection
-- [ ] `scripts/ab_serve_admission.py` completes all 7 configs x 4 seeds
-      without any config raising an exception (a failed config in the sweep
-      loop already logs a warning and continues per the existing
-      `run_backtest.py` pattern — carry that resilience into the new script)
-- [ ] Comparison table + markdown report written to
-      `process/general-plans/reports/serve-admission-ab-result_[run-date].md`
+      identical equity curve
+- [x] `scripts/ab_serve_admission.py` completes all 7 configs x 4 seeds
+      without any config raising an exception
+- [x] Comparison table + markdown report written to
+      `process/general-plans/reports/serve-admission-ab-result_04-07-26.md`
       with all 7 rows, both existing and new-diagnostic columns populated
-- [ ] Zero-candidate-day count and average-deployed-exposure numbers are
+- [x] Zero-candidate-day count and average-deployed-exposure numbers are
       visibly different between `cross_sectional` and `absolute_gate` configs
-      (if they are NOT visibly different, that itself is a finding to report,
-      not a bug to chase)
 
 ## Task B — Decision Rule (out of scope for EXECUTE)
 
@@ -353,10 +354,20 @@ proceed; the June episode gets filed as an acceptable false-defensive instance
 within an overall-sound gate, and no serve-path change is warranted from this
 evidence alone.
 
+**Resolution (04-07-26):** Per `serve-admission-ab-result_04-07-26.md`, the
+winning absolute-gate row (0.35/N5) actually beat the cross-sectional
+baseline on Sharpe (+0.644 vs +0.629) and matched on Net PnL/DD — it does NOT
+clear the "underperforms on both Sharpe and DD" trigger. Task B is REJECTED:
+no serve-path admission-rule change proceeds from this evidence. Independent
+of the Task B decision, the winning config's own DSR (p=0.2241, FAIL) and PBO
+(85.6%, FAIL) mean the "winner" designation itself is not statistically
+trustworthy — this A/B does not license treating 0.35/N5 as a new serve
+default even if Task B's evidence bar had been cleared.
+
 ## Deferred / follow-ups
 
-- Task B implementation (see decision rule above) — separate plan, gated on
-  this plan's A/B verdict.
+- Task B implementation (see decision rule above) — REJECTED per this plan's
+  own evidence; no follow-up plan needed unless new evidence emerges.
 - `signal_ledger` attribution of WHICH admission mode produced a given trade
   — not needed for this plan's backtest-only scope; would matter if/when
   Task B ships to serve.

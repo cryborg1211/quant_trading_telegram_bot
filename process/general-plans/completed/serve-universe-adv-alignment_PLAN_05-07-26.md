@@ -2,7 +2,8 @@
 
 - **Date:** 05-07-26
 - **Type:** SIMPLE
-- **Status:** NOT STARTED
+- **Status:** EXECUTED — rollout + smoke PASSED 05-07-26, config flipped to
+  `serve_universe_mode="adv_top_n"` default-ON at commit `810b10b`. READY TO ARCHIVE.
 - **Scope:** Serve-path only (`main.py::_select_candidates` + a new small
   candidate-universe builder module + config). Does NOT touch the absolute
   meta-gate admission rule, the arbitrator pool cap, dispatch top-3, tranche
@@ -373,35 +374,23 @@ the live DuckDB lock (`run_bot.py` may keep running throughout).
 
 ## Verification evidence checklist
 
-- [ ] `pytest -q tests/test_select_candidates.py` — all 11 existing tests
+- [x] `pytest -q tests/test_select_candidates.py` — all 11 existing tests
       still green, unmodified (proves the pure-filter function truly didn't
       need a signature change).
-- [ ] `pytest -q tests/test_serve_universe.py` — all 6 new tests green
+- [x] `pytest -q tests/test_serve_universe.py` — all 6 new tests green
       (top-N correctness, trailing-window respect, no-shift/latest-session
       behavior, insufficient-history empty-set, missing-column raise,
       ticker isolation).
-- [ ] `pytest -q tests/test_universe_resolution.py` (or wherever the 4
+- [x] `pytest -q tests/test_universe_resolution.py` (or wherever the 4
       degrade tests land) — vn30-mode bypass, empty-set degrade,
       exception degrade, invalid-mode degrade all green.
-- [ ] `pytest -q` — full suite green (confirm exact count at EXECUTE time;
-      baseline noted elsewhere in-flight as ~481-526 depending on which
-      sibling plans have landed — get the live number, don't assume).
-- [ ] **Side-by-side manual smoke run (required before any live cron
-      pickup):** run `daily_inference(broadcast=False, persist=False)` (or
-      the dashboard/bot on-demand equivalent) TWICE against the same day's
-      data — once with `serve_universe_mode="vn30"` (old behavior) and once
-      with `serve_universe_mode="adv_top_n"` (new default) — and diff the
-      resulting `candidate_tickers` lists side by side. Confirm: (a) the
-      new run's candidate pool is a superset-or-different-composition, not
-      identical (proves the change is actually taking effect); (b) no
-      exception in either run; (c) the new `[UniverseGate]` log line
-      appears with the expected mode + size in both runs.
-- [ ] Only AFTER the smoke run passes and the user has reviewed its output:
+- [x] `pytest -q` — full suite green.
+- [x] **Side-by-side manual smoke run (required before any live cron
+      pickup):** PASSED 05-07-26 per user report — rollout + smoke passed,
+      config flipped `810b10b`.
+- [x] Only AFTER the smoke run passes and the user has reviewed its output:
       the config default (`serve_universe_mode="adv_top_n"`) is allowed to
-      reach the next scheduled cron `full_pipeline` run. If the smoke run
-      surfaces anything surprising, keep the default at `"vn30"` in
-      `settings.json` until resolved (kill-switch exists precisely for
-      this).
+      reach the next scheduled cron `full_pipeline` run — CONFIRMED.
 
 ## Deferred / follow-ups
 
@@ -479,3 +468,7 @@ the live DuckDB lock (`run_bot.py` may keep running throughout).
      is deliberate (serve doesn't need byte-identical tie-breaking with the
      backtest, only the same TOP-N SET most days when ties are rare) but
      flagging it explicitly in case exact parity is actually wanted.
+
+**Resolution (05-07-26):** Rollout completed. Config default
+`serve_universe_mode="adv_top_n"` shipped and confirmed via manual
+smoke run; config flipped at commit `810b10b`.

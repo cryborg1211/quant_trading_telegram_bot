@@ -1,6 +1,6 @@
 # Quant Engine V4.0 - All Context
 
-Last updated: 2026-06-29
+Last updated: 2026-07-06
 
 This file is the root context entrypoint for the repo.
 
@@ -62,7 +62,7 @@ For most substantial tasks:
 | Group | Entry point | Scope |
 |---|---|---|
 | `planning/` | `process/context/planning/all-planning.md` | plan-shape calibration, planning examples, SIMPLE vs COMPLEX reference docs |
-| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 473 tests, in-memory DuckDB stubs, debugging quick-ref |
+| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 591 tests, in-memory DuckDB stubs, debugging quick-ref |
 
 ## Task Routing Table
 
@@ -162,6 +162,7 @@ stock_price_v3/
       construction.py     -- Mean-variance optimization
     trading/
       portfolio_manager.py -- Portfolio state management
+      intraday_scanner.py  -- Intraday attack scanner (pure module, monitoring-only, kill-switch OFF default)
     reports/
       __init__.py         -- Re-exports report builders
       builders.py         -- 10 report builder functions + 11 constants (extracted from main.py)
@@ -171,7 +172,7 @@ stock_price_v3/
       logging_utils.py    -- Centralized logging setup
       audit_evaluator.py  -- Trade audit evaluation
       version.py          -- Version string
-  tests/                  -- 21 test files, 238 tests (pytest)
+  tests/                  -- 47 test files, 591 tests (pytest)
   train_macro_regime.py   -- Train + serialize the GARCH-HMM regime overlay
   scripts/
     migrate_sqlite_to_duckdb.py -- Legacy SQLite → DuckDB migration
@@ -205,7 +206,7 @@ stock_price_v3/
 - **Bot:** python-telegram-bot 22.7 (async PTB framework)
 - **HTTP:** aiohttp 3.13, requests 2.33
 - **Config:** python-dotenv 1.2 (.env), dataclass-based settings with JSON overrides
-- **Testing:** pytest (473 tests, in-memory DuckDB stubs)
+- **Testing:** pytest (591 tests, in-memory DuckDB stubs)
 - **Deployment:** Bare metal VPS — systemd (bot), cron (daily pipeline at 15:30 ICT Mon–Fri)
 
 ## Key Patterns and Conventions
@@ -252,6 +253,8 @@ stock_price_v3/
 **Deprecated:** `alpha360_generator.py` is gutted in V4.0 — system is purely tabular.
 
 **Local dashboard (new program, 2026-06-19):** Streamlit dashboard for a single Windows laptop user. Package root: `dashboard/`. No-polling architecture: send-only Telegram alerter, no PTB ApplicationBuilder anywhere in `dashboard/`. Reuses `main.daily_inference(broadcast=False)`, `verify_single_ticker`, `inference_for_holdings`, `PortfolioManager`, `signal_ledger`, `audit_evaluator.run_post_mortem`. Tabs: `mua/ban/giu/verify/audit/settings/tam_nhin`. Launch: `streamlit run dashboard/app.py` — `app.py` prepends repo-root to `sys.path` (streamlit puts only the script dir on path). Dashboard reads of serve-built signal dicts must coerce the Telegram-display `price` string via `headless._parse_price` (serve stores `"22,600 VND"` text). Installer: Inno Setup `setup.exe` (P4 scope) — no PyInstaller.
+
+**Intraday attack scanner (2026-07-06):** `src/trading/intraday_scanner.py` — pure module, monitoring-only. Every 10–30 min during HOSE hours (09:15–11:30 / 13:00–14:45 ICT) one SSI iBoard bulk snapshot builds provisional daily bars (absolute VND ÷1000 to the parquet thousands convention), spliced in-memory onto each ticker's 120-row parquet tail, dual-horizon (T+5 + T+20) rescore, ADV-top-50 gate (`_resolve_candidate_universe`), event-only alert card (new top-3 entrant / τ crossing / |Δ|≥2pp) sent to BOTH chats (ADMIN + USER). **Hard constraints:** zero writes to parquet/DuckDB/`sentiment_entry_paperlog` (protects the running item-1 pre-registered experiment), no arbitrator/Gemini call in the loop, no `signal_ledger` writes, no BUY dispatch. Config: `TradingConfig.intraday_scanner_enabled` (default **False** — kill-switch), `intraday_scan_interval_min` (default 15, clamped 10–30), `intraday_alert_delta_pp` (default 0.02). Wiring: `telegram_bot.py::_intraday_scan_job` via PTB `JobQueue`, config-gated; degrades to an ERROR log (bot still builds/runs) when `app.job_queue is None`. `requirements.txt` pins `python-telegram-bot[job-queue]==22.7` (new dependency — PTB's JobQueue extra was not previously installed). Tests: `tests/test_intraday_scanner.py` (39). Gate 5 (live market-open smoke, 09:15 ICT) still pending as of ship date — plan stays active until that manual verification lands.
 
 **Tầm Nhìn fan-chart (2026-06-29):** `dashboard/tabs/tam_nhin.py` + `dashboard/utils/fan_chart.py` — TradingView-style pure-technical forecast: `go.Candlestick` history + 12 Monte Carlo GBM paths + neon median (no shaded bands), rangeslider/rangeselector, crosshair spikes (`spikemode="toaxis+across"`). `project_fan` still computes analytic bands (unit-tested) but the figure draws MC paths instead. MC seed is per-ticker (`_ticker_seed` = `crc32(ticker)`, NOT `hash()` which is process-salted) — a single shared seed made every ticker render one cloned wiggle shape. Needs OHLC, so `price_lookup.ohlc_history(ticker, n)` was added alongside `close_history`. Tests: `tests/test_dashboard_fan_chart.py`.
 
