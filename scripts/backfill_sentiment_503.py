@@ -36,14 +36,21 @@ _FALLBACK_PREFIX = "Gemini fallback%"
 _TABLE = "hist_sentiment_llm_labeled"
 
 
-def _fetch_corrupted(conn: Any, limit: int | None) -> list[tuple]:
-    """Rows still carrying a Gemini-fallback reason: (url, title, ticker, date)."""
+def _fetch_corrupted(conn: Any, limit: int | None, since: str | None = None) -> list[tuple]:
+    """Rows still carrying a Gemini-fallback reason: (url, title, ticker, date).
+
+    ``since`` (ISO date) restricts to rows dated >= that day — lets an incident
+    be repaired in isolation without re-scoring older history.
+    """
     sql = (
         f"SELECT url, title, ticker, date FROM {_TABLE} "
         "WHERE reason LIKE ? AND url IS NOT NULL "
-        "ORDER BY date DESC"
     )
     params: list[Any] = [_FALLBACK_PREFIX]
+    if since is not None:
+        sql += "AND date >= ? "
+        params.append(since)
+    sql += "ORDER BY date DESC"
     if limit is not None:
         sql += " LIMIT ?"
         params.append(int(limit))
@@ -56,6 +63,7 @@ def backfill_503(
     *,
     limit: int | None = None,
     commit: bool = False,
+    since: str | None = None,
 ) -> dict[str, int]:
     """Re-score every fallback row; UPDATE the recovered ones.
 
@@ -64,7 +72,7 @@ def backfill_503(
     fallback → left untouched for the next run). Pure enough to unit-test with a
     mock ``conn`` + mock ``crawler``.
     """
-    rows = _fetch_corrupted(conn, limit)
+    rows = _fetch_corrupted(conn, limit, since)
     recovered = still_failing = 0
 
     for url, title, ticker, dt in rows:
@@ -107,6 +115,8 @@ def main() -> None:
     parser.add_argument("--db", default=str(CONFIG.paths.duckdb_path), help="DuckDB path.")
     parser.add_argument("--limit", type=int, default=None, help="Max rows to process.")
     parser.add_argument("--commit", action="store_true", help="Write UPDATEs (else dry-run).")
+    parser.add_argument("--since", default=None,
+                        help="ISO date — only re-score rows dated >= this (incident isolation).")
     args = parser.parse_args()
 
     crawler = SentimentCrawler(db_path=args.db)
@@ -116,7 +126,8 @@ def main() -> None:
         )
 
     with duckdb.connect(args.db) as conn:
-        stats = backfill_503(conn, crawler, limit=args.limit, commit=args.commit)
+        stats = backfill_503(conn, crawler, limit=args.limit, commit=args.commit,
+                             since=args.since)
 
     mode = "COMMITTED" if args.commit else "DRY-RUN (no writes — pass --commit)"
     LOGGER.info(

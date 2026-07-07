@@ -50,7 +50,7 @@ class _FakeClient:
         return _Resp(self._ok_text)
 
 
-_OK_JSON = '{"sentiment_score": 0.6, "magnitude": 0.4, "reason": "tích cực"}'
+_OK_JSON = '{"sentiment_score": 0.6, "magnitude": 0.4, "reason": "tÃ­ch cá»±c"}'
 
 
 @pytest.fixture(autouse=True)
@@ -150,7 +150,7 @@ def test_score_payload_parse_error_not_retried() -> None:
     crawler = _crawler_with(client)
     out = crawler.score_payload(ticker="HPG", dt=date(2026, 6, 1), title="t", content="c")
     assert out["reason"].startswith("Gemini fallback")
-    assert client.calls == 1  # bad JSON is permanent → no retry
+    assert client.calls == 1  # bad JSON is permanent â†’ no retry
 
 
 # --------------------------------------------------------------------------- #
@@ -208,3 +208,60 @@ def test_backfill_dry_run_writes_nothing() -> None:
 
     assert stats["recovered"] == 1
     assert not [c for c in conn.execute.call_args_list if "UPDATE" in c[0][0]]
+
+
+# --------------------------------------------------------------------------- #
+# parse_gemini_json â€” 2026-07-07 format-drift incident coverage
+# --------------------------------------------------------------------------- #
+
+def test_parse_strict_json_still_works() -> None:
+    out = SentimentCrawler.parse_gemini_json(
+        '{"sentiment_score": 0.4, "magnitude": 0.2, "reason": "ok"}'
+    )
+    assert out["sentiment_score"] == 0.4
+
+
+def test_parse_fenced_json() -> None:
+    out = SentimentCrawler.parse_gemini_json(
+        '```json\n{"sentiment_score": -0.3, "magnitude": 0.1, "reason": "x"}\n```'
+    )
+    assert out["sentiment_score"] == -0.3
+
+
+def test_parse_trailing_extra_data() -> None:
+    # "Extra data: line 9 column 1" shape: valid object then trailing junk.
+    raw = '{"sentiment_score": 0.6, "magnitude": 0.5, "reason": "r"}\nNote: extra prose.'
+    out = SentimentCrawler.parse_gemini_json(raw)
+    assert out["sentiment_score"] == 0.6
+
+
+def test_parse_two_objects_takes_first() -> None:
+    raw = ('{"sentiment_score": 0.2, "magnitude": 0.1, "reason": "a"}\n'
+           '{"sentiment_score": -0.9, "magnitude": 0.9, "reason": "b"}')
+    out = SentimentCrawler.parse_gemini_json(raw)
+    assert out["sentiment_score"] == 0.2
+
+
+def test_parse_broken_reason_salvages_numeric_fields() -> None:
+    # "Expecting ',' delimiter" shape: unescaped quote breaks the reason string.
+    raw = ('{"sentiment_score": -0.5, "magnitude": 0.7, '
+           '"reason": "cong ty "ABC" cong bo loi nhuan giam manh...')
+    out = SentimentCrawler.parse_gemini_json(raw)
+    assert out["sentiment_score"] == -0.5
+    assert out["magnitude"] == 0.7
+    assert out["reason"].startswith("salvaged:")
+
+
+def test_parse_total_garbage_raises() -> None:
+    with pytest.raises(ValueError):
+        SentimentCrawler.parse_gemini_json("I cannot help with that request.")
+
+
+def test_score_payload_falls_back_on_unparseable(monkeypatch) -> None:
+    crawler = SentimentCrawler.__new__(SentimentCrawler)
+    crawler._client = object()
+    monkeypatch.setattr(sc, "genai_types", types.SimpleNamespace(), raising=False)
+    crawler._generate_content = lambda msg: "no json here at all"
+    out = crawler.score_payload(ticker="HPG", dt=date(2026, 7, 7), title="t", content="c")
+    assert out["sentiment_score"] == 0.0
+    assert out["reason"].startswith("Gemini fallback:")

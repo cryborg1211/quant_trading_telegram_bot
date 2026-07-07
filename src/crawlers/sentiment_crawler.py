@@ -430,6 +430,44 @@ class SentimentCrawler:
         )
         return (response.text or "").strip()
 
+    @staticmethod
+    def parse_gemini_json(raw: str) -> dict:
+        """Parse a Gemini sentiment response, tolerating format drift.
+
+        2026-07-07 incident: gemini-flash-latest began returning 200s whose
+        bodies fail strict ``json.loads`` in two shapes — valid JSON followed
+        by trailing content ("Extra data: line 9"), and objects broken mid-way
+        by unescaped quotes inside the Vietnamese ``reason`` string
+        ("Expecting ',' delimiter: line 7"). Ladder:
+          1. strict parse (fences stripped),
+          2. ``raw_decode`` of the FIRST object — survives trailing junk,
+          3. regex salvage of the numeric fields — survives a broken reason
+             string (scores precede it in the schema).
+        Raises ``ValueError`` when nothing is salvageable.
+        """
+        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+        start = raw.find("{")
+        if start >= 0:
+            try:
+                obj, _ = json.JSONDecoder().raw_decode(raw[start:])
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                pass
+        m_score = re.search(r'"(?:sentiment_)?score"\s*:\s*(-?\d+(?:\.\d+)?)', raw)
+        m_mag = re.search(r'"magnitude"\s*:\s*(-?\d+(?:\.\d+)?)', raw)
+        if m_score:
+            return {
+                "sentiment_score": float(m_score.group(1)),
+                "magnitude": float(m_mag.group(1)) if m_mag else 0.0,
+                "reason": "salvaged: malformed Gemini JSON (numeric fields only)",
+            }
+        raise ValueError("no parseable JSON object or salvageable score fields")
+
     def score_payload(
         self, *, ticker: str | None, dt: date, title: str, content: str
     ) -> dict:
@@ -453,10 +491,7 @@ class SentimentCrawler:
             )
             try:
                 raw = self._generate_content(user_message)
-                # response_mime_type="application/json" avoids markdown fences,
-                # but keep the strip as a defensive fallback.
-                raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-                parsed = json.loads(raw)
+                parsed = self.parse_gemini_json(raw)
                 score = {
                     "sentiment_score": float(parsed.get("sentiment_score", parsed.get("score", 0.0))),
                     "magnitude": float(parsed.get("magnitude", 0.0)),
