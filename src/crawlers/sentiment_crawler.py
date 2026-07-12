@@ -419,14 +419,25 @@ class SentimentCrawler:
         transient error is re-raised (``reraise=True``) for the caller to fall
         back on.
         """
+        config_kwargs: dict = dict(
+            system_instruction=DEFAULT_PROMPT,
+            response_mime_type="application/json",
+            temperature=0.0,
+        )
+        # COST: gemini-2.5-flash enables "thinking" by DEFAULT, and thinking
+        # tokens bill at the OUTPUT rate (~8x input) — measured ~$1.5-2.0 per
+        # full pipeline run (~300 scoring calls) before this was disabled
+        # (2026-07-12). Deterministic JSON extraction needs none of it;
+        # budget=0 turns it off (~85% cost cut). Guarded so an SDK/model
+        # without ThinkingConfig support still works.
+        if hasattr(genai_types, "ThinkingConfig"):
+            config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_budget=0
+            )
         response = self._client.models.generate_content(
             model=self.model_name,
             contents=user_message,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=DEFAULT_PROMPT,
-                response_mime_type="application/json",
-                temperature=0.0,
-            ),
+            config=genai_types.GenerateContentConfig(**config_kwargs),
         )
         return (response.text or "").strip()
 
