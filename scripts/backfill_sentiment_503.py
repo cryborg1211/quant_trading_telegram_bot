@@ -21,9 +21,13 @@ from __future__ import annotations
 import time
 import argparse
 import logging
+import sys
+from pathlib import Path
 from typing import Any
 
 import duckdb
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config.settings import CONFIG
 from src.crawlers.sentiment_crawler import SentimentCrawler
