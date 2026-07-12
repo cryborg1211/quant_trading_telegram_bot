@@ -736,6 +736,32 @@ def _is_transient(exc: Exception, status: Any) -> bool:
     )
 
 
+def _parse_llm_json(raw_response: str) -> Any:
+    """Parse a Gemini batch response, tolerating fences and format drift.
+
+    Ladder: strict ``json.loads`` → fence-strip + greedy object/array regex →
+    ``raw_decode`` of the FIRST complete object/array (2026-07-07 drift:
+    trailing prose or two objects back-to-back make the greedy
+    {first..last} span invalid JSON). A still-broken body raises
+    ``json.JSONDecodeError`` for the caller's retry/fallback path.
+    """
+    try:
+        return json.loads(raw_response)
+    except json.JSONDecodeError:
+        cleaned = re.sub(
+            r"^```(?:json)?\s*", "", raw_response.strip(), flags=re.IGNORECASE
+        )
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        m = re.search(r"(\{.*\}|\[.*\])", cleaned, flags=re.DOTALL)
+        if not m:
+            raise
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            parsed, _ = json.JSONDecoder().raw_decode(cleaned[m.start():])
+            return parsed
+
+
 def _normalize_news_json(
     parsed: Any, tickers: list[str]
 ) -> dict[str, dict[str, Any]]:
@@ -856,17 +882,7 @@ def get_batch_sentiment_scores(ticker_news_dict: dict[str, list[str]]) -> dict[s
             raw_response = (response.text or "") if hasattr(response, "text") else ""
 
             # Parse — tolerant of code fences AND object-or-array shapes.
-            try:
-                parsed = json.loads(raw_response)
-            except json.JSONDecodeError:
-                cleaned = re.sub(
-                    r"^```(?:json)?\s*", "", raw_response.strip(), flags=re.IGNORECASE
-                )
-                cleaned = re.sub(r"\s*```$", "", cleaned)
-                m = re.search(r"(\{.*\}|\[.*\])", cleaned, flags=re.DOTALL)
-                if not m:
-                    raise
-                parsed = json.loads(m.group(0))
+            parsed = _parse_llm_json(raw_response)
 
             # THE FIX: normalize dict / list / wrapped shapes → {TICKER:{}}.
             result_json = _normalize_news_json(parsed, list(ticker_news_dict))

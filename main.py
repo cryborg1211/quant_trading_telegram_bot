@@ -2075,6 +2075,25 @@ def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> No
         notify_tranche_exits()
 
 
+def inference_only() -> None:
+    """Steps 3–4 of `full_pipeline` only: daily inference + tranche exit alerts.
+
+    For the operator who already ingested today's OHLCV (`--task crawl_hose`)
+    and wants the EOD signal, paperlog row, and exit alerts WITHOUT the
+    ~25-min sentiment crawl. Gemini cost: only the arbitrator's single small
+    batch (3–6 tickers) — the per-article scoring pass is skipped entirely.
+    Freshness is the operator's contract: run AFTER the close and AFTER
+    crawl_hose, otherwise inference scores stale bars. Unlike the default
+    `--task daily_inference` (safe any time of day), this variant fires
+    `notify_tranche_exits` which MARKS due cohorts closed — EOD use only.
+    """
+    LOGGER.warning("Running inference_only (EOD, no crawl, no sentiment refresh): "
+                   "inference + exit alerts.")
+    daily_inference()
+    with timed_step("Tranche exit-due check (signal ledger)"):
+        notify_tranche_exits()
+
+
 def notify_tranche_exits() -> int:
     """Alert (then close) every ledgered signal whose hold horizon elapsed.
 
@@ -2132,9 +2151,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--task",
         default="daily_inference",
-        choices=["daily_inference", "crawl_hose", "crawl_macro", "full_pipeline"],
+        choices=["daily_inference", "crawl_hose", "crawl_macro", "full_pipeline",
+                 "inference_only"],
         help="Task to run. daily_inference is the no-crawl live path; "
-             "crawl_hose / full_pipeline are the EOD ingestion paths.",
+             "crawl_hose / full_pipeline are the EOD ingestion paths; "
+             "inference_only = EOD inference + exit alerts on already-crawled "
+             "data (skips the sentiment crawl — minimal Gemini spend).",
     )
     parser.add_argument("--window-rows", type=int, default=120, help="Rows per ticker for live Alpha360 inference.")
     parser.add_argument(
@@ -2239,6 +2261,8 @@ def main() -> None:
             update_macro_daily(days_back=args.days_back)
         elif task_name == "full_pipeline":
             full_pipeline(force_crawl=args.force_crawl, days_back=args.days_back)
+        elif task_name == "inference_only":
+            inference_only()
         else:
             daily_inference(window_rows=args.window_rows, max_candidates=args.max_candidates)
     except (KeyboardInterrupt, SystemExit):

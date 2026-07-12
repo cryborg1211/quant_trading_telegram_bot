@@ -220,3 +220,38 @@ class TestGetRebalanceAdvice:
 
     def test_rebalance_prompt_is_vietnamese(self):
         assert "Việt Nam" in REBALANCE_SYSTEM_PROMPT or "tiếng Việt" in REBALANCE_SYSTEM_PROMPT
+
+
+# --------------------------------------------------------------------------- #
+# _parse_llm_json — batch-parse drift tolerance (2026-07-07 incident)
+# --------------------------------------------------------------------------- #
+
+class TestParseLlmJson:
+    def test_strict_object(self):
+        from src.models.quant_agent_arbitrator import _parse_llm_json
+        assert _parse_llm_json('{"HPG": {"sentiment_score": 0.5}}') == {
+            "HPG": {"sentiment_score": 0.5}
+        }
+
+    def test_fenced_array(self):
+        from src.models.quant_agent_arbitrator import _parse_llm_json
+        out = _parse_llm_json('```json\n[{"ticker": "SSI", "sentiment_score": 0.1}]\n```')
+        assert isinstance(out, list) and out[0]["ticker"] == "SSI"
+
+    def test_trailing_prose_takes_first_object(self):
+        from src.models.quant_agent_arbitrator import _parse_llm_json
+        raw = '{"SSI": {"sentiment_score": 0.2}}\nNote: assessment above.'
+        assert _parse_llm_json(raw) == {"SSI": {"sentiment_score": 0.2}}
+
+    def test_two_objects_back_to_back_takes_first(self):
+        from src.models.quant_agent_arbitrator import _parse_llm_json
+        raw = ('{"SSI": {"sentiment_score": 0.2}}\n'
+               '{"VJC": {"sentiment_score": -0.4}}')
+        assert _parse_llm_json(raw) == {"SSI": {"sentiment_score": 0.2}}
+
+    def test_garbage_raises_jsondecodeerror(self):
+        import json as _json
+        import pytest as _pytest
+        from src.models.quant_agent_arbitrator import _parse_llm_json
+        with _pytest.raises(_json.JSONDecodeError):
+            _parse_llm_json("Xin loi, toi khong the phan tich.")
