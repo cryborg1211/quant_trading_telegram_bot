@@ -48,7 +48,7 @@
     "serve_universe_mode": "adv_top_n",
     "serve_liquid_top_n": 50,
     "serve_adv_window": 20,
-    "intraday_scanner_enabled": false,
+    "intraday_scanner_enabled": true,
     "intraday_scan_interval_min": 15,
     "intraday_alert_delta_pp": 0.02
   },
