@@ -455,3 +455,10 @@ def test_run_scan_new_calendar_date_resets_to_baseline(monkeypatch) -> None:
     assert result.card is not None  # baseline card, not a spurious huge-delta alert
     assert "PHIÊN MỞ" in result.card
     assert result.state.session_date == date(2026, 7, 6)
+
+
+def test_release_memory_never_raises() -> None:
+    """Hygiene helper is best-effort by contract - must run cleanly anywhere."""
+    from src.trading.intraday_scanner import _release_memory
+    _release_memory()
+    _release_memory()  # idempotent

@@ -43,7 +43,9 @@ parquet stores raw share counts.
 """
 from __future__ import annotations
 
+import gc
 import logging
+import sys
 from dataclasses import dataclass, field
 from datetime import date as date_cls, datetime
 from typing import Any
@@ -520,7 +522,32 @@ def run_scan(
         session_date=scan_date,
         last_card=card if card is not None else state.last_card,
     )
+    # Memory hygiene (2026-07-12): each cycle transiently allocates ~1 GB of
+    # pandas/numpy intermediates (full-panel feature build × 2 horizons)
+    # inside the LONG-LIVED bot process; without an explicit release the
+    # process RSS ratchets between scans and starves low-RAM laptops. The
+    # retained state above is tiny (score dicts) — everything else is
+    # droppable right now.
+    del tails, spliced, snapshot, scores_now
+    _release_memory()
     return ScanResult(state=new_state, card=card)
+
+
+def _release_memory() -> None:
+    """Force-release scan transients: full GC, then (Windows) trim the
+    process working set so the freed pages actually return to the OS instead
+    of sitting in the allocator. Best-effort — never raises."""
+    gc.collect()
+    if sys.platform == "win32":
+        try:
+            import ctypes  # noqa: PLC0415
+
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            ctypes.windll.kernel32.SetProcessWorkingSetSizeEx(
+                handle, ctypes.c_size_t(-1), ctypes.c_size_t(-1), 0
+            )
+        except Exception:  # noqa: BLE001 — trimming is opportunistic
+            LOGGER.debug("[intraday_scanner] working-set trim unavailable.")
 
 
 def _load_tails(window_rows: int) -> pl.DataFrame:
