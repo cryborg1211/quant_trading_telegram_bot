@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from telegram import BotCommand, Update
+from telegram import BotCommand, BotCommandScopeChat, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -140,6 +140,7 @@ HELP_TEXT = (
     "🗓️ <b>/audit_monthly</b> — Xem lại hiệu quả các quyết định 30 ngày qua.\n"
     "📰 <b>/news</b> — Tổng hợp tin tức thị trường mới nhất.\n"
     "💬 <b>/feedback</b> <i>[Nội dung]</i> — Gửi góp ý trực tiếp đến Admin.\n"
+    "📨 <b>/msg_user2</b> <i>[Nội dung]</i> — Gửi thông báo đến User (chỉ Admin).\n"
     "ℹ️ <b>/help</b> — Hiển thị menu này.\n"
     "\n"
     "💡 Lưu ý: Để hỗ trợ và cải thiện hệ thống, các truy vấn của bạn "
@@ -1541,14 +1542,37 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("help", "Hiển thị danh sách lệnh"),
 ]
 
+# Admin-only commands: appended to the menu ONLY in the Admin chat via a
+# chat-scoped set_my_commands — User2's "/" menu must not advertise commands
+# whose auth gate would just reject them.
+_ADMIN_COMMANDS: list[BotCommand] = [
+    BotCommand("msg_user2", "Gửi thông báo đến User (ID 2) — chỉ Admin"),
+]
+
 
 async def _set_bot_commands(app: Application) -> None:
-    """Post-init hook: push command list to Telegram so the slash menu is current."""
+    """Post-init hook: push command list to Telegram so the slash menu is current.
+
+    Default scope gets the shared list; the Admin chat additionally gets the
+    admin-only commands (chat-scoped menus override the default for that chat).
+    """
     await app.bot.set_my_commands(_BOT_COMMANDS)
     LOGGER.info(
         "Telegram bot commands registered: %s",
         [c.command for c in _BOT_COMMANDS],
     )
+    if ADMIN_CHAT_ID:
+        try:
+            await app.bot.set_my_commands(
+                _BOT_COMMANDS + _ADMIN_COMMANDS,
+                scope=BotCommandScopeChat(chat_id=int(ADMIN_CHAT_ID)),
+            )
+            LOGGER.info(
+                "Admin-scoped commands registered: %s",
+                [c.command for c in _ADMIN_COMMANDS],
+            )
+        except Exception as exc:  # noqa: BLE001 — menu cosmetics must not kill startup
+            LOGGER.warning("Admin-scoped command menu failed (%s) — global menu only.", exc)
 
 
 async def msg_user2_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
