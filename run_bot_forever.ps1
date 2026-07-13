@@ -14,10 +14,12 @@
     `python run_bot.py`.
 
 .PARAMETER Python
-    Interpreter to use. Default "python" — works when you have already run
-    `conda activate stock`. If you launch without activating the env, pass the
-    full path, e.g.:
-        -Python C:\Users\caokh\anaconda3\envs\stock\python.exe
+    Interpreter to use. Defaults to the conda `stock` env's python by ABSOLUTE
+    path when it exists (a bare "python" resolved through a child shell's PATH
+    has bitten before — 13-07-26: profile put package-less Python 3.11 first →
+    ModuleNotFoundError: telegram). Falls back to "python" only when the conda
+    path is absent (other machines). Override explicitly if needed:
+        -Python C:\path\to\other\python.exe
 
 .PARAMETER BackoffSeconds
     Seconds to wait between a bot exit and the next relaunch. Default 10.
@@ -33,9 +35,14 @@
     returns a getUpdates Conflict.
 #>
 param(
-    [string]$Python = "python",
+    [string]$Python = "",
     [int]$BackoffSeconds = 10
 )
+
+if (-not $Python) {
+    $condaPython = "C:\Users\caokh\anaconda3\envs\stock\python.exe"
+    if (Test-Path $condaPython) { $Python = $condaPython } else { $Python = "python" }
+}
 
 $ErrorActionPreference = "Stop"
 $Script = Join-Path $PSScriptRoot "run_bot.py"
