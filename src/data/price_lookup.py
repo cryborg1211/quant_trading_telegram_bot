@@ -117,6 +117,47 @@ def close_on_or_after(ticker: str, ref_date: Any, conn: Any | None = None) -> fl
         return None
 
 
+def closes_between(
+    ticker: str, start_date: Any, end_date: Any, conn: Any | None = None
+) -> list[float]:
+    """Ordered daily closes in ``[start_date, end_date]`` (empty on any miss).
+
+    Backs the corporate-action gap guard: callers need the CLOSE PATH across
+    a return window, not just its endpoints.
+    """
+    src = _shard_source(ticker)
+    if src is None:
+        return []
+    try:
+        with _conn_ctx(conn) as c:
+            rows = c.execute(
+                f"SELECT close FROM {src} "
+                "WHERE date >= CAST(? AS DATE) AND date <= CAST(? AS DATE) "
+                "ORDER BY date ASC",
+                [start_date, end_date],
+            ).fetchall()
+        return [float(r[0]) for r in rows if r[0] is not None]
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("price_lookup.closes_between(%s, %s, %s) failed: %s",
+                       ticker, start_date, end_date, exc)
+        return []
+
+
+def has_ca_gap(closes: list[float], max_session_move: float = 0.10) -> bool:
+    """True when any consecutive close-to-close move exceeds ``max_session_move``.
+
+    HOSE caps a session at ±7%, so a raw-parquet close path containing a
+    >10% single-session jump means a corporate action (split / stock
+    dividend / rights issue), NOT price action — e.g. KLB 2026-07-01→07-02:
+    16.55 → 12.78 (−23%, ~30% stock dividend). A return computed across such
+    a window is a phantom; callers should exclude it rather than book it.
+    """
+    for prev, cur in zip(closes, closes[1:]):
+        if prev > 0 and abs(cur / prev - 1.0) > max_session_move:
+            return True
+    return False
+
+
 def latest_close(ticker: str, conn: Any | None = None) -> float | None:
     """Latest available close for ``ticker``."""
     src = _shard_source(ticker)

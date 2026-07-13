@@ -364,3 +364,83 @@ def test_backfill_returns_count(fake_db, monkeypatch) -> None:
         ).fetchone()[0]
     )
     assert filled == 2
+
+
+# --------------------------------------------------------------------------- #
+# Test Group C — corporate-action guard (2026-07-12, KLB Jul-2 stock dividend)
+# --------------------------------------------------------------------------- #
+
+from src.data.price_lookup import has_ca_gap  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_ca_gap_by_default(monkeypatch):
+    """Neutralize the CA guard for pre-existing tests: fake tickers would
+    otherwise hit REAL parquet shards (HPG/FPT exist on disk) and make
+    results date-dependent. CA tests override this per-test."""
+    monkeypatch.setattr(main.price_lookup, "closes_between", lambda *a, **k: [])
+
+
+def test_has_ca_gap_normal_path_false() -> None:
+    assert has_ca_gap([100.0, 106.9, 100.1, 93.5]) is False  # inside ±7% band
+
+
+def test_has_ca_gap_klb_shape_true() -> None:
+    # KLB 01-07 -> 02-07: 16.55 -> 12.78 = -22.8% single session.
+    assert has_ca_gap([16.5, 16.55, 12.78, 12.85]) is True
+
+
+def test_has_ca_gap_empty_and_single() -> None:
+    assert has_ca_gap([]) is False
+    assert has_ca_gap([100.0]) is False
+
+
+def test_backfill_ca_gap_skips_short_fill(fake_db, monkeypatch) -> None:
+    log_date = date.today() - timedelta(days=6)  # T+3 mature, T+20 not
+    _insert_raw_row(fake_db, "KLB", log_date)
+
+    monkeypatch.setattr(
+        main.price_lookup, "close_on_or_before", lambda t, d, conn=None: 16.6
+    )
+    monkeypatch.setattr(
+        main.price_lookup, "close_on_or_after", lambda t, d, conn=None: 12.85
+    )
+    monkeypatch.setattr(
+        main.price_lookup, "closes_between",
+        lambda *a, **k: [16.6, 16.55, 12.78, 12.85],  # CA gap inside window
+    )
+
+    n = main._backfill_paperlog_outcomes(fake_db)
+    assert n == 0  # nothing written — short skipped, long not mature
+    ret_3d, filled = fake_db.conn.execute(
+        "SELECT ret_3d, outcome_filled FROM sentiment_entry_paperlog "
+        "WHERE ticker = 'KLB'"
+    ).fetchone()
+    assert ret_3d is None
+    assert filled is False  # stays pending until the long window settles it
+
+
+def test_backfill_ca_gap_settles_long_with_null(fake_db, monkeypatch) -> None:
+    log_date = date.today() - timedelta(days=25)  # both horizons mature
+    _insert_raw_row(fake_db, "KLB", log_date)
+
+    monkeypatch.setattr(
+        main.price_lookup, "close_on_or_before", lambda t, d, conn=None: 16.6
+    )
+    monkeypatch.setattr(
+        main.price_lookup, "close_on_or_after", lambda t, d, conn=None: 12.85
+    )
+    monkeypatch.setattr(
+        main.price_lookup, "closes_between",
+        lambda *a, **k: [16.6, 16.55, 12.78, 12.85],
+    )
+
+    n = main._backfill_paperlog_outcomes(fake_db)
+    assert n == 1  # progress: the row settled (excluded), not retried forever
+    ret_3d, ret_20d, filled = fake_db.conn.execute(
+        "SELECT ret_3d, ret_20d, outcome_filled FROM sentiment_entry_paperlog "
+        "WHERE ticker = 'KLB'"
+    ).fetchone()
+    assert ret_3d is None      # short window also CA-contaminated -> skipped
+    assert ret_20d is None     # settled with NULL = permanently excluded
+    assert filled is True

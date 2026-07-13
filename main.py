@@ -804,7 +804,16 @@ def _backfill_paperlog_outcomes(db: Any) -> int:
             continue  # T0 shard missing → leave pending, retry next run.
 
         new_ret_3d, new_ret_20d = ret_3d, ret_20d
-        wrote_short = wrote_long = False
+        wrote_short = wrote_long = ca_excluded_long = False
+
+        # Corporate-action guard (2026-07-12; KLB Jul-2 ~30% stock dividend):
+        # parquet closes are UNADJUSTED, so a split/dividend inside a return
+        # window books a phantom loss/gain (KLB: −22.6% "ret_3d" that never
+        # happened). A single-session close-to-close move beyond the HOSE
+        # band (|Δ| > 10%; band is ±7%) marks the window as CA-contaminated:
+        # the SHORT fill is skipped, and a contaminated LONG window settles
+        # the row with ret_20d = NULL (outcome_filled TRUE) so it is
+        # permanently excluded from sleeve/audit math instead of retried.
 
         # SHORT (T+3) — fill as soon as the window is available.
         if ret_3d is None:
@@ -812,8 +821,15 @@ def _backfill_paperlog_outcomes(db: Any) -> int:
                 ticker, log_date + timedelta(days=3), conn=db.conn
             )
             if t3_close is not None:
-                new_ret_3d = (t3_close - t0_close) / t0_close
-                wrote_short = True
+                if price_lookup.has_ca_gap(price_lookup.closes_between(
+                        ticker, log_date, log_date + timedelta(days=5), conn=db.conn)):
+                    LOGGER.warning(
+                        "[Paperlog] CA gap in %s T+3 window (log %s) — ret_3d skipped.",
+                        ticker, log_date,
+                    )
+                else:
+                    new_ret_3d = (t3_close - t0_close) / t0_close
+                    wrote_short = True
 
         # LONG (T+20) — only once the max horizon has matured.
         if ret_20d is None and log_date <= long_cutoff:
@@ -821,14 +837,24 @@ def _backfill_paperlog_outcomes(db: Any) -> int:
                 ticker, log_date + timedelta(days=20), conn=db.conn
             )
             if t20_close is not None:
-                new_ret_20d = (t20_close - t0_close) / t0_close
-                wrote_long = True
+                if price_lookup.has_ca_gap(price_lookup.closes_between(
+                        ticker, log_date, log_date + timedelta(days=22), conn=db.conn)):
+                    LOGGER.warning(
+                        "[Paperlog] CA gap in %s T+20 window (log %s) — settled "
+                        "with NULL ret_20d (excluded).", ticker, log_date,
+                    )
+                    ca_excluded_long = True
+                    wrote_long = True
+                else:
+                    new_ret_20d = (t20_close - t0_close) / t0_close
+                    wrote_long = True
 
         if not (wrote_short or wrote_long):
             continue  # nothing newly available → retry next run.
 
-        # Terminal only when the T+20 (max-horizon) return is populated.
-        completed = new_ret_20d is not None
+        # Terminal when the T+20 return is populated OR the window is
+        # CA-excluded (settled-with-NULL stops the infinite retry).
+        completed = new_ret_20d is not None or ca_excluded_long
 
         with db._audit_lock:
             db.conn.execute(

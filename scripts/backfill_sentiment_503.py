@@ -18,7 +18,6 @@ Usage (dry-run by default — prints what WOULD change, writes nothing):
 """
 
 from __future__ import annotations
-import time
 import argparse
 import logging
 import sys
@@ -108,7 +107,6 @@ def backfill_503(
             "[backfill] %s %s -> score=%.2f mag=%.2f",
             "UPDATED" if commit else "WOULD UPDATE", url, sentiment, magnitude,
         )
-    time.sleep(10)
 
     return {"scanned": len(rows), "recovered": recovered, "still_failing": still_failing}
 
