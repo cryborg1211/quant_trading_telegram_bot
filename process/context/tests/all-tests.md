@@ -1,6 +1,6 @@
 # Quant Engine V4.0 - All Tests
 
-Last updated: 2026-07-06
+Last updated: 2026-07-14
 
 Attach this file first when the task involves testing, verification, or test debugging.
 
@@ -50,7 +50,7 @@ Use this file when you need to:
 
 ### Use `pytest` for everything
 
-- All 591 tests run through pytest
+- All 653 tests run through pytest
 - `pytest -q` for quick output (default via `pytest.ini`)
 - No separate test runners, no browser tests, no e2e framework
 - Tests use in-memory DuckDB and stubs — no external services needed
@@ -67,7 +67,7 @@ Unless the task clearly needs a different path:
 
 | Scope | Command | Notes |
 |---|---|---|
-| Full suite | `pytest -q` | 591 tests, all in-memory |
+| Full suite | `pytest -q` | 653 tests, all in-memory |
 | Single file | `pytest -q tests/test_<name>.py` | targeted verification |
 | Single test | `pytest -q tests/test_<name>.py::test_<func>` | surgical |
 | Verbose | `pytest -v` | full test names + pass/fail |
@@ -92,12 +92,13 @@ Unless the task clearly needs a different path:
 | `test_serve_resilience.py` | serve-path error handling | graceful degradation | API failure stubs |
 | `test_rank_sleeve.py` | rank-sleeve counterfactual evaluator | 6 tests | added 05-07-26 (item-1 frozen-criteria evaluator) |
 | `test_foreign_flow_crawler.py` | SSI iBoard bulk snapshot crawler | 8 tests | added 05-07-26; also the shared `_fetch_ssi_hose_snapshot` retry logic reused by the intraday scanner |
-| `test_intraday_scanner.py` | intraday attack scanner (pure functions + degrade paths) | 39 tests | added 06-07-26; monitoring-only, no live HTTP, no paperlog/parquet writes in any test |
+| `test_intraday_scanner.py` | intraday attack scanner (pure functions + degrade paths) | 40 tests | added 06-07-26; monitoring-only, no live HTTP, no paperlog/parquet writes in any test |
+| `test_portfolio_guard.py` | EOD alert-only guard: triggers, price-scale normalization, card rendering, orchestration | 40 tests | added 13-07-26; pure-function tests need no DB/stubs, loader+orchestration tests use in-memory DuckDB |
 | `conftest.py` (tests/) | shared fixtures | fixture definitions | in-memory DuckDB, sample data |
 
-**Note (06-07-26):** this table covers the historically-significant/hub-adjacent
+**Note (06-07-26; count corrected 14-07-26):** this table covers the historically-significant/hub-adjacent
 test files and is not a complete 1:1 listing of every file under `tests/`
-(currently 47 files, 591 tests total — see `pytest --collect-only -q` for the
+(currently 50 files, 653 tests total — see `pytest --collect-only -q` for the
 exhaustive list). A full test-file-map refresh is recommended via
 `vc-audit-context` if this table's staleness becomes a recurring friction
 point.

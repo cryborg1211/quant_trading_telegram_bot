@@ -1,6 +1,6 @@
 # Quant Engine V4.0 - All Context
 
-Last updated: 2026-07-06
+Last updated: 2026-07-14
 
 This file is the root context entrypoint for the repo.
 
@@ -62,7 +62,7 @@ For most substantial tasks:
 | Group | Entry point | Scope |
 |---|---|---|
 | `planning/` | `process/context/planning/all-planning.md` | plan-shape calibration, planning examples, SIMPLE vs COMPLEX reference docs |
-| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 591 tests, in-memory DuckDB stubs, debugging quick-ref |
+| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 653 tests, in-memory DuckDB stubs, debugging quick-ref |
 
 ## Task Routing Table
 
@@ -163,6 +163,7 @@ stock_price_v3/
     trading/
       portfolio_manager.py -- Portfolio state management
       intraday_scanner.py  -- Intraday attack scanner (pure module, monitoring-only, kill-switch OFF default)
+      portfolio_guard.py   -- EOD alert-only protective scan of human /add holdings (pure + thin I/O, kill-switch ON default)
     reports/
       __init__.py         -- Re-exports report builders
       builders.py         -- 10 report builder functions + 11 constants (extracted from main.py)
@@ -172,7 +173,7 @@ stock_price_v3/
       logging_utils.py    -- Centralized logging setup
       audit_evaluator.py  -- Trade audit evaluation
       version.py          -- Version string
-  tests/                  -- 47 test files, 591 tests (pytest)
+  tests/                  -- 50 test files, 653 tests (pytest)
   train_macro_regime.py   -- Train + serialize the GARCH-HMM regime overlay
   scripts/
     migrate_sqlite_to_duckdb.py -- Legacy SQLite → DuckDB migration
@@ -206,7 +207,7 @@ stock_price_v3/
 - **Bot:** python-telegram-bot 22.7 (async PTB framework)
 - **HTTP:** aiohttp 3.13, requests 2.33
 - **Config:** python-dotenv 1.2 (.env), dataclass-based settings with JSON overrides
-- **Testing:** pytest (591 tests, in-memory DuckDB stubs)
+- **Testing:** pytest (653 tests, in-memory DuckDB stubs)
 - **Deployment:** Bare metal VPS — systemd (bot), cron (daily pipeline at 15:30 ICT Mon–Fri)
 
 ## Key Patterns and Conventions
@@ -257,6 +258,8 @@ stock_price_v3/
 **Intraday attack scanner (2026-07-06):** `src/trading/intraday_scanner.py` — pure module, monitoring-only. Every 10–30 min during HOSE hours (09:15–11:30 / 13:00–14:45 ICT) one SSI iBoard bulk snapshot builds provisional daily bars (absolute VND ÷1000 to the parquet thousands convention), spliced in-memory onto each ticker's 120-row parquet tail, dual-horizon (T+5 + T+20) rescore, ADV-top-50 gate (`_resolve_candidate_universe`), event-only alert card (new top-3 entrant / τ crossing / |Δ|≥2pp) sent to BOTH chats (ADMIN + USER). **Hard constraints:** zero writes to parquet/DuckDB/`sentiment_entry_paperlog` (protects the running item-1 pre-registered experiment), no arbitrator/Gemini call in the loop, no `signal_ledger` writes, no BUY dispatch. Config: `TradingConfig.intraday_scanner_enabled` (default **False** — kill-switch), `intraday_scan_interval_min` (default 15, clamped 10–30), `intraday_alert_delta_pp` (default 0.02). Wiring: `telegram_bot.py::_intraday_scan_job` via PTB `JobQueue`, config-gated; degrades to an ERROR log (bot still builds/runs) when `app.job_queue is None`. `requirements.txt` pins `python-telegram-bot[job-queue]==22.7` (new dependency — PTB's JobQueue extra was not previously installed). Tests: `tests/test_intraday_scanner.py` (39). Gate 5 (live market-open smoke, 09:15 ICT) still pending as of ship date — plan stays active until that manual verification lands.
 
 **Tầm Nhìn fan-chart (2026-06-29):** `dashboard/tabs/tam_nhin.py` + `dashboard/utils/fan_chart.py` — TradingView-style pure-technical forecast: `go.Candlestick` history + 12 Monte Carlo GBM paths + neon median (no shaded bands), rangeslider/rangeselector, crosshair spikes (`spikemode="toaxis+across"`). `project_fan` still computes analytic bands (unit-tested) but the figure draws MC paths instead. MC seed is per-ticker (`_ticker_seed` = `crc32(ticker)`, NOT `hash()` which is process-salted) — a single shared seed made every ticker render one cloned wiggle shape. Needs OHLC, so `price_lookup.ohlc_history(ticker, n)` was added alongside `close_history`. Tests: `tests/test_dashboard_fan_chart.py`.
+
+**Portfolio guard (2026-07-14):** `src/trading/portfolio_guard.py` — pure module (+ one thin I/O function), EOD alert-only protective scan of human users' `/add`-tracked holdings (never the `user_id='cron'` automated book — the triggering incident was a user riding a position −7% with no alert). Stage 1 is five deterministic, zero-LLM triggers per lot: hard stop-loss (`CONFIG.trading.stop_loss_pct`), take-profit (`take_profit_pct`), trailing-stop (new `portfolio_guard_trailing_pct`, default `0.08`), model-flip (OR across T+5/T+20 argmax==SELL), NO_TRADE regime warning (`{0,7}`); a corporate-action-gap shield downgrades hard-stop/trailing-stop wording only (take-profit stays confident, per approved scope). Stage 2 is config-gated: at most ONE `evaluate_trades_batch` arbitrator call + ONE `mr_score_tickers` call, across the union of triggered tickers only (never per-user, never per-trigger). **Hard constraints:** alert-only (zero writes to parquet/DuckDB/`signal_ledger`/`sentiment_entry_paperlog`, no auto-sell), never-raise (`main.notify_portfolio_guard` mirrors `notify_tranche_exits`'s try/except→log→`0` shape), event-only delivery (silent when nothing fires), and `portfolio_guard.py` never imports `main` (one-directional — `main.py` imports it). Wiring: `main._run_guard_for_users` + `main.notify_portfolio_guard()` called from both `full_pipeline` and `inference_only` immediately after each's `notify_tranche_exits()`; optional on-demand `/guard` command (mirrors `/suggest_sell`). Delivery is per-user Telegram DM via new `TelegramBot.send_text_to_chat(chat_id, html_text, label)` (extracted `_send_to_one` from `_dispatch`, single-recipient not broadcast). Config: `CONFIG.trading.portfolio_guard_enabled` (default **True**, kill-switch), `portfolio_guard_trailing_pct` (default `0.08`), `portfolio_guard_llm_enabled` (default **True**). **Price-scale resolution (the highest-risk defect this feature guards against):** `portfolio.price` (a user's `/add` entry price) had two conflicting scale assumptions already live in the codebase — the bot's own `/add` help example (`/add VNE 1000 32.5`) implies thousands-VND, while `dashboard/utils/headless.py::_pnl_ratio` assumes absolute VND unconditionally. `portfolio_guard.normalize_entry_price_vnd` resolves it with the same `< 1000.0 ⇒ ×1000` rule already canonical in `main._VN_PRICE_SCALE_THRESHOLD` (main.py:89); confirmed correct on real rows (entries `27.5`/`152.5` normalize to `27,500`/`152,500` VND). **Flagged, not fixed:** `headless.py::_pnl_ratio`'s one-sided absolute-VND assumption is a latent-bug candidate for the dashboard's GIỮ tab if a user ever followed the bot's own thousands-VND `/add` example literally — out of scope for this feature by design; tracked in `process/features/local-dashboard/backlog/dashboard-pnl-ratio-price-scale_14-07-26.md` (recommended fix reuses `normalize_entry_price_vnd` rather than a third inline copy of the threshold rule). Tests: `tests/test_portfolio_guard.py` (40). Status: code-complete, 653/653 full suite green (independently re-confirmed via a full `pytest -q` run), live-DB read-only dry run completed (no write paths invoked by construction; empirical DB diff not run) — the general plan (`process/general-plans/active/portfolio-guard_PLAN_13-07-26.md`) stays ACTIVE pending confirmation of the first production EOD run at the 15:30 ICT cron (same Gate-5-style precedent as the intraday scanner).
 
 ## Environment and Configuration
 

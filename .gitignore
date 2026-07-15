@@ -54,3 +54,6 @@ TradingAgents-main/
 .code-review-graph/
 #old files
 stock_price_old/
+# --- Local tool indexes & artifact dumps (never commit) ---
+.tokensave/
+backups/
