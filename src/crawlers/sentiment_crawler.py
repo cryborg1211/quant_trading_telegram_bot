@@ -138,6 +138,13 @@ class SentimentCrawler:
     # NEW item is one Gemini call. Feeds are newest-first, so the cap keeps the
     # freshest slice.
     RSS_MAX_ITEMS_PER_FEED = 30
+    # Chunk size for BOTH the batched Gemini call (`_score_batch` — one call
+    # per chunk instead of one per article) and the incremental DB append (an
+    # interrupt loses at most ONE in-flight batch). 2026-07-13 incident: a
+    # Ctrl+C 420s into per-article scoring billed ~7 min of calls and
+    # persisted zero rows; 14-07 batching also cut a 300-article run from
+    # 300 calls to 12.
+    SCORE_APPEND_CHUNK = 25
 
     def __init__(
         self,
@@ -145,8 +152,14 @@ class SentimentCrawler:
         model_name: str | None = None,
     ):
         self.db_path = db_path or str(CONFIG.paths.duckdb_path)
+        # Model precedence: explicit arg → .env GEMINI_MODEL → config default.
+        # The env pin governs BOTH this crawler and the arbitrator (parity with
+        # quant_agent_arbitrator's os.environ.get("GEMINI_MODEL", ...)).
+        # Floating aliases are banned here: "gemini-flash-latest" silently
+        # became gemini-3.5-flash and caused the 2026-07-07 JSON-drift incident
+        # plus intermittent 503s — pin GA models only.
         # Strip legacy "models/" prefix — new SDK accepts bare model name only.
-        raw_model = model_name or CONFIG.sentiment.gemini_model
+        raw_model = model_name or os.getenv("GEMINI_MODEL") or CONFIG.sentiment.gemini_model
         self.model_name = raw_model.removeprefix("models/")
         self._client: Any | None = None
         api_key = os.getenv("GEMINI_API_KEY")
@@ -184,9 +197,18 @@ class SentimentCrawler:
             LOGGER.info("[SentimentCrawler] No new sentiment articles found.")
             return pd.DataFrame()
 
-        rows = [self._score_item(item) for item in new_items]
-        df = pd.DataFrame(rows)
-        self._append_rows(df)
+        # Score + persist in chunks: each chunk is ONE batched Gemini call
+        # (`_score_batch`) and is INSERTed before the next chunk is scored, so
+        # an interrupt keeps every fully-scored chunk (the `existing_urls` read
+        # at the top makes the next run skip them). An exception mid-chunk
+        # propagates exactly as before — no new swallowing.
+        appended: list[pd.DataFrame] = []
+        for start in range(0, len(new_items), self.SCORE_APPEND_CHUNK):
+            chunk_items = new_items[start:start + self.SCORE_APPEND_CHUNK]
+            chunk_df = pd.DataFrame(self._score_batch(chunk_items))
+            self._append_rows(chunk_df)
+            appended.append(chunk_df)
+        df = pd.concat(appended, ignore_index=True)
         LOGGER.info("[SentimentCrawler] Appended %s sentiment rows to hist_sentiment_llm_labeled.", len(df))
         return df
 
@@ -516,15 +538,8 @@ class SentimentCrawler:
         score["magnitude"] = max(0.0, min(1.0, float(score["magnitude"])))
         return score
 
-    def _score_item(self, item: NewsItem) -> dict:
-        score = self.score_payload(
-            ticker=item.ticker,
-            dt=item.date,
-            title=item.title,
-            content=item.text,
-        )
-        sentiment = score["sentiment_score"]
-        magnitude = score["magnitude"]
+    def _item_row(self, item: NewsItem, sentiment: float, magnitude: float, reason: str) -> dict:
+        """Assemble one `hist_sentiment_llm_labeled` row from an item + scores (pure)."""
         # Market-wide RSS items carry no ticker — use the MARKET_WIDE sentinel
         # (same label the LLM prompt uses) so the NOT NULL filter in
         # _append_rows keeps them instead of dropping every RSS row.
@@ -535,12 +550,123 @@ class SentimentCrawler:
             "title": item.title[:1000],
             "sentiment_score": sentiment,
             "magnitude": magnitude,
-            "reason": score["reason"],
+            "reason": reason,
             "url": item.url,
             "sentiment_nlp": sentiment,
             "impact_force": sentiment * magnitude,
             "is_market_wide": bool(item.is_market_wide),
         }
+
+    def _fallback_row(self, item: NewsItem, reason: str) -> dict:
+        """Neutral row for a failed scoring — `reason` keeps the 'Gemini fallback:'
+        marker when applicable so scripts/backfill_sentiment_503.py can re-score it."""
+        return self._item_row(item, 0.0, 0.0, reason)
+
+    def _score_item(self, item: NewsItem) -> dict:
+        """Single-article scoring path (one Gemini call). Kept for parity with
+        `score_payload` consumers (503 backfill); the live crawl loop uses the
+        batched `_score_batch` instead."""
+        score = self.score_payload(
+            ticker=item.ticker,
+            dt=item.date,
+            title=item.title,
+            content=item.text,
+        )
+        return self._item_row(
+            item, score["sentiment_score"], score["magnitude"], score["reason"]
+        )
+
+    @staticmethod
+    def _parse_batch_json(raw: str) -> dict[int, dict]:
+        """Parse a batched scoring response into {article_id: obj}.
+
+        Tolerates code fences, a top-level object wrapping the array (e.g.
+        {"results": [...]}), and items missing "id" (positional fallback).
+        Raises on anything that yields no usable array — the caller degrades
+        the whole batch to neutral fallback rows.
+        """
+        raw = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        start = min((i for i in (raw.find("["), raw.find("{")) if i >= 0), default=-1)
+        if start < 0:
+            raise ValueError("no JSON payload in batch response")
+        data, _ = json.JSONDecoder().raw_decode(raw[start:])
+        if isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, list):
+                    data = v
+                    break
+            else:
+                data = [data]
+        if not isinstance(data, list):
+            raise ValueError("batch response is not a JSON array")
+        out: dict[int, dict] = {}
+        for pos, obj in enumerate(data):
+            if not isinstance(obj, dict):
+                continue
+            try:
+                idx = int(obj.get("id", pos))
+            except (TypeError, ValueError):
+                idx = pos
+            out[idx] = obj
+        return out
+
+    def _score_batch(self, items: list[NewsItem]) -> list[dict]:
+        """Score a chunk of articles with ONE Gemini call.
+
+        Cost surgery 14-07-26: per-article scoring re-sent the ~1k-token system
+        prompt N times per run (the dominant input cost) and made N sequential
+        calls (~60 min wall-clock, N× the 503 surface). Batching by
+        SCORE_APPEND_CHUNK cuts a 300-article run from 300 calls to 12.
+
+        Failure contract: any API/parse failure degrades the WHOLE batch (or
+        the missing items) to neutral rows carrying the 'Gemini fallback:'
+        reason marker — the exact marker scripts/backfill_sentiment_503.py
+        targets, so individual rows stay heal-able without re-crawling.
+        """
+        if self._client is None or genai_types is None:
+            return [self._fallback_row(it, "Neutral fallback") for it in items]
+
+        blocks = []
+        for i, it in enumerate(items):
+            blocks.append(
+                f"=== ARTICLE {i} ===\n"
+                f"TICKER: {it.ticker or 'MARKET_WIDE'}\n"
+                f"DATE: {it.date.isoformat()}\n"
+                f"TITLE: {it.title}\n"
+                f"CONTENT: {(it.text or '')[: CONFIG.sentiment.article_char_limit]}"
+            )
+        user_message = (
+            "Chấm sentiment cho TỪNG bài viết dưới đây theo đúng khung phân tích.\n"
+            "Trả về STRICT JSON ARRAY, mỗi phần tử một object:\n"
+            '{"id": <số ARTICLE>, "sentiment_score": float -1..1, '
+            '"magnitude": float 0..1, "reason": "tiếng Việt, <= 3 câu, có evidence"}\n'
+            "KHÔNG thêm bất kỳ text nào ngoài JSON array.\n\n"
+            + "\n\n".join(blocks)
+        )
+
+        try:
+            raw = self._generate_content(user_message)
+            parsed = self._parse_batch_json(raw)
+        except Exception as exc:  # noqa: BLE001 — batch failure must not kill the crawl
+            LOGGER.warning(
+                "[SentimentCrawler] Batch scoring failed (%s items): %s", len(items), exc
+            )
+            return [self._fallback_row(it, f"Gemini fallback: batch {exc}") for it in items]
+
+        rows: list[dict] = []
+        for i, it in enumerate(items):
+            obj = parsed.get(i)
+            if obj is None:
+                rows.append(self._fallback_row(it, "Gemini fallback: batch missing id"))
+                continue
+            try:
+                sentiment = max(-1.0, min(1.0, float(obj.get("sentiment_score", obj.get("score", 0.0)))))
+                magnitude = max(0.0, min(1.0, float(obj.get("magnitude", 0.0))))
+            except (TypeError, ValueError):
+                rows.append(self._fallback_row(it, "Gemini fallback: batch bad fields"))
+                continue
+            rows.append(self._item_row(it, sentiment, magnitude, str(obj.get("reason", ""))[:1000]))
+        return rows
 
     def _append_rows(self, df: pd.DataFrame) -> None:
         if df.empty:
