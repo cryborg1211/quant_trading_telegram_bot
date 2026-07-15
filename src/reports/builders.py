@@ -14,6 +14,8 @@ from typing import Any
 import numpy as np
 
 from config.settings import CONFIG
+from src.features.market_regime import regime_label_vi
+from src.trading.regime_policy import NO_TRADE_REGIMES, PENALTY_REGIMES
 from src.utils.telegram_alerter import TelegramBot, format_source_links
 
 # ---------------------------------------------------------------------------
@@ -243,11 +245,49 @@ def _format_sentiment_status(sentiment_data: dict[str, Any]) -> str:
     return f"{label} ({score:+.2f})"
 
 
-def _build_combined_report(signal_data_list: list[dict]) -> str:
+def build_regime_pulse(regime_by_ticker: dict[str, int]) -> str:
+    """One-line market-regime distribution snapshot (pure, HTML-safe).
+
+    Observability line for logs + reports: without it, "what did the regime
+    layer see this week?" is unanswerable after the fact (2026-07-14 debate —
+    nothing in logs but feature-build noise). Input is the serve regime cache
+    (`main._LATEST_REGIME_BY_TICKER` shape: ticker → 0-7). Returns "" on empty.
+
+    Format (shares of the scored universe, top-3 regimes by share, then the
+    defensive aggregates the sizing policy actually acts on):
+        🌐 Pha thị trường (50 mã): R3 Tăng mạnh 42% · R6 Choppy 30% · R2 18%
+        ⛔ NO_TRADE {0,7}: 8% · ⚠️ PENALTY {1,6}: 30%
+
+    No HTML tags on purpose — the same string is valid in plain logs and in
+    `parse_mode=HTML` Telegram messages (labels contain no angle brackets).
+    """
+    if not regime_by_ticker:
+        return ""
+    total = len(regime_by_ticker)
+    counts: dict[int, int] = {}
+    for r in regime_by_ticker.values():
+        counts[int(r)] = counts.get(int(r), 0) + 1
+    # Top-3 by share, regime id as deterministic tiebreak.
+    top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+    top_txt = " · ".join(
+        f"R{r} {regime_label_vi(r)} {100 * n / total:.0f}%" for r, n in top
+    )
+    no_trade = sum(n for r, n in counts.items() if r in NO_TRADE_REGIMES)
+    penalty = sum(n for r, n in counts.items() if r in PENALTY_REGIMES)
+    return (
+        f"🌐 Pha thị trường ({total} mã): {top_txt}\n"
+        f"⛔ NO_TRADE {{0,7}}: {100 * no_trade / total:.0f}% · "
+        f"⚠️ PENALTY {{1,6}}: {100 * penalty / total:.0f}%"
+    )
+
+
+def _build_combined_report(signal_data_list: list[dict], regime_pulse: str = "") -> str:
     """Concatenate per-ticker Telegram messages into one HTML chat report.
 
     Reuses `TelegramBot._build_message()` (already HTML-escapes every dynamic
     field) so the combined string is safe to send with `parse_mode=HTML`.
+    `regime_pulse` (from `build_regime_pulse`) is prepended as a header when
+    non-empty — additive param, existing callers unchanged.
 
     Returns "" when the list is empty so callers can short-circuit on
     "no signals" with a single truthiness check.
@@ -255,7 +295,10 @@ def _build_combined_report(signal_data_list: list[dict]) -> str:
     if not signal_data_list:
         return ""
     parts = [TelegramBot._build_message(sd) for sd in signal_data_list]
-    return _REPORT_SEPARATOR.join(parts)
+    report = _REPORT_SEPARATOR.join(parts)
+    if regime_pulse:
+        return f"{regime_pulse}\n{_REPORT_SEPARATOR}{report}"
+    return report
 
 
 def _smart_truncate(text: str, limit: int = 300) -> str:
