@@ -49,8 +49,11 @@
     "serve_liquid_top_n": 50,
     "serve_adv_window": 20,
     "intraday_scanner_enabled": true,
-    "intraday_scan_interval_min": 15,
-    "intraday_alert_delta_pp": 0.02
+    "intraday_scan_interval_min": 60,
+    "intraday_alert_delta_pp": 0.02,
+    "portfolio_guard_enabled": true,
+    "portfolio_guard_trailing_pct": 0.08,
+    "portfolio_guard_llm_enabled": true
   },
   "crawler": {
     "stock_start_date": "2016-01-01",
@@ -61,13 +64,13 @@
     "request_backoff_factor": 1.5
   },
   "sentiment": {
-    "gemini_model": "models/gemini-flash-latest",
+    "gemini_model": "gemini-2.5-flash",
     "rss_lookback_weekday_days": 1,
     "rss_lookback_monday_days": 3,
-    "max_tickers": 30,
-    "gnews_max_results": 8,
+    "max_tickers": 15,
+    "gnews_max_results": 4,
     "gnews_sleep_seconds": 1.25,
-    "article_char_limit": 4000
+    "article_char_limit": 2000
   },
   "universe_filter": {
     "enabled": true,

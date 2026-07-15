@@ -108,6 +108,18 @@ class TelegramBot:
         """
         self._dispatch(html_text, ticker=label)
 
+    def send_text_to_chat(self, chat_id: str, html_text: str, label: str = "alert") -> None:
+        """Send a pre-escaped HTML message to a SINGLE chat_id (not a broadcast).
+
+        Unlike `send_text_alert` (which loops every id in `self.chat_id_list`),
+        this targets exactly one recipient - used by the per-user portfolio-guard
+        DM where `chat_id == user_id`. Reuses the same `_send_to_one` helper the
+        broadcast loop uses, so mock-mode, rate-limit, status-code, and
+        per-recipient exception handling are byte-for-byte identical. The caller
+        MUST ensure `html_text` is already HTML-escaped.
+        """
+        self._send_to_one(chat_id, html_text, ticker=label)
+
     # ------------------------------------------------------------------
     # Message builder
     # ------------------------------------------------------------------
@@ -304,22 +316,34 @@ class TelegramBot:
             return
 
         for chat_id in self.chat_id_list:
-            payload = {"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}
-            try:
-                if self.bot_token == "YOUR_BOT_TOKEN":
-                    LOGGER.info("[TelegramBot] MOCK ALERT → %s for %s", chat_id, ticker)
-                    continue
+            self._send_to_one(chat_id, msg, ticker=ticker)
 
-                resp = requests.post(self.base_url, json=payload, timeout=10)
-                if resp.status_code != 200:
-                    LOGGER.warning(
-                        "[TelegramBot] Failed to send to %s. HTTP %s: %s",
-                        chat_id, resp.status_code, resp.text[:200],
-                    )
-                else:
-                    LOGGER.info("[TelegramBot] Alert sent → %s for %s", chat_id, ticker)
+    def _send_to_one(self, chat_id: str, msg: str, ticker: str = "N/A") -> None:
+        """Send ONE HTML message to ONE chat_id. Never raises.
 
-                time.sleep(0.5)  # Telegram rate-limit guard
+        Extracted verbatim from `_dispatch`'s loop body — the mock-check,
+        `requests.post`, status-code logging, `time.sleep(0.5)` rate-limit guard,
+        and per-recipient exception logging are byte-for-byte preserved. Shared by
+        the broadcast `_dispatch` loop and the single-recipient
+        `send_text_to_chat`. The former loop's `continue` becomes an early
+        `return` here (same effect: skip the post + skip the sleep in mock mode).
+        """
+        payload = {"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}
+        try:
+            if self.bot_token == "YOUR_BOT_TOKEN":
+                LOGGER.info("[TelegramBot] MOCK ALERT → %s for %s", chat_id, ticker)
+                return
 
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.error("[TelegramBot] Exception sending to %s: %s", chat_id, exc)
+            resp = requests.post(self.base_url, json=payload, timeout=10)
+            if resp.status_code != 200:
+                LOGGER.warning(
+                    "[TelegramBot] Failed to send to %s. HTTP %s: %s",
+                    chat_id, resp.status_code, resp.text[:200],
+                )
+            else:
+                LOGGER.info("[TelegramBot] Alert sent → %s for %s", chat_id, ticker)
+
+            time.sleep(0.5)  # Telegram rate-limit guard
+
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("[TelegramBot] Exception sending to %s: %s", chat_id, exc)

@@ -8,7 +8,7 @@ import sys
 import time
 import traceback
 from contextlib import contextmanager
-from datetime import datetime, time as dt_time, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -41,6 +41,7 @@ from src.models.quant_agent_arbitrator import (
 )
 from src.trading.portfolio_manager import PortfolioManager
 from src.trading import signal_ledger
+from src.trading import portfolio_guard
 from src.trading.risk_tier import classify_risk_tier
 from src.trading.serve_universe import liquid_universe
 from src.trading.regime_policy import (
@@ -65,6 +66,7 @@ from src.reports.builders import (
     _humanize_feature,
     _build_feature_explanation,
     _format_sentiment_status,
+    build_regime_pulse,
     _build_combined_report,
     _smart_truncate,
     _build_fallback_observability_report_vi,
@@ -429,6 +431,12 @@ def _compute_v3_features(latest_df: pd.DataFrame, feature_list: list[str],
             for t, v in zip(_reg["ticker"].to_list(), _reg["market_regime"].to_list())
             if v is not None
         })
+        # Observability: one regime-distribution line per predict pass. Without
+        # this, "what did the regime layer see that week?" is unanswerable
+        # after the fact (2026-07-14 post-mortem gap).
+        _pulse = build_regime_pulse(_LATEST_REGIME_BY_TICKER)
+        if _pulse:
+            LOGGER.info("[Regime] %s", _pulse.replace("\n", " | "))
 
     return (
         panel.sort(["ticker", "date"])
@@ -1717,9 +1725,13 @@ def run_trade_execution(
 
     except Exception:
         LOGGER.exception("Error during trade execution")
-        return _build_combined_report(dispatched_signals), dispatched_signals
+        return _build_combined_report(
+        dispatched_signals, regime_pulse=build_regime_pulse(_LATEST_REGIME_BY_TICKER)
+    ), dispatched_signals
 
-    return _build_combined_report(dispatched_signals), dispatched_signals
+    return _build_combined_report(
+        dispatched_signals, regime_pulse=build_regime_pulse(_LATEST_REGIME_BY_TICKER)
+    ), dispatched_signals
 
 
 # ---------------------------------------------------------------------------
@@ -2047,7 +2059,8 @@ def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> No
       1c. refresh the daily foreign-flow snapshot (khoi ngoai → foreign_flow_daily.parquet);
       2. refresh daily LLM news sentiment;
       3. run the daily inference (T+20 tranche Top-3 broadcast);
-      4. alert tranche cohorts whose hold horizon has elapsed (signal ledger).
+      4. alert tranche cohorts whose hold horizon has elapsed (signal ledger);
+      5. portfolio guard — EOD protective alert for non-cron user holdings.
 
     Step 1 is the ONLY OHLCV ingestion entrypoint in the bot/CLI; the V4 backtest
     engine (train_models.py / run_backtest.py) reads the populated store and never
@@ -2100,9 +2113,15 @@ def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> No
     with timed_step("Tranche exit-due check (signal ledger)"):
         notify_tranche_exits()
 
+    # 5. Portfolio guard — EOD protective sweep of every non-cron user's /add
+    #    holdings (alert-only; never writes, never auto-sells).
+    with timed_step("Portfolio guard EOD check"):
+        notify_portfolio_guard()
+
 
 def inference_only() -> None:
-    """Steps 3–4 of `full_pipeline` only: daily inference + tranche exit alerts.
+    """Steps 3–5 of `full_pipeline` only: daily inference + tranche exit alerts
+    + portfolio-guard EOD protective sweep.
 
     For the operator who already ingested today's OHLCV (`--task crawl_hose`)
     and wants the EOD signal, paperlog row, and exit alerts WITHOUT the
@@ -2118,6 +2137,8 @@ def inference_only() -> None:
     daily_inference()
     with timed_step("Tranche exit-due check (signal ledger)"):
         notify_tranche_exits()
+    with timed_step("Portfolio guard EOD check"):
+        notify_portfolio_guard()
 
 
 def notify_tranche_exits() -> int:
@@ -2169,6 +2190,150 @@ def notify_tranche_exits() -> int:
         return len(due)
     except Exception:  # noqa: BLE001
         LOGGER.exception("[SignalLedger] notify_tranche_exits failed.")
+        return 0
+
+
+def _run_guard_for_users(
+    positions_by_user: dict[str, list[dict]],
+    db_path: str | None = None,
+    today: date | None = None,
+) -> dict[str, str]:
+    """Shared portfolio-guard evaluation core → {user_id: card_html}.
+
+    Builds the live feature frame ONCE, dual-horizon predicts (refreshing the
+    per-ticker regime cache as a side effect), evaluates the five Stage-1
+    triggers per lot, runs at most ONE arbitrator batch (config-gated) + ONE MR
+    batch across the union of triggered tickers, and renders one card per user
+    with >=1 fired trigger. Returns {} when nothing fires (event-only gating).
+
+    ALERT-ONLY: writes nothing, sells nothing. Used by both the EOD sweep
+    (`notify_portfolio_guard`) and the on-demand `/guard` command (single-user
+    dict). `db_path` is accepted for parity/testing but unused by the live
+    predict path (features come from parquet via Alpha360Generator, not DuckDB).
+    """
+    if not positions_by_user:
+        return {}
+
+    eval_date = today or datetime.now().date()
+
+    # 1. Live OHLCV frame ONCE (full universe — same pattern as /verify, /rebalance).
+    try:
+        live_pl = Alpha360Generator().load_live_ohlcv_window(window_rows=120)
+        latest_df = live_pl.to_pandas()
+    except FileNotFoundError as exc:
+        LOGGER.warning("[guard] live OHLCV window unavailable (%s) — guard skipped.", exc)
+        return {}
+    if latest_df.empty:
+        LOGGER.warning("[guard] live feature frame is empty — guard skipped.")
+        return {}
+
+    # 2. Dual-horizon predict; each degrades to {} independently (mirrors
+    #    daily_inference's secondary-horizon degrade). Refreshes
+    #    _LATEST_REGIME_BY_TICKER as a documented side effect of _compute_v3_features.
+    try:
+        stacking_5d, _, _, _, _ = predict_v3_horizon(latest_df, SHORT_HORIZON)
+    except (FileNotFoundError, RuntimeError) as exc:
+        LOGGER.warning("[guard] T+%d inference unavailable (%s).",
+                       SHORT_HORIZON, exc.__class__.__name__)
+        stacking_5d = {}
+    try:
+        stacking_20d, _, _, _, _ = predict_v3_horizon(latest_df, 20)
+    except (FileNotFoundError, RuntimeError) as exc:
+        LOGGER.warning("[guard] T+20 inference unavailable (%s).", exc.__class__.__name__)
+        stacking_20d = {}
+
+    # 3. Per-user, per-lot trigger evaluation (multi-lot same-ticker = per lot).
+    triggered_by_user: dict[str, list[dict]] = {}
+    union: set[str] = set()
+    for user_id, rows in positions_by_user.items():
+        for row in rows:
+            ticker = str(row.get("ticker", "")).upper().strip()
+            if not ticker:
+                continue
+            closes = price_lookup.closes_between(ticker, row.get("entry_date"), eval_date)
+            if not closes:
+                continue  # delisted / no bar yet / read failure → skip this lot
+            closes_abs = [c * 1000.0 for c in closes]  # thousands VND → absolute VND
+            triggers = portfolio_guard.evaluate_position(
+                {"entry_price_raw": row.get("price"), "ticker": ticker},
+                closes_abs,
+                stacking_5d.get(ticker),
+                stacking_20d.get(ticker),
+                _LATEST_REGIME_BY_TICKER.get(ticker),
+                stop_loss_pct=CONFIG.trading.stop_loss_pct,
+                take_profit_pct=CONFIG.trading.take_profit_pct,
+                trailing_pct=CONFIG.trading.portfolio_guard_trailing_pct,
+            )
+            if not triggers:
+                continue
+            entry_norm = portfolio_guard.normalize_entry_price_vnd(row.get("price"))
+            current_abs = closes_abs[-1]
+            pnl_pct = (current_abs - entry_norm) / entry_norm if entry_norm > 0.0 else 0.0
+            triggered_by_user.setdefault(user_id, []).append({
+                "ticker": ticker,
+                "entry_date": row.get("entry_date"),
+                "entry_price_norm": entry_norm,
+                "current_price": current_abs,
+                "pnl_pct": pnl_pct,
+                "volume": row.get("volume"),
+                "triggers": triggers,
+            })
+            union.add(ticker)
+
+    # 4. Event-only gating.
+    if not union:
+        return {}
+
+    # 5. Stage 2 — ONE arbitrator batch (config-gated, never per-user) + ONE MR batch.
+    sorted_union = sorted(union)
+    if CONFIG.trading.portfolio_guard_llm_enabled:
+        try:
+            enrichment = evaluate_trades_batch(
+                {"5d": stacking_5d, "20d": stacking_20d}, sorted_union
+            )
+        except Exception:  # noqa: BLE001 — arbitrator failure must not kill the alert
+            LOGGER.exception("[guard] arbitrator batch failed — shipping quant-only card.")
+            enrichment = ({}, {})
+    else:
+        enrichment = ({}, {})
+    mr_scores = mr_score_tickers(sorted_union)
+
+    # 6. One card per triggered user.
+    return {
+        user_id: portfolio_guard.build_guard_alert_card(lots, enrichment, mr_scores)
+        for user_id, lots in triggered_by_user.items()
+    }
+
+
+def notify_portfolio_guard() -> int:
+    """EOD protective sweep of every non-cron user's /add holdings. Alert-only.
+
+    Loads non-cron positions, evaluates triggers via `_run_guard_for_users`, and
+    DMs each user with a fired trigger to their own chat (`chat_id == user_id`).
+    Returns the count of users alerted. Never raises — copies
+    `notify_tranche_exits`' exact shape so a guard hiccup can never abort the EOD
+    pipeline. Fully short-circuits (zero DB reads, zero compute) when
+    `portfolio_guard_enabled` is False.
+    """
+    if not CONFIG.trading.portfolio_guard_enabled:
+        LOGGER.info("[guard] portfolio_guard_enabled=False — EOD guard skipped.")
+        return 0
+    try:
+        positions = portfolio_guard.load_guard_positions()
+        if not positions:
+            LOGGER.info("[guard] no non-cron portfolio rows — nothing to guard.")
+            return 0
+        positions_by_user: dict[str, list[dict]] = {}
+        for row in positions:
+            positions_by_user.setdefault(str(row["user_id"]), []).append(row)
+        cards = _run_guard_for_users(positions_by_user)
+        for user_id, card_html in cards.items():
+            TelegramBot().send_text_to_chat(user_id, card_html, label="portfolio_guard")
+        LOGGER.info("[guard] EOD guard complete: %s alerted / %s total users.",
+                    len(cards), len(positions_by_user))
+        return len(cards)
+    except Exception:  # noqa: BLE001
+        LOGGER.exception("[guard] notify_portfolio_guard failed.")
         return 0
 
 

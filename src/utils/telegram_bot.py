@@ -128,6 +128,7 @@ HELP_TEXT = (
     "<b>/suggest_buy5</b> — Khuyến nghị MUA T+5 (tầm nhìn ngắn).\n"
     "📒 <b>/exits</b> — Vị thế tranche đang mở + số phiên còn lại.\n"
     "🔴 <b>/suggest_sell</b> — Đánh giá NÊN BÁN hay GIỮ danh mục của bạn.\n"
+    "🛡️ <b>/guard</b> — Kiểm tra cảnh báo bảo vệ danh mục (cắt lỗ / trailing / pha thị trường).\n"
     "⚖️ <b>/rebalance</b> — Tư vấn cơ cấu lại danh mục hiện tại.\n"
     "🔍 <b>/verify</b> <i>[Mã]</i> — Soi nhanh 1 cổ phiếu, mô hình T+5 &amp; T+20 "
     "(VD: <code>/verify HPG</code>).\n"
@@ -983,6 +984,86 @@ async def suggest_sell_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_or_reply_chunks(update, wait_msg, _split_html_report(report_html))
 
 
+async def guard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
+    """On-demand portfolio guard — protective trigger check for THIS user's holdings.
+
+    Mirrors /suggest_sell: strictly `user_id`-scoped, READ-ONLY, never mutates the
+    portfolio and never auto-sells. Reuses `main._run_guard_for_users` (the exact
+    evaluation core the EOD sweep uses), so the five deterministic triggers +
+    optional arbitrator enrichment are identical to the automatic alert.
+    """
+    if update.message is None:
+        return
+    _log_request("/guard", update)
+
+    user_id = _extract_user_id(update)
+    if user_id is None:
+        await update.message.reply_text(
+            "❌ <b>Không xác định được user_id.</b> Lệnh này yêu cầu chat 1-1 với bot.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # 1. Read THIS user's non-cron holdings (read-only, cron-excluded by loader).
+    try:
+        from src.trading.portfolio_guard import (  # noqa: PLC0415
+            GUARD_NO_TRIGGERS_MESSAGE,
+            load_guard_positions,
+        )
+        positions = load_guard_positions(user_id=user_id)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("/guard: position load failed for user_id=%s", user_id)
+        await update.message.reply_text(
+            f"❌ <b>Lỗi DB:</b> <code>{html.escape(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await _audit_log_async(user_id=user_id, command="guard",
+                           details=f"portfolio_size:{len(positions)}")
+
+    if not positions:
+        await update.message.reply_text(EMPTY_PORTFOLIO_MESSAGE, parse_mode=ParseMode.HTML)
+        return
+
+    # 2. Acknowledge.
+    wait_msg = await update.message.reply_text(
+        f"🛡️ Đang kiểm tra <b>{len(positions)}</b> vị thế trong danh mục...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # 3. Lazy-import the evaluation core (heavy ML pipeline).
+    try:
+        from main import _run_guard_for_users  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("/guard: import failed")
+        await wait_msg.edit_text(
+            f"❌ <b>Lỗi import:</b> <code>{html.escape(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # 4. Run off the event loop.
+    try:
+        cards: dict[str, str] = await asyncio.to_thread(
+            _run_guard_for_users, {user_id: positions}
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("/guard: evaluation crashed")
+        await wait_msg.edit_text(
+            f"❌ <b>Lỗi mô hình:</b> <code>{html.escape(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # 5. Reply with the card, or the "all stable" message when nothing fired.
+    card_html = cards.get(user_id) if cards else None
+    if card_html:
+        await _send_or_reply_chunks(update, wait_msg, _split_html_report(card_html))
+    else:
+        await wait_msg.edit_text(GUARD_NO_TRIGGERS_MESSAGE, parse_mode=ParseMode.HTML)
+
+
 def _build_exits_report(rows: list[dict]) -> str:
     """HTML report for /exits — open tranche cohorts + sessions remaining.
 
@@ -1530,6 +1611,7 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("suggest_buy5", "Khuyến nghị MUA T+5 — tầm nhìn ngắn"),
     BotCommand("exits", "Vị thế tranche đang mở + số phiên còn lại"),
     BotCommand("suggest_sell", "Lấy khuyến nghị BÁN/HOLD cho danh mục cá nhân"),
+    BotCommand("guard", "Kiểm tra cảnh báo bảo vệ danh mục (cắt lỗ/trailing/pha)"),
     BotCommand("rebalance", "AI tư vấn cơ cấu danh mục hiện tại"),
     BotCommand("verify", "Kiểm định nhanh 1 cổ phiếu — T+5 & T+20 (VD: /verify HPG)"),
     BotCommand("add", "Thêm cổ phiếu vào danh mục (VD: /add VNE 1000 32.5)"),
@@ -1719,6 +1801,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("add", add_portfolio_command))
     app.add_handler(CommandHandler("remove", remove_portfolio_command))
     app.add_handler(CommandHandler("suggest_sell", suggest_sell_command))
+    app.add_handler(CommandHandler("guard", guard_command))
     app.add_handler(
         MessageHandler(
             filters.Regex(r"^/suggest-sell(@\w+)?(\s|$)"),

@@ -116,6 +116,23 @@ class TradingConfig:
     serve_universe_mode: str = "adv_top_n"
     serve_liquid_top_n: int = 50   # backtest-validated N (WalkForwardConfig.liquid_top_n)
     serve_adv_window: int = 20     # backtest-validated trailing window (WalkForwardConfig.adv_window)
+    # Portfolio Guard (EOD, alert-only): after each full_pipeline/inference_only
+    # EOD pass, notify_portfolio_guard() scans every non-cron user's /add
+    # holdings against five deterministic triggers (hard stop-loss, take-profit,
+    # trailing-stop, model-flip-to-SELL, NO_TRADE regime warning) and DMs a
+    # protective card ONLY to users with a fired trigger. Writes NOTHING (no
+    # parquet/DuckDB/paperlog/ledger), never auto-sells. Kill-switch: set
+    # "portfolio_guard_enabled": false in settings.json + restart. When False the
+    # guard fully short-circuits (zero DB reads, zero compute).
+    portfolio_guard_enabled: bool = True
+    # Trailing-stop trigger: alert when today's close has fallen >= this fraction
+    # from the position's peak close since entry (0.08 = 8% off the high).
+    portfolio_guard_trailing_pct: float = 0.08
+    # Stage-2 enrichment gate: when True, a SINGLE arbitrator+sentiment batch runs
+    # across the union of all triggered tickers per EOD run (bounded Gemini spend).
+    # When False, only the quant/rule triggers run — alerts still ship, LLM-free.
+    # Kill-switch: set "portfolio_guard_llm_enabled": false in settings.json + restart.
+    portfolio_guard_llm_enabled: bool = True
 
 
 @dataclass
@@ -130,13 +147,20 @@ class CrawlerConfig:
 
 @dataclass
 class SentimentConfig:
-    gemini_model: str = "models/gemini-flash-latest"
+    # GA pin — the floating "gemini-flash-latest" alias is banned (silently
+    # became gemini-3.5-flash; caused the 2026-07-07 JSON-drift incident and
+    # intermittent 503s). `.env GEMINI_MODEL` overrides this for crawler AND
+    # arbitrator alike; settings.json "sentiment.gemini_model" overrides the
+    # dataclass default only.
+    gemini_model: str = "gemini-2.5-flash"
     rss_lookback_weekday_days: int = 1
     rss_lookback_monday_days: int = 3
-    max_tickers: int = 30
-    gnews_max_results: int = 8
+    # Cost trim 14-07-26 (user budget): 30→15 tickers, 8→4 GNews results,
+    # 4000→2000 chars/article — roughly halves daily crawl volume/tokens.
+    max_tickers: int = 15
+    gnews_max_results: int = 4
     gnews_sleep_seconds: float = 1.25
-    article_char_limit: int = 4000
+    article_char_limit: int = 2000
 
 
 # (UniverseFilterConfig removed — superseded by the hardcoded VN30 gate
