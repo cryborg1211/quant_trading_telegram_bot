@@ -295,6 +295,7 @@ async def _send_per_ticker_reports(
     signal_data_list: list[dict],
     *,
     disable_preview: bool = True,
+    mirror_to_user2: bool = False,
 ) -> None:
     """Send ONE Telegram message per ticker (no combined-string bundling).
 
@@ -306,6 +307,11 @@ async def _send_per_ticker_reports(
     card sent to a monitored "user" is also forwarded to ADMIN_CHAT_ID
     (best-effort). Each send degrades to `html.escape`d text on a `BadRequest`
     parse error rather than leaking raw tags.
+
+    `mirror_to_user2` (2026-07-14): opt-in reverse mirror, ADMIN → User2, for
+    the small set of commands the user asked to auto-broadcast (suggest_buy5,
+    suggest_buy20). Only fires when the caller is ADMIN — never when User2 is
+    the caller (no self-forward) and never for commands that didn't pass it.
     """
     if not signal_data_list:
         if wait_msg is not None:
@@ -362,6 +368,25 @@ async def _send_per_ticker_reports(
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("[Oversight] per-ticker mirror failed: %s", exc)
 
+    # Reverse mirror: ADMIN's suggest_buy5/20 results auto-broadcast to User2.
+    if mirror_to_user2 and USER_CHAT_ID and _role_for(update) == "admin":
+        try:
+            _bot = update.get_bot()
+            await _bot.send_message(
+                chat_id=USER_CHAT_ID,
+                text="📤 <b>[ADMIN] Báo cáo tự động:</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            for _card in cards:
+                await _bot.send_message(
+                    chat_id=USER_CHAT_ID,
+                    text=_card,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=disable_preview,
+                )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("[User2 mirror] per-ticker forward failed: %s", exc)
+
     if update.message is None:
         return
     for card in cards:
@@ -385,8 +410,17 @@ async def _send_or_reply_chunks(
     chunks: list[str],
     *,
     disable_preview: bool = False,
+    mirror_to_user2: bool = False,
 ) -> None:
-    """Edit `wait_msg` in place if 1 chunk, else delete it and post fresh replies."""
+    """Edit `wait_msg` in place if 1 chunk, else delete it and post fresh replies.
+
+    `mirror_to_user2` (2026-07-14): opt-in reverse mirror, ADMIN → User2. Set
+    by the specific command handlers the user asked to auto-broadcast
+    (suggest_sell, audit_weekly, audit_monthly, audit_accuracy) — NOT a
+    blanket default, since some callers of this shared sender (/guard,
+    /verify, /rebalance) were never asked to forward and may carry data the
+    user did not approve broadcasting.
+    """
     if not chunks:
         return
 
@@ -411,6 +445,25 @@ async def _send_or_reply_chunks(
                 )
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("[Oversight] response mirror failed: %s", exc)
+
+    # Reverse mirror: opted-in ADMIN commands auto-broadcast to User2.
+    if mirror_to_user2 and USER_CHAT_ID and _role_for(update) == "admin":
+        try:
+            _bot = update.get_bot()
+            await _bot.send_message(
+                chat_id=USER_CHAT_ID,
+                text="📤 <b>[ADMIN] Báo cáo tự động:</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            for _c in chunks:
+                await _bot.send_message(
+                    chat_id=USER_CHAT_ID,
+                    text=_c,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("[User2 mirror] response forward failed: %s", exc)
 
     if len(chunks) == 1 and wait_msg is not None:
         try:
@@ -702,7 +755,9 @@ async def _suggest_buy_dispatch(update: Update, horizon: int) -> None:
         # generic "no signal" line so the weak-market diagnostics still reach
         # the user.
         if report_html and report_html.strip():
-            await _send_or_reply_chunks(update, wait_msg, _split_html_report(report_html))
+            await _send_or_reply_chunks(
+                update, wait_msg, _split_html_report(report_html), mirror_to_user2=True
+            )
             return
         await wait_msg.edit_text(
             f"<b>Không có tín hiệu MUA T+{horizon} hôm nay.</b>\n"
@@ -713,7 +768,9 @@ async def _suggest_buy_dispatch(update: Update, horizon: int) -> None:
 
     # Deliver ONE message per ticker (each is the institutional BUY card, well
     # below the 4096-char limit — no combined-string splitting needed).
-    await _send_per_ticker_reports(update, wait_msg, signal_data_list)
+    # mirror_to_user2: /suggest_buy5 and /suggest_buy20 are global market
+    # signals (not portfolio-scoped) — Admin's results auto-broadcast to User2.
+    await _send_per_ticker_reports(update, wait_msg, signal_data_list, mirror_to_user2=True)
 
 
 async def suggest_buy20_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
@@ -981,7 +1038,14 @@ async def suggest_sell_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    await _send_or_reply_chunks(update, wait_msg, _split_html_report(report_html))
+    # mirror_to_user2 (2026-07-14, user-requested): when ADMIN runs
+    # /suggest_sell, the recommendation for ADMIN's OWN /add holdings is also
+    # broadcast to User2 — User2 will see what Admin holds and Admin's BÁN/GIỮ
+    # recommendation for it. Approved explicitly by the user despite the
+    # privacy tradeoff being flagged.
+    await _send_or_reply_chunks(
+        update, wait_msg, _split_html_report(report_html), mirror_to_user2=True
+    )
 
 
 async def guard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
@@ -1384,7 +1448,13 @@ async def _run_audit_command(
         )
         return
 
-    await _send_or_reply_chunks(update, wait_msg, _split_html_report(report_html))
+    # mirror_to_user2 (2026-07-14, user-requested): covers /audit_weekly and
+    # /audit_monthly (this shared handler). Same privacy tradeoff as
+    # /suggest_sell — the caller's own /verify+/add history broadcasts to
+    # User2 when Admin is the caller. Approved explicitly by the user.
+    await _send_or_reply_chunks(
+        update, wait_msg, _split_html_report(report_html), mirror_to_user2=True
+    )
 
     # ── DUAL-AUDIT ROUTING ───────────────────────────────────────────
     # Both roles get the IDENTICAL post-mortem above. ADMIN (ID1) ALSO
@@ -1450,7 +1520,10 @@ async def audit_accuracy_command(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    await _send_or_reply_chunks(update, wait_msg, _split_html_report(report_html))
+    # /audit_accuracy is system-wide (paperlog is global) — safe broadcast.
+    await _send_or_reply_chunks(
+        update, wait_msg, _split_html_report(report_html), mirror_to_user2=True
+    )
 
 
 async def rebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
