@@ -766,6 +766,35 @@ async def _suggest_buy_dispatch(update: Update, horizon: int) -> None:
         )
         return
 
+    # Paper-track these delivered picks in the dispatched-signals ledger,
+    # independent of the persist/broadcast gates above. daily_inference was
+    # called with broadcast=False (so the cron-path signal_ledger.record_dispatch
+    # never fires) AND persist=False (so the PortfolioManager/paperlog writes are
+    # correctly skipped) — without this, every /suggest_buy5|20 pick the user
+    # actually received went completely untracked. This does NOT loosen the
+    # persist gate: record_dispatch only touches the dispatched_signals ledger,
+    # never the shared automated portfolio/trade_history book. Never-raise: a
+    # tracking failure must never block delivery of the cards below.
+    from config.settings import CONFIG  # noqa: PLC0415
+
+    if CONFIG.trading.suggest_buy_ledger_tracking_enabled:
+        try:
+            from src.trading import signal_ledger  # noqa: PLC0415
+
+            # T5 tracks a synthetic 5-session window; T20 uses the real tranche
+            # portfolio-window convention (hold_days=30, NOT 20) — mirrors the
+            # dual-dispatch convention in main.py / the EOD position-report plan.
+            _hold_days = 5 if int(horizon) == 5 else 30
+            signal_ledger.record_dispatch(
+                signal_data_list,
+                {"mode": "tranche", "hold_days": _hold_days},
+                int(horizon),
+            )
+        except Exception:  # noqa: BLE001 — ledger tracking must never break delivery
+            LOGGER.exception(
+                "/%s: signal_ledger.record_dispatch tracking failed", cmd
+            )
+
     # Deliver ONE message per ticker (each is the institutional BUY card, well
     # below the 4096-char limit — no combined-string splitting needed).
     # mirror_to_user2: /suggest_buy5 and /suggest_buy20 are global market
@@ -1144,16 +1173,20 @@ def _build_exits_report(rows: list[dict]) -> str:
         return (f"{header}\n\n<i>Không có vị thế tranche nào đang mở. "
                 f"Tín hiệu mới sẽ được ghi sổ khi mô hình T+20 phát lệnh.</i>")
 
+    # Horizon tag ([T5]/[T20]) so mixed dual-horizon ledger rows are unambiguous
+    # (a T5 paper-tracking row must not read as a real weighted tranche position).
+    from src.reports.builders import _HORIZON_LABEL  # noqa: PLC0415
     lines = []
     for r in rows:
         disp = r.get("dispatch_date")
         disp_str = disp.strftime("%d/%m/%Y") if hasattr(disp, "strftime") else str(disp)
         weight_pct = float(r.get("weight") or 0.0) * 100
         remaining = int(r.get("sessions_remaining", 0))
+        hz_tag = _HORIZON_LABEL.get(r.get("horizon"), "?")
         status = ("⏰ <b>ĐẾN HẠN — thoát ATC hôm nay</b>" if remaining <= 0
                   else f"còn <b>{remaining}</b> phiên")
         lines.append(
-            f"• <b>{html.escape(str(r['ticker']))}</b> — vào {disp_str} "
+            f"• <b>{html.escape(str(r['ticker']))}</b> [{hz_tag}] — vào {disp_str} "
             f"({weight_pct:.1f}% NAV), đã {int(r['sessions_elapsed'])}/{int(r['hold_days'])} phiên, "
             f"{status}"
         )

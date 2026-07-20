@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import html
 import re
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 import numpy as np
@@ -129,6 +129,32 @@ _MR_SELL_VETO = (
 # The `_5d`-named vars/labels below mean "short horizon" — the artifact behind
 # them is T+5 (recovered 16-06-26; the short model stays verify-only role).
 SHORT_HORIZON_DAYS: int = 5
+
+# Horizon → short display tag, shared by build_position_report and the /exits +
+# tranche-exit-due hygiene tags (telegram_bot._build_exits_report /
+# main.notify_tranche_exits) so mixed T5/T20 ledger rows are unambiguous.
+_HORIZON_LABEL: dict[int, str] = {SHORT_HORIZON_DAYS: "T5", 20: "T20"}
+
+# EOD position-report Telegram char budget — matches notify_tranche_exits' safe
+# 3800-char accumulate-and-cut budget (Telegram hard limit is 4096).
+_POSITION_REPORT_CHAR_BUDGET: int = 3800
+
+def _gap_adjustment_suffix(r: dict) -> str:
+    """Transparent auto-adjustment annotation appended (never replacing) the
+    trusted, corrected lãi/lỗ clause on any row whose evaluator's shared
+    corporate-action gap guard fired (``gap_flag=True`` —
+    ``signal_ledger._evaluate_pnl``). ``pct`` is ALREADY the corrected,
+    trusted number (T0 rebased by ``adjustment_factor``) by the time it
+    reaches this module; this note only discloses WHY. Returns ``""`` when
+    ``gap_flag`` is falsy or ``adjustment_factor`` is missing (defensive —
+    production rows always carry both together, computed live at read
+    time)."""
+    if not r.get("gap_flag"):
+        return ""
+    factor = r.get("adjustment_factor")
+    if factor is None:
+        return ""
+    return f" (⚙️ đã tự động điều chỉnh sự kiện DN, hệ số {factor:.3f})"
 
 # Class-label -> display text mappings for the verify report.
 _VERIFY_5D_PRED_LABELS: dict[int, str] = {
@@ -584,3 +610,245 @@ def _build_rebalance_report(holdings_context: list[dict], advice: str) -> str:
         f"<b>• Đang nắm giữ:</b>\n{holdings_block}\n\n"
         f"<b>\U0001f4ca Đề xuất AI:</b>\n{html.escape(advice)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# EOD dual-horizon position / verdict report (signal ledger)
+# ---------------------------------------------------------------------------
+
+def _position_open_line(r: dict) -> str:
+    """One OPEN-position line: live NET PnL% + trading sessions remaining.
+
+    ``r`` is a ledger row pre-enriched by the caller with evaluate_signal_pnl's
+    ``pct`` merged in, plus the row's own ``ticker`` / ``horizon`` /
+    ``dispatch_date`` / ``sessions_remaining``.
+    """
+    hz = _HORIZON_LABEL.get(r.get("horizon"), "?")
+    pct = float(r.get("pct") or 0.0)
+    verb = "lãi" if pct >= 0 else "lỗ"
+    disp = r.get("dispatch_date")
+    disp_str = disp.strftime("%d/%m/%Y") if hasattr(disp, "strftime") else str(disp)
+    rem = int(r.get("sessions_remaining") or 0)
+    # Corporate-action gap: the pct is ALREADY auto-adjusted/trusted; APPEND a
+    # transparent adjustment annotation (never replace the number). Keeps the
+    # "(còn N ngày kết thúc dự đoán)" suffix.
+    clause = f"{verb} {abs(pct):.1f}%{_gap_adjustment_suffix(r)}"
+    return (
+        f"Dự báo ngày {disp_str}: Mô hình {hz} mã {html.escape(str(r['ticker']))} "
+        f"hiện đang {clause} (còn {rem} ngày kết thúc dự đoán)"
+    )
+
+
+def _position_closed_line(r: dict) -> str:
+    """One CLOSED-position line: đúng/sai verdict + final NET PnL%."""
+    hz = _HORIZON_LABEL.get(r.get("horizon"), "?")
+    ticker = html.escape(str(r["ticker"]))
+    pct = float(r.get("pct") or 0.0)
+    verdict = "đúng" if pct >= 0 else "sai"
+    verb = "lãi" if pct >= 0 else "lỗ"
+    # Corporate-action gap: the pct is ALREADY auto-adjusted/trusted; APPEND the
+    # transparent adjustment annotation rather than hiding the verdict/PnL clause.
+    return (
+        f"Mô hình {hz} — mã {ticker}: "
+        f"đã dự báo {verdict} và {verb} {abs(pct):.1f}%{_gap_adjustment_suffix(r)}"
+    )
+
+
+def build_position_report(
+    open_rows: list[dict],
+    closed_rows: list[dict],
+    today: date,
+    lookback_days: int,
+) -> str:
+    """Pure HTML builder for the EOD dual-horizon position/verdict report.
+
+    Rows are pre-enriched by the caller (main.notify_position_report) with
+    evaluate_signal_pnl's output merged in (``pct``, ``matured``, optional
+    ``error``) alongside the ledger row's own fields. This function does ZERO
+    I/O and no logging — it is trivially unit-testable with plain fixture dicts.
+
+    Behaviour:
+      • Rows carrying an ``error`` key are silently skipped (the caller logs).
+      • Open rows are sorted ascending by ``sessions_remaining`` (soonest-to-
+        close first); closed rows keep the caller's ORDER BY dispatch_date,ticker.
+      • Two labelled sections; a section header is omitted entirely when its list
+        is empty. Returns ``""`` when BOTH lists are empty post error-filtering,
+        so the caller knows to skip sending.
+      • Char-budget accumulate-and-cut (mirrors notify_tranche_exits) against
+        ``_POSITION_REPORT_CHAR_BUDGET``; a single combined overflow notice is
+        appended when truncated. Output is always < Telegram's 4096-char limit.
+    """
+    open_ok = sorted(
+        [r for r in open_rows if not r.get("error")],
+        key=lambda r: int(r.get("sessions_remaining") or 0),
+    )
+    closed_ok = [r for r in closed_rows if not r.get("error")]
+    if not open_ok and not closed_ok:
+        return ""
+
+    header = (
+        f"📊 <b>BÁO CÁO VỊ THẾ DỰ ĐOÁN</b>\n"
+        f"📅 {today.strftime('%d/%m/%Y') if hasattr(today, 'strftime') else today}\n"
+        f"══════════════════════"
+    )
+
+    # Ordered, tagged data lines: open first (soonest-to-close), then closed.
+    tagged: list[tuple[str, str]] = (
+        [("open", _position_open_line(r)) for r in open_ok]
+        + [("closed", _position_closed_line(r)) for r in closed_ok]
+    )
+
+    # Accumulate-and-cut under the char budget. `overflow_reserve` covers the two
+    # section headers (~60) + the overflow notice (~60) that are added AFTER this
+    # loop, so the final string can never exceed 4096.
+    kept: list[tuple[str, str]] = []
+    running = len(header)
+    overflow_reserve = 140
+    for tag, ln in tagged:
+        if running + len(ln) + 1 > _POSITION_REPORT_CHAR_BUDGET - overflow_reserve:
+            break
+        kept.append((tag, ln))
+        running += len(ln) + 1
+    dropped = len(tagged) - len(kept)
+
+    open_kept = [ln for tag, ln in kept if tag == "open"]
+    closed_kept = [ln for tag, ln in kept if tag == "closed"]
+
+    blocks: list[str] = [header]
+    if open_kept:
+        blocks.append("\n📈 <b>ĐANG MỞ</b>")
+        blocks.extend(open_kept)
+    if closed_kept:
+        blocks.append(f"\n🏁 <b>ĐÃ ĐÓNG ({lookback_days} NGÀY QUA)</b>")
+        blocks.extend(closed_kept)
+    if dropped > 0:
+        blocks.append(f"\n... và <b>{dropped}</b> tín hiệu khác (rút gọn).")
+    return "\n".join(blocks)
+
+
+# ---------------------------------------------------------------------------
+# EOD cancelled-signal regret report (HYPOTHETICAL — never a recommendation)
+# ---------------------------------------------------------------------------
+
+# Regret-report Telegram char budget — same safe accumulate-and-cut budget as the
+# position report (Telegram hard limit is 4096).
+_REGRET_REPORT_CHAR_BUDGET: int = 3800
+
+
+def _regret_open_line(r: dict) -> str:
+    """One still-tracking cancelled-signal line: hypothetical live GROSS PnL%.
+
+    ``r`` is a cancelled ledger row (screen_date / ticker / p_up / reason /
+    sessions_remaining) pre-enriched by the caller with evaluate_regret_pnl's
+    GROSS ``pct`` / ``matured`` / ``gap_flag``.
+    """
+    ticker = html.escape(str(r["ticker"]))
+    screen = r.get("screen_date")
+    screen_str = screen.strftime("%d/%m/%Y") if hasattr(screen, "strftime") else str(screen)
+    p_up = float(r.get("p_up") or 0.0)
+    reason = html.escape(str(r.get("reason") or ""))
+    rem = int(r.get("sessions_remaining") or 0)
+    # Corporate-action gap: the pct is ALREADY auto-adjusted/trusted; APPEND the
+    # transparent adjustment annotation rather than replacing the outcome clause.
+    pct = float(r.get("pct") or 0.0)
+    verb = "lãi" if pct >= 0 else "lỗ"
+    outcome = f"nếu mua thì hiện {verb} {abs(pct):.1f}%{_gap_adjustment_suffix(r)}"
+    return (
+        f"Đã huỷ ngày {screen_str}: mã {ticker} "
+        f"(P(tăng)={p_up * 100:.0f}%, lý do: {reason}) — {outcome} (còn {rem} ngày)"
+    )
+
+
+def _regret_closed_line(r: dict) -> str:
+    """One matured cancelled-signal line: final hypothetical GROSS PnL%."""
+    ticker = html.escape(str(r["ticker"]))
+    screen = r.get("screen_date")
+    screen_str = screen.strftime("%d/%m/%Y") if hasattr(screen, "strftime") else str(screen)
+    # Corporate-action gap: the pct is ALREADY auto-adjusted/trusted; APPEND the
+    # transparent adjustment annotation rather than replacing the outcome clause.
+    pct = float(r.get("pct") or 0.0)
+    verb = "lãi" if pct >= 0 else "lỗ"
+    outcome = f"nếu mua thì đã {verb} {abs(pct):.1f}%{_gap_adjustment_suffix(r)}"
+    return f"Đã huỷ ngày {screen_str}: mã {ticker} — {outcome}"
+
+
+def build_regret_report(
+    cancelled_rows: list[dict],
+    today: date,
+    lookback_days: int,
+) -> str:
+    """Pure HTML builder for the EOD cancelled-signal regret report.
+
+    Rows are pre-enriched by the caller (main.notify_regret_report) with
+    evaluate_regret_pnl's GROSS output merged onto each cancelled ledger row.
+    Zero I/O, no logging — trivially unit-testable with plain fixture dicts.
+
+    HYPOTHETICAL, NON-RECOMMENDATION by construction: the header (title +
+    disclaimer) states this is a retroactive "if bought anyway" simulation for
+    REJECTED buy candidates, GROSS of cost, NOT a trading suggestion — and the
+    header is NEVER part of the truncatable line list, so that disclaimer can
+    never be cut away regardless of ledger size (mirrors build_position_report's
+    non-truncatable-header safety property).
+
+    Behaviour (same contract as build_position_report):
+      • Rows carrying an ``error`` key are silently skipped (the caller logs).
+      • Partition by the freshly-computed ``matured`` flag: not-matured →
+        "⏳ ĐANG THEO DÕI" (sorted ascending by sessions_remaining, soonest-to-
+        mature first), matured → "🏁 ĐÃ KẾT THÚC". Deliberately DIFFERENT section
+        wording from build_position_report's "ĐANG MỞ"/"ĐÃ ĐÓNG" (Decision 7) so a
+        reader never confuses a hypothetical screening record with a real
+        tracked position. A section header is omitted when its list is empty.
+      • Returns "" when BOTH lists are empty post error-filtering.
+      • Char-budget accumulate-and-cut against _REGRET_REPORT_CHAR_BUDGET; a
+        single combined overflow notice is appended when truncated. Output is
+        always < Telegram's 4096-char limit.
+    """
+    ok = [r for r in cancelled_rows if not r.get("error")]
+    open_ok = sorted(
+        [r for r in ok if not r.get("matured")],
+        key=lambda r: int(r.get("sessions_remaining") or 0),
+    )
+    closed_ok = [r for r in ok if r.get("matured")]
+    if not open_ok and not closed_ok:
+        return ""
+
+    today_str = today.strftime("%d/%m/%Y") if hasattr(today, "strftime") else str(today)
+    header = (
+        "🔍 <b>KIỂM CHỨNG TÍN HIỆU BỊ HUỶ (giả định — KHÔNG phải khuyến nghị)</b>\n"
+        f"📅 {today_str}\n"
+        "<i>Đây là mô phỏng hồi tố cho các mã ĐÃ BỊ TỪ CHỐI MUA — nếu lúc đó mua "
+        "thì bây giờ ra sao. Số liệu là GỘP (chưa trừ phí), CHỈ để tham khảo, "
+        "KHÔNG phải khuyến nghị giao dịch.</i>\n"
+        "══════════════════════"
+    )
+
+    # Ordered, tagged data lines: still-tracking first (soonest-to-mature), then
+    # matured. Only these lines are truncatable — the header always survives.
+    tagged: list[tuple[str, str]] = (
+        [("open", _regret_open_line(r)) for r in open_ok]
+        + [("closed", _regret_closed_line(r)) for r in closed_ok]
+    )
+
+    kept: list[tuple[str, str]] = []
+    running = len(header)
+    overflow_reserve = 140
+    for tag, ln in tagged:
+        if running + len(ln) + 1 > _REGRET_REPORT_CHAR_BUDGET - overflow_reserve:
+            break
+        kept.append((tag, ln))
+        running += len(ln) + 1
+    dropped = len(tagged) - len(kept)
+
+    open_kept = [ln for tag, ln in kept if tag == "open"]
+    closed_kept = [ln for tag, ln in kept if tag == "closed"]
+
+    blocks: list[str] = [header]
+    if open_kept:
+        blocks.append("\n⏳ <b>ĐANG THEO DÕI</b>")
+        blocks.extend(open_kept)
+    if closed_kept:
+        blocks.append(f"\n🏁 <b>ĐÃ KẾT THÚC ({lookback_days} NGÀY QUA)</b>")
+        blocks.extend(closed_kept)
+    if dropped > 0:
+        blocks.append(f"\n... và <b>{dropped}</b> tín hiệu khác (rút gọn).")
+    return "\n".join(blocks)

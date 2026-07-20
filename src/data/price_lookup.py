@@ -158,6 +158,41 @@ def has_ca_gap(closes: list[float], max_session_move: float = 0.10) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Corporate-action auto-adjustment (sibling of has_ca_gap — same threshold,
+# same input list, zero new I/O). UPCOM tickers have a wider ±15% daily limit
+# than HOSE/HNX (~±7%/±10%), so a genuine (non-CA) 10-15% UPCOM move can be
+# misclassified as a corporate action and incorrectly auto-adjusted. No
+# exchange-classification data source exists anywhere in this codebase
+# (confirmed by repo search) to scope this to HOSE/HNX only without adding a
+# new external data source — explicitly out of scope (see the plan's
+# Decision 7). Applied universally, same precedent as has_ca_gap itself.
+# ---------------------------------------------------------------------------
+def derive_ca_adjustment_factor(closes: list[float], max_session_move: float = 0.10) -> float:
+    """Cumulative back-adjustment factor across every corporate-action gap in
+    ``closes``.
+
+    For every consecutive close-to-close move whose magnitude exceeds
+    ``max_session_move`` (the SAME VN daily-limit heuristic behind
+    ``has_ca_gap`` — a split / stock dividend / rights issue, not price
+    action), multiplies a running factor by ``cur / prev``. Two or more gaps
+    inside the window compose as a cumulative product, in date order (a hold
+    window can span more than one corporate action). Mirrors ``has_ca_gap``'s
+    ``prev > 0`` guard so a corrupted zero/negative close is skipped rather
+    than raising a ZeroDivisionError.
+
+    Returns ``1.0`` (identity — "no adjustment needed") when no gap is found
+    or ``closes`` has fewer than 2 points. Callers determine "is there a gap
+    at all" via ``has_ca_gap(closes)`` first; this function only supplies the
+    MAGNITUDE of the correction once a gap is already known to exist.
+    """
+    factor = 1.0
+    for prev, cur in zip(closes, closes[1:]):
+        if prev > 0 and abs(cur / prev - 1.0) > max_session_move:
+            factor *= cur / prev
+    return factor
+
+
 def latest_close(ticker: str, conn: Any | None = None) -> float | None:
     """Latest available close for ``ticker``."""
     src = _shard_source(ticker)
