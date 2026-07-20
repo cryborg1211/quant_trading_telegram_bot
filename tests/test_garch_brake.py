@@ -20,13 +20,15 @@ from src.bot import garch_brake
 
 @pytest.fixture(autouse=True)
 def _reset_model_cache(monkeypatch):
-    """Clear the module-level model cache + isolate the drift leg per test.
+    """Clear the module-level model cache + isolate the drift/breadth legs.
 
-    The drift leg (19-07-26) loads real OHLCV parquets when enabled — these
-    GARCH-leg tests disable it so they stay hermetic; TestDriftBrake covers
-    the drift leg with the pure core + a stubbed loader.
+    The drift (19-07-26) and breadth (20-07-26) legs load real OHLCV
+    parquets when enabled — these GARCH-leg tests disable both so they stay
+    hermetic; TestDriftBrake / TestBreadthBrake cover their own legs with
+    the pure core + a stubbed loader.
     """
     monkeypatch.setattr(CONFIG.trading, "drift_brake_enabled", False, raising=False)
+    monkeypatch.setattr(CONFIG.trading, "breadth_brake_enabled", False, raising=False)
     garch_brake._MODEL = None
     garch_brake._MODEL_TRIED = False
     yield
@@ -173,3 +175,75 @@ class TestDriftBrake:
             with patch.object(garch_brake, "_load_model", return_value=_M()), \
                  patch.object(garch_brake, "_build_live_obs", return_value=_fake_obs()):
                 assert garch_brake.live_exposure_scalar() == pytest.approx(0.6)
+
+
+class TestBreadthBrake:
+    """Breadth leg (20-07-26): the direct July-collapse signal the other two
+    legs (price micro-regime, macro vol, index drift) never read."""
+
+    def _fake_pipeline(self):
+        return types.SimpleNamespace(RunConfig=lambda: None, load_ohlcv=lambda cfg: object())
+
+    def test_all_legs_disabled_no_panel_load(self, monkeypatch):
+        # drift/breadth default False (autouse fixture); GARCH also off here
+        # → none of the three legs need the shared panel — must never even
+        # attempt to import/load it.
+        monkeypatch.setattr(CONFIG.trading, "garch_brake_enabled", False, raising=False)
+        with patch("src.backtest.pipeline.load_ohlcv", side_effect=AssertionError("must not load")):
+            assert garch_brake.live_exposure_scalar() == 1.0
+
+    def test_breadth_alone_triggers_shared_panel_load(self, monkeypatch):
+        # GARCH off, only breadth on — the shared-load gate must still fire
+        # for breadth alone (not just when GARCH is enabled).
+        monkeypatch.setattr(CONFIG.trading, "garch_brake_enabled", False, raising=False)
+        monkeypatch.setattr(CONFIG.trading, "breadth_brake_enabled", True, raising=False)
+        with patch.dict(sys.modules, {"src.backtest.pipeline": self._fake_pipeline()}):
+            with patch.object(garch_brake, "_breadth_leg_scalar", return_value=0.4) as mock_leg:
+                assert garch_brake.live_exposure_scalar() == pytest.approx(0.4)
+                mock_leg.assert_called_once()
+
+    def test_combined_takes_breadth_when_binding(self, monkeypatch, _enabled):
+        monkeypatch.setattr(CONFIG.trading, "breadth_brake_enabled", True, raising=False)
+
+        class _M:
+            def p_bull_latest(self, obs):
+                return 0.9  # healthy GARCH leg → must not bind
+
+        with patch.dict(sys.modules, {"src.backtest.pipeline": self._fake_pipeline()}):
+            with patch.object(garch_brake, "_load_model", return_value=_M()), \
+                 patch.object(garch_brake, "_build_live_obs", return_value=_fake_obs()), \
+                 patch.object(garch_brake, "_breadth_leg_scalar", return_value=0.5):
+                assert garch_brake.live_exposure_scalar() == pytest.approx(0.5)
+
+    def test_breadth_failure_fails_open_to_garch(self, monkeypatch, _enabled):
+        monkeypatch.setattr(CONFIG.trading, "breadth_brake_enabled", True, raising=False)
+
+        class _M:
+            def p_bull_latest(self, obs):
+                return 0.6
+
+        with patch.dict(sys.modules, {"src.backtest.pipeline": self._fake_pipeline()}):
+            with patch.object(garch_brake, "_load_model", return_value=_M()), \
+                 patch.object(garch_brake, "_build_live_obs", return_value=_fake_obs()), \
+                 patch.object(garch_brake, "_breadth_leg_scalar",
+                               side_effect=RuntimeError("boom")):
+                assert garch_brake.live_exposure_scalar() == pytest.approx(0.6)
+
+    def test_all_three_legs_stack_takes_the_min(self, monkeypatch, _enabled):
+        monkeypatch.setattr(CONFIG.trading, "drift_brake_enabled", True, raising=False)
+        monkeypatch.setattr(CONFIG.trading, "breadth_brake_enabled", True, raising=False)
+        fake_hmm = types.SimpleNamespace(build_market_proxy_returns=lambda panel: None)
+
+        class _M:
+            def p_bull_latest(self, obs):
+                return 0.9
+
+        with patch.dict(sys.modules, {
+            "src.backtest.pipeline": self._fake_pipeline(),
+            "src.models.macro_risk_hmm": fake_hmm,
+        }):
+            with patch.object(garch_brake, "_load_model", return_value=_M()), \
+                 patch.object(garch_brake, "_build_live_obs", return_value=_fake_obs()), \
+                 patch.object(garch_brake, "_breadth_leg_scalar", return_value=0.3):
+                # garch=0.9, drift=1.0 (market_ret None → no-op), breadth=0.3 → min=0.3.
+                assert garch_brake.live_exposure_scalar() == pytest.approx(0.3)

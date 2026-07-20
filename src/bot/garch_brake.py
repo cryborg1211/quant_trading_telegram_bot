@@ -1,23 +1,38 @@
 """
-src/bot/garch_brake.py — live GARCH-HMM macro exposure brake (serve path).
+src/bot/garch_brake.py — live market-wide exposure meta-controller (serve path).
 
-Computes a single market-wide exposure multiplier ∈ [floor, 1.0] from the
-fitted GARCH(1,1)+HMM overlay (``models/saved/garch_hmm_v4_weights.joblib``),
-applied to every MUA weight in ``main._dispatch_signals``.
+``live_exposure_scalar()`` combines THREE independent market-wide legs into
+one exposure multiplier ∈ (0, 1.0], applied to every MUA weight in
+``main._dispatch_signals``:
+  • GARCH-HMM  — macro/vol regime (``models/saved/garch_hmm_v4_weights.joblib``)
+  • drift      — trailing index-return slow-bleed (added 19-07-26; the GARCH
+                 leg is vol-triggered and read ~0.99 through the whole
+                 low-vol July grind-down)
+  • breadth    — fraction of the liquid universe with positive trailing
+                 returns (added 20-07-26; check_drift.py found July's bleed
+                 was a breadth collapse, 29.5% vs 41.5% train — the direct
+                 signal none of the price/vol proxies above actually read)
 
-Benchmark (seed 0, T+5, bear OOS): regime_policy + this brake was the best
-defense (Sharpe −0.36 → +0.005, timing_α +0.37). The two layers are
-complementary — price micro-regime × macro breadth — so they STACK.
+Combined = min(all three). Every call logs the FULL per-leg breakdown plus
+which leg is binding — the attribution the July post-mortem was missing
+(before this, nobody could tell which layer cost how much on a given day).
+
+Benchmark (seed 0, T+5, bear OOS): regime_policy + the GARCH leg was the
+best defense (Sharpe −0.36 → +0.005, timing_α +0.37). regime_policy is
+per-name price micro-structure; these three legs are market-wide — they
+STACK, not compete.
 
 FAIL-OPEN CONTRACT
 ──────────────────
-This runs on the daily live cron. ANY failure (missing/stale macro parquet,
-incompatible model pickle, empty OHLCV, import error) returns 1.0 — full
-exposure, no brake — and logs a warning. The brake can only ever REDUCE
-exposure when everything is healthy; it can never break serve.
+This runs on the daily live cron. ANY failure in ANY leg (missing/stale
+macro parquet, incompatible model pickle, empty OHLCV, import error) drops
+that leg to 1.0 (full exposure, no brake) and logs a warning — the other
+legs are unaffected. The controller can only ever REDUCE exposure when
+everything is healthy; a failure can never break serve or over-brake.
 
 Leak discipline is inherited: GARCH is causal, the HMM posterior is filtered
-(``p_bull_latest`` reads the leak-free last-bar estimate).
+(``p_bull_latest`` reads the leak-free last-bar estimate); drift and breadth
+are both strictly backward-looking (no forward return, no lookahead).
 """
 
 from __future__ import annotations
@@ -58,18 +73,23 @@ def _load_model():
     return _MODEL
 
 
-def _build_live_obs():
+def _build_live_obs(panel=None):
     """Assemble the live macro observation frame (market proxy + macro returns).
 
-    Returns a date-indexed DataFrame with columns [market_ret, sp500_ret,
-    dxy_ret, usdvnd_ret], or None if anything is unavailable.
+    `panel` — an already-loaded OHLCV panel to reuse (the drift/breadth legs
+    load one for the same call); loads its own when omitted so this function
+    still works standalone. Returns a date-indexed DataFrame with columns
+    [market_ret, sp500_ret, dxy_ret, usdvnd_ret], or None if anything is
+    unavailable.
     """
     import pandas as pd  # noqa: PLC0415
 
-    from src.backtest.pipeline import RunConfig, load_ohlcv  # noqa: PLC0415
     from src.models.macro_risk_hmm import build_market_proxy_returns  # noqa: PLC0415
 
-    panel = load_ohlcv(RunConfig())
+    if panel is None:
+        from src.backtest.pipeline import RunConfig, load_ohlcv  # noqa: PLC0415
+
+        panel = load_ohlcv(RunConfig())
     market_ret = build_market_proxy_returns(panel)
     if market_ret is None or len(market_ret) == 0:
         LOGGER.warning("[garch-brake] empty market proxy — full exposure")
@@ -137,49 +157,101 @@ def _drift_scalar(market_ret) -> float:
         float(getattr(CONFIG.trading, "drift_brake_full", -0.06)),
         float(getattr(CONFIG.trading, "drift_brake_floor", 0.5)),
     )
+    return scalar
+
+
+def _breadth_leg_scalar(panel) -> float:
+    """Config-driven breadth scalar from the live OHLCV panel."""
+    if not getattr(CONFIG.trading, "breadth_brake_enabled", False):
+        return 1.0
+    from src.trading.breadth import breadth_from_panel  # noqa: PLC0415
+    from src.trading.breadth import breadth_scalar as _breadth_scalar_fn  # noqa: PLC0415
+
+    window = int(getattr(CONFIG.trading, "breadth_brake_window", 20))
+    breadth = breadth_from_panel(panel, window=window)
+    if breadth is None:
+        return 1.0  # insufficient history — fail open
+    scalar = _breadth_scalar_fn(
+        breadth,
+        float(getattr(CONFIG.trading, "breadth_brake_trigger", 0.40)),
+        float(getattr(CONFIG.trading, "breadth_brake_floor_level", 0.25)),
+        float(getattr(CONFIG.trading, "breadth_brake_floor", 0.5)),
+    )
     if scalar < 1.0:
-        LOGGER.info("[drift-brake] trailing drift tripped → exposure ×%.3f", scalar)
+        LOGGER.info("[breadth-brake] trailing breadth=%.3f (window=%d) → exposure ×%.3f",
+                    breadth, window, scalar)
     return scalar
 
 
 def live_exposure_scalar() -> float:
     """Market-wide exposure multiplier ∈ (0, 1.0] for today's dispatch.
 
-    min(GARCH-HMM scalar, drift scalar) — the GARCH leg is vol-triggered and
-    was blind to the low-vol July-2026 grind-down (read ~0.99 through a
-    12-of-13-red dispatch month); the drift leg covers exactly that slow-bleed
-    shape. Each leg fails open to 1.0 independently; both disabled → 1.0.
+    min(GARCH-HMM, drift, breadth) — three independent legs reading three
+    different signals (macro/vol regime, index-return drift, universe-wide
+    breadth). Each leg fails open to 1.0 independently; all disabled → 1.0.
+    Every call logs the full breakdown + the binding leg (module docstring
+    has the "why" for each leg).
     """
     garch_scalar = 1.0
     drift_scalar = 1.0
-    market_ret = None
-    try:
-        if getattr(CONFIG.trading, "drift_brake_enabled", False):
+    breadth_scalar = 1.0
+
+    need_panel = (getattr(CONFIG.trading, "drift_brake_enabled", False)
+                  or getattr(CONFIG.trading, "breadth_brake_enabled", False)
+                  or getattr(CONFIG.trading, "garch_brake_enabled", False))
+    panel = None
+    if need_panel:
+        try:
             from src.backtest.pipeline import RunConfig, load_ohlcv  # noqa: PLC0415
+
+            panel = load_ohlcv(RunConfig())
+        except Exception:  # noqa: BLE001 — fail-open
+            LOGGER.warning("[meta-controller] OHLCV panel load failed — "
+                           "drift/breadth legs full exposure", exc_info=True)
+            panel = None
+
+    if getattr(CONFIG.trading, "drift_brake_enabled", False):
+        try:
             from src.models.macro_risk_hmm import build_market_proxy_returns  # noqa: PLC0415
 
-            market_ret = build_market_proxy_returns(load_ohlcv(RunConfig()))
+            market_ret = build_market_proxy_returns(panel)
             if market_ret is not None and len(market_ret) > 0:
                 drift_scalar = _drift_scalar(market_ret)
-    except Exception:  # noqa: BLE001 — fail-open
-        LOGGER.warning("[drift-brake] computation failed — full exposure", exc_info=True)
-        drift_scalar = 1.0
+        except Exception:  # noqa: BLE001 — fail-open
+            LOGGER.warning("[drift-brake] computation failed — full exposure", exc_info=True)
+            drift_scalar = 1.0
+
+    if getattr(CONFIG.trading, "breadth_brake_enabled", False):
+        try:
+            breadth_scalar = _breadth_leg_scalar(panel)
+        except Exception:  # noqa: BLE001 — fail-open
+            LOGGER.warning("[breadth-brake] computation failed — full exposure", exc_info=True)
+            breadth_scalar = 1.0
 
     if getattr(CONFIG.trading, "garch_brake_enabled", False):
         try:
             import numpy as np  # noqa: PLC0415
 
             model = _load_model()
-            obs = _build_live_obs() if model is not None else None
+            # Shared panel first; _build_live_obs self-loads if it's None
+            # (e.g. the shared load failed but this leg is still enabled).
+            obs = _build_live_obs(panel) if model is not None else None
             if model is not None and obs is not None:
                 p_bull = float(model.p_bull_latest(obs))
                 floor = float(getattr(CONFIG.trading, "garch_brake_floor", 0.2))
                 garch_scalar = float(np.clip(p_bull, floor, 1.0))
-                LOGGER.info("[garch-brake] P(Bull)=%.3f → exposure ×%.3f (floor %.2f)",
-                            p_bull, garch_scalar, floor)
         except Exception:  # noqa: BLE001 — fail-open: never break the live pipeline
             LOGGER.warning("[garch-brake] scalar computation failed — full exposure",
                            exc_info=True)
             garch_scalar = 1.0
 
-    return min(garch_scalar, drift_scalar)
+    legs = {"garch": garch_scalar, "drift": drift_scalar, "breadth": breadth_scalar}
+    combined = min(legs.values())
+    binding = min(legs, key=legs.get)
+    LOGGER.info(
+        "[meta-controller] legs garch=%.3f drift=%.3f breadth=%.3f → "
+        "combined=×%.3f (binding=%s)",
+        garch_scalar, drift_scalar, breadth_scalar, combined,
+        binding if combined < 1.0 else "none",
+    )
+    return combined

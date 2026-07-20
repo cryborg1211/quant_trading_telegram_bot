@@ -103,6 +103,18 @@ class TradingConfig:
     drift_brake_trigger: float = -0.03
     drift_brake_full: float = -0.06
     drift_brake_floor: float = 0.5
+    # Breadth brake (20-07-26 meta-controller upgrade): check_drift.py found
+    # the July bleed was a BREADTH collapse (trailing 20d UP rate 29.5% vs
+    # 41.5% train), not model decay — a direct signal none of the other
+    # brakes read. breadth = fraction of the liquid universe with a positive
+    # trailing `breadth_brake_window`-session return. First-cut thresholds
+    # (not yet backtested — moderate floor 0.5 bounds downside if miscalibrated,
+    # matching drift_brake_floor). Kill-switch: "breadth_brake_enabled": false.
+    breadth_brake_enabled: bool = True
+    breadth_brake_window: int = 20
+    breadth_brake_trigger: float = 0.40
+    breadth_brake_floor_level: float = 0.25
+    breadth_brake_floor: float = 0.5
     # Prob-scaled tranche cohort weights (plan prob-scaled-tranche-weights_PLAN_20-07-26):
     # scale within-cohort dispatch weights by normalized edge over the serve
     # signal gate (src/trading/cohort_weights.py, capped 2× equal weight).
