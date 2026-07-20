@@ -16,6 +16,7 @@ function Step($name, $argLine) {
     Add-Content $log "===== $name DONE : $(Get-Date -Format o) ====="
 }
 
+Step "MR-LGBM retrain" "src/models/train_mr_lgbm.py"
 Step "T+20 train checkpoint" "train_models.py --tb-horizon 20"
 Step "T+20 backtest + save" "run_backtest.py --mode tranche --hold-days 30"
 Step "T+5 train checkpoint" "train_models.py --tb-horizon 5"
