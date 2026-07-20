@@ -1,31 +1,31 @@
 {
-  "train_rows": 766123,
-  "train_pos_rate": 0.04032511750724101,
+  "train_rows": 783272,
+  "train_pos_rate": 0.039668212319602894,
   "oof_selection": {
     "tau": 0.96,
-    "oof_precision": 0.5684,
-    "oof_recall": 0.0104,
-    "oof_fires": 563,
+    "oof_precision": 0.5775,
+    "oof_recall": 0.0117,
+    "oof_fires": 632,
     "target_precision": 0.6,
     "target_precision_met": false,
     "min_fires": 40
   },
   "holdout": {
-    "n": 84599,
-    "pos": 2109,
-    "fires": 14,
-    "precision": 0.6429,
-    "recall": 0.0043,
-    "f1": 0.0085,
-    "avg_precision": 0.3322,
+    "n": 84061,
+    "pos": 2359,
+    "fires": 17,
+    "precision": 0.6471,
+    "recall": 0.0047,
+    "f1": 0.0093,
+    "avg_precision": 0.3168,
     "confusion_matrix": [
       [
-        82485,
-        5
+        81696,
+        6
       ],
       [
-        2100,
-        9
+        2348,
+        11
       ]
     ]
   },
@@ -40,7 +40,7 @@
     "min_child_weight": 0.001,
     "min_split_gain": 0.0,
     "n_estimators": 400,
-    "n_jobs": -1,
+    "n_jobs": 1,
     "num_leaves": 7,
     "objective": "binary",
     "random_state": 42,
@@ -49,7 +49,10 @@
     "subsample": 0.8,
     "subsample_for_bin": 200000,
     "subsample_freq": 1,
-    "scale_pos_weight": 23.79843982650353,
+    "max_bin": 255,
+    "scale_pos_weight": 24.20910173473657,
+    "device_type": "gpu",
+    "gpu_use_dp": false,
     "verbose": -1
   }
 }

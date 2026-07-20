@@ -1,4 +1,5 @@
 {
+  "schema_hash": "v2-sha8:d89375a8",
   "model": "mr_lgbm_single",
   "tau": 0.96,
   "label": {
@@ -25,29 +26,29 @@
   },
   "selection": {
     "tau": 0.96,
-    "oof_precision": 0.5684,
-    "oof_recall": 0.0104,
-    "oof_fires": 563,
+    "oof_precision": 0.5775,
+    "oof_recall": 0.0117,
+    "oof_fires": 632,
     "target_precision": 0.6,
     "target_precision_met": false,
     "min_fires": 40
   },
   "holdout": {
-    "n": 84599,
-    "pos": 2109,
-    "fires": 14,
-    "precision": 0.6429,
-    "recall": 0.0043,
-    "f1": 0.0085,
-    "avg_precision": 0.3322,
+    "n": 84061,
+    "pos": 2359,
+    "fires": 17,
+    "precision": 0.6471,
+    "recall": 0.0047,
+    "f1": 0.0093,
+    "avg_precision": 0.3168,
     "confusion_matrix": [
       [
-        82485,
-        5
+        81696,
+        6
       ],
       [
-        2100,
-        9
+        2348,
+        11
       ]
     ]
   }
