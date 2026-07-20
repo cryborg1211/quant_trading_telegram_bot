@@ -690,6 +690,12 @@ class SentimentCrawler:
         if df.empty:
             return
 
+        # PK guard: the live table has PRIMARY KEY (ticker, date, title) and the
+        # crawl window overlaps yesterday, so re-crawled articles violate it and
+        # kill the whole EOD pipeline (crashed 16-07 + 17-07). Dedup within the
+        # batch, then anti-join against rows already in the table.
+        df = df.drop_duplicates(subset=["ticker", "date", "title"], keep="first")
+
         with duckdb.connect(self.db_path) as conn:
             conn.execute(
                 """
@@ -709,7 +715,18 @@ class SentimentCrawler:
             )
             # Legacy tables predate the ticker column — BY NAME insert needs it.
             conn.execute("ALTER TABLE hist_sentiment_llm_labeled ADD COLUMN IF NOT EXISTS ticker VARCHAR")
-            conn.execute("INSERT INTO hist_sentiment_llm_labeled BY NAME SELECT * FROM df")
+            conn.execute(
+                """
+                INSERT INTO hist_sentiment_llm_labeled BY NAME
+                SELECT * FROM df d
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM hist_sentiment_llm_labeled t
+                    WHERE t.ticker = d.ticker
+                      AND t.date   = d.date
+                      AND t.title  = d.title
+                )
+                """
+            )
 
 
 def update_daily_sentiment(
