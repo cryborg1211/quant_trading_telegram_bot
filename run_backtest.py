@@ -509,6 +509,45 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
                      time.perf_counter() - t_start, mode=mode, hold_days=hold_days)
 
 
+def _promote_decision(
+    new_meta: dict,
+    old_meta: dict | None,
+    min_sharpe_delta: float,
+    max_dd_regression_pp: float,
+    min_up_precision: float,
+) -> tuple[bool, str]:
+    """Pure promote/reject decision (weekly-auto-retrain gate, 20-07-26).
+
+    The retrain schedule went from manual/occasional to EVERY Saturday, so a
+    single bad walk-forward run (data glitch, unlucky seed, silent regression)
+    would auto-overwrite the live artifact with no human in the loop. Compares
+    the new candidate's embedded metrics against the CURRENT on-disk artifact's
+    own metadata (every bundle already carries oos_sharpe/oos_max_dd/
+    golden_mean_up_precision — no extra state needed).
+
+    No incumbent (first run / artifact missing) → always promote. `old_meta`
+    unreadable/malformed upstream → caller passes None, same as no incumbent
+    (fail toward promoting rather than permanently wedging deploys).
+    """
+    if old_meta is None:
+        return True, "no incumbent artifact — promoting first run"
+    new_sharpe = float(new_meta.get("oos_sharpe", float("-inf")))
+    old_sharpe = float(old_meta.get("oos_sharpe", float("-inf")))
+    if new_sharpe < old_sharpe + min_sharpe_delta:
+        return False, (f"Sharpe regression: new={new_sharpe:.3f} old={old_sharpe:.3f} "
+                       f"(min allowed delta={min_sharpe_delta:+.3f})")
+    new_dd = abs(float(new_meta.get("oos_max_dd", 0.0)))
+    old_dd = abs(float(old_meta.get("oos_max_dd", 0.0)))
+    if new_dd > old_dd + max_dd_regression_pp / 100.0:
+        return False, (f"MaxDD regression: new={new_dd:.2%} old={old_dd:.2%} "
+                       f"(max regression +{max_dd_regression_pp:.1f}pp)")
+    new_prec = float(new_meta.get("golden_mean_up_precision", 0.0))
+    if new_prec < min_up_precision:
+        return False, f"UP-precision below floor: new={new_prec:.3f} < {min_up_precision:.3f}"
+    return True, (f"passed — Sharpe {old_sharpe:.3f}→{new_sharpe:.3f}, "
+                  f"DD {old_dd:.2%}→{new_dd:.2%}, UP-prec={new_prec:.3f}")
+
+
 def _persist_bot_payload(cfg: RunConfig, tabular_features: list[str], golden: dict,
                          best_seed_record: dict, macro_hmm, sweep_results: list[dict],
                          mode: str = "tranche", hold_days: int = 30,
@@ -520,19 +559,6 @@ def _persist_bot_payload(cfg: RunConfig, tabular_features: list[str], golden: di
     save_dir = Path("models/saved")
     save_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = save_dir / f"v3_ensemble_{cfg.tb_horizon}d.joblib"
-
-    # Back up the EXISTING artifact before overwriting.  models/saved/ is
-    # git-untracked, unversioned, and un-backed-up, so a bad/partial run would
-    # otherwise clobber the live model with no rollback (a synthetic smoke run did
-    # exactly this once).  Timestamped copies land in models/saved/backups/.
-    if artifact_path.exists():
-        import shutil
-        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-        backup_dir = save_dir / "backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        backup_path = backup_dir / f"v3_ensemble_{cfg.tb_horizon}d_{ts}.joblib"
-        shutil.copy2(artifact_path, backup_path)
-        LOGGER.info("Backed up existing artifact → %s", backup_path)
 
     bundle = {
         "schema_version": "v3.0",
@@ -582,6 +608,51 @@ def _persist_bot_payload(cfg: RunConfig, tabular_features: list[str], golden: di
             ],
         },
     }
+    from config.settings import CONFIG  # noqa: PLC0415 — backtest script is CLI-first
+
+    if getattr(CONFIG.trading, "promote_gate_enabled", True):
+        old_meta = None
+        if artifact_path.exists():
+            try:
+                old_meta = joblib.load(artifact_path).get("metadata")
+            except Exception:  # noqa: BLE001 — unreadable incumbent must not wedge deploys
+                LOGGER.warning("Promote-gate: incumbent artifact unreadable — "
+                               "promoting without comparison.", exc_info=True)
+        promote, reason = _promote_decision(
+            bundle["metadata"], old_meta,
+            float(getattr(CONFIG.trading, "promote_gate_min_sharpe_delta", -0.10)),
+            float(getattr(CONFIG.trading, "promote_gate_max_dd_regression_pp", 3.0)),
+            float(getattr(CONFIG.trading, "promote_gate_min_up_precision", 0.35)),
+        )
+        if not promote:
+            rejected_dir = save_dir / "rejected"
+            rejected_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            rejected_path = rejected_dir / f"v3_ensemble_{cfg.tb_horizon}d_{ts}_REJECTED.joblib"
+            joblib.dump(bundle, rejected_path, compress=3)
+            LOGGER.warning(
+                "PROMOTE-GATE REJECTED new %dd candidate — incumbent artifact "
+                "UNCHANGED. Reason: %s. Candidate saved for inspection → %s",
+                cfg.tb_horizon, reason, rejected_path,
+            )
+            return
+        LOGGER.info("Promote-gate: %s", reason)
+
+    # Back up the EXISTING artifact before overwriting.  models/saved/ is
+    # git-untracked, unversioned, and un-backed-up, so a bad/partial run would
+    # otherwise clobber the live model with no rollback (a synthetic smoke run
+    # did exactly this once).  Timestamped copies land in models/saved/backups/.
+    # Runs only on the promote path — no point backing up an artifact that
+    # (on reject) isn't changing.
+    if artifact_path.exists():
+        import shutil
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        backup_dir = save_dir / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / f"v3_ensemble_{cfg.tb_horizon}d_{ts}.joblib"
+        shutil.copy2(artifact_path, backup_path)
+        LOGGER.info("Backed up existing artifact → %s", backup_path)
+
     joblib.dump(bundle, artifact_path, compress=3)
     size_kb = artifact_path.stat().st_size / 1024
     LOGGER.info("V4 GOLDEN bot payload persisted → %s  (%.1f KB)  seed=%d  thr=%.2f",

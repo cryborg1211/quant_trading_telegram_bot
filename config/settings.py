@@ -115,6 +115,19 @@ class TradingConfig:
     breadth_brake_trigger: float = 0.40
     breadth_brake_floor_level: float = 0.25
     breadth_brake_floor: float = 0.5
+    # Promote-gate for the weekly auto-retrain (20-07-26): retrain moved from
+    # manual/occasional to EVERY Saturday (quant_weekly_retrain schtask), so a
+    # single bad walk-forward run would otherwise auto-overwrite the live
+    # artifact with no human in the loop. run_backtest.py compares the new
+    # candidate's embedded OOS metrics against the CURRENT on-disk artifact's
+    # own metadata before persisting; a regression beyond these tolerances
+    # keeps the incumbent live and stashes the candidate under
+    # models/saved/rejected/ for inspection. Kill-switch:
+    # "promote_gate_enabled": false in settings.json.
+    promote_gate_enabled: bool = True
+    promote_gate_min_sharpe_delta: float = -0.10
+    promote_gate_max_dd_regression_pp: float = 3.0
+    promote_gate_min_up_precision: float = 0.35
     # Prob-scaled tranche cohort weights (plan prob-scaled-tranche-weights_PLAN_20-07-26):
     # scale within-cohort dispatch weights by normalized edge over the serve
     # signal gate (src/trading/cohort_weights.py, capped 2× equal weight).
@@ -206,6 +219,12 @@ class TradingConfig:
     # the arbitrator candidate pool; unmapped (OTHER) tickers are uncapped.
     # 0 disables the cap entirely.
     arbitrator_sector_cap: int = 2
+    # (3) Admission hysteresis: require N consecutive raw-qualifying days
+    # (tracked independent of dedup/sector-cap) before a name is admissible.
+    # Kill-switch: "hysteresis_enabled": false in settings.json + restart.
+    hysteresis_enabled: bool = True
+    hysteresis_min_qualify_days: int = 2
+    hysteresis_max_gap_days: int = 4
 
 
 @dataclass
