@@ -40,7 +40,7 @@ from src.models.quant_agent_arbitrator import (
     scrape_centralized_news,
 )
 from src.trading.portfolio_manager import PortfolioManager
-from src.trading import sector_map, signal_ledger
+from src.trading import candidate_hysteresis, sector_map, signal_ledger
 from src.trading.cohort_weights import prob_scaled_weights
 from src.trading import portfolio_guard
 from src.trading.risk_tier import classify_risk_tier
@@ -973,6 +973,7 @@ def _select_candidates(
     meta_gate: dict[str, bool],
     vn30_universe: frozenset[str],
     max_candidates: int,
+    persist: bool = True,
 ) -> tuple[list[str], set[str], bool, dict[str, str]]:
     """VN30 gate + meta-gate filter + top-N sort + fallback mode.
 
@@ -1010,6 +1011,30 @@ def _select_candidates(
         )
         if ticker in universe_tickers and meta_gate.get(ticker, True)
     ]
+
+    # Admission hysteresis (meta-controller optimization #4, 20-07-26): BSR
+    # bounced in/out of the pool 4 consecutive July days — require N straight
+    # qualifying runs (raw meta-gate+universe survival, tracked independent of
+    # dedup/sector-cap below) before a name is admissible at all. Read is
+    # always safe; the streak WRITE is persist-gated (mirrors the paperlog's
+    # persist=False contract — a dashboard preview must never mutate state).
+    if CONFIG.trading.hysteresis_enabled and _survivors:
+        _streaks = candidate_hysteresis.read_streaks(_survivors)
+        _min_days = int(CONFIG.trading.hysteresis_min_qualify_days)
+        _held_back = [t for t in _survivors if _streaks.get(t, 0) + 1 < _min_days]
+        if _held_back:
+            LOGGER.info(
+                "[Hysteresis] %s candidate(s) held back (need %s consecutive "
+                "qualifying days): %s",
+                len(_held_back), _min_days, _held_back,
+            )
+        _survivors = [t for t in _survivors if t not in _held_back]
+        if persist:
+            candidate_hysteresis.update_streaks(
+                list({*_survivors, *_held_back}),
+                date.today(),
+                max_gap_days=int(CONFIG.trading.hysteresis_max_gap_days),
+            )
 
     # July-2026 incident guards (applied BEFORE the pool slice so a skipped
     # name frees its slot for the next-best candidate; the monitoring-only
@@ -1277,7 +1302,8 @@ def daily_inference(
     resolved_universe = _resolve_candidate_universe(live_pl)
 
     candidate_tickers, universe_tickers, fallback_mode, fallback_reasons = _select_candidates(
-        stacking_predictions_5d, meta_gate_5d, resolved_universe, max_candidates
+        stacking_predictions_5d, meta_gate_5d, resolved_universe, max_candidates,
+        persist=persist,
     )
 
     horizon_predictions = {"5d": stacking_predictions_5d, "20d": stacking_predictions_20d}

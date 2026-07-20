@@ -99,6 +99,11 @@ def _gate_all(preds: dict) -> dict[str, bool]:
 def _guard_defaults(monkeypatch):
     monkeypatch.setattr(CONFIG.trading, "dispatch_open_cohort_dedup_enabled", True)
     monkeypatch.setattr(CONFIG.trading, "arbitrator_sector_cap", 2)
+    # Hysteresis defaults OFF here — its own dedicated tests below enable it
+    # with the DB calls mocked. Without this, these tests would hit the REAL
+    # candidate_qualify_streak table (same class of incident as the paperlog
+    # test-pollution earlier this session).
+    monkeypatch.setattr(CONFIG.trading, "hysteresis_enabled", False)
 
 
 def test_select_candidates_skips_open_cohorts(monkeypatch):
@@ -140,3 +145,82 @@ def test_select_candidates_fallback_branch_unfiltered(monkeypatch):
     assert fallback
     assert cands == ["BSR", "PVD", "GAS"]
     assert set(reasons) == {"BSR", "PVD", "GAS"}
+
+
+# ---------------------------------------------------------------------------
+# Admission hysteresis (meta-controller optimization #4) — DB calls mocked,
+# never touching the real candidate_qualify_streak table.
+# ---------------------------------------------------------------------------
+
+
+def test_hysteresis_holds_back_first_time_qualifier(monkeypatch):
+    # Both first-timers get held back → _survivors empties → this hits the
+    # SAME pre-existing fallback branch dedup/sector-cap already fall into
+    # when they empty the pool (monitoring-only top-3 by raw P(UP), ranked
+    # over the full universe — not narrowed by hysteresis/dedup/sector).
+    monkeypatch.setattr(CONFIG.trading, "hysteresis_enabled", True)
+    monkeypatch.setattr(CONFIG.trading, "hysteresis_min_qualify_days", 2)
+    monkeypatch.setattr(main.signal_ledger, "open_tickers", lambda: set())
+    monkeypatch.setattr(main.candidate_hysteresis, "read_streaks", lambda tickers: {})
+    updates = []
+    monkeypatch.setattr(main.candidate_hysteresis, "update_streaks",
+                        lambda tickers, today, max_gap_days=4: updates.append(set(tickers)))
+    preds = _preds("BSR", "VCB")
+    cands, _, fallback, _ = main._select_candidates(preds, _gate_all(preds), _UNIVERSE, 6)
+    assert fallback
+    assert cands == ["BSR", "VCB"]  # fallback ranks the full universe, unfiltered
+    assert updates == [{"BSR", "VCB"}]  # streak still recorded for both
+
+
+def test_hysteresis_admits_after_min_streak(monkeypatch):
+    monkeypatch.setattr(CONFIG.trading, "hysteresis_enabled", True)
+    monkeypatch.setattr(CONFIG.trading, "hysteresis_min_qualify_days", 2)
+    monkeypatch.setattr(main.signal_ledger, "open_tickers", lambda: set())
+    monkeypatch.setattr(main.candidate_hysteresis, "read_streaks",
+                        lambda tickers: {"BSR": 1})  # qualified once already
+    monkeypatch.setattr(main.candidate_hysteresis, "update_streaks", lambda *a, **k: None)
+    preds = _preds("BSR", "VCB")
+    cands, _, fallback, _ = main._select_candidates(preds, _gate_all(preds), _UNIVERSE, 6)
+    assert not fallback
+    assert cands == ["BSR"]  # BSR's 2nd day clears the bar; VCB (0 prior) held back
+
+
+def test_hysteresis_kill_switch_skips_db_entirely(monkeypatch):
+    monkeypatch.setattr(CONFIG.trading, "hysteresis_enabled", False)
+    monkeypatch.setattr(main.signal_ledger, "open_tickers", lambda: set())
+    monkeypatch.setattr(
+        main.candidate_hysteresis, "read_streaks",
+        lambda tickers: (_ for _ in ()).throw(AssertionError("must not be called")),
+    )
+    preds = _preds("BSR", "VCB")
+    cands, _, _, _ = main._select_candidates(preds, _gate_all(preds), _UNIVERSE, 6)
+    assert cands == ["BSR", "VCB"]
+
+
+def test_hysteresis_write_skipped_when_persist_false(monkeypatch):
+    monkeypatch.setattr(CONFIG.trading, "hysteresis_enabled", True)
+    monkeypatch.setattr(CONFIG.trading, "hysteresis_min_qualify_days", 2)
+    monkeypatch.setattr(main.signal_ledger, "open_tickers", lambda: set())
+    monkeypatch.setattr(main.candidate_hysteresis, "read_streaks", lambda tickers: {"BSR": 5})
+    monkeypatch.setattr(
+        main.candidate_hysteresis, "update_streaks",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not write under persist=False")),
+    )
+    preds = _preds("BSR")
+    cands, _, _, _ = main._select_candidates(preds, _gate_all(preds), _UNIVERSE, 6, persist=False)
+    assert cands == ["BSR"]  # read still applies, write correctly skipped
+
+
+def test_hysteresis_fallback_branch_unaffected(monkeypatch):
+    # A held-back name must still surface via the monitoring-only fallback —
+    # hysteresis narrows real ADMISSION, never observability.
+    monkeypatch.setattr(CONFIG.trading, "hysteresis_enabled", True)
+    monkeypatch.setattr(CONFIG.trading, "hysteresis_min_qualify_days", 2)
+    monkeypatch.setattr(main.signal_ledger, "open_tickers", lambda: set())
+    monkeypatch.setattr(main.candidate_hysteresis, "read_streaks", lambda tickers: {})
+    monkeypatch.setattr(main.candidate_hysteresis, "update_streaks", lambda *a, **k: None)
+    preds = _preds("BSR", "PVD")
+    gate = {t: False for t in preds}  # force fallback regardless of hysteresis
+    cands, _, fallback, _ = main._select_candidates(preds, gate, _UNIVERSE, 6)
+    assert fallback
+    assert cands == ["BSR", "PVD"]

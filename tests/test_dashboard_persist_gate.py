@@ -186,9 +186,18 @@ def test_persist_true_default_writes():
 @patch("main.predict_v3_horizon")
 @patch("main.Alpha360Generator")
 def test_daily_inference_persist_passthrough(
-    mock_a360_cls, mock_predict, mock_eval, mock_rte,
+    mock_a360_cls, mock_predict, mock_eval, mock_rte, monkeypatch,
 ):
     """daily_inference(persist=False) → run_trade_execution(persist=False)."""
+    from config.settings import CONFIG
+
+    # All 3 names pass meta-gate → _select_candidates' admission-hysteresis
+    # leg (20-07-26) would otherwise open a REAL duckdb.connect for the read
+    # even under persist=False (its write correctly stays gated, but the
+    # read doesn't know about this file's "zero DB connections" contract).
+    # Not under test here — disable it.
+    monkeypatch.setattr(CONFIG.trading, "hysteresis_enabled", False)
+
     mock_gen = MagicMock()
     mock_gen.load_live_ohlcv_window.return_value = _make_polars_df()
     mock_a360_cls.return_value = mock_gen

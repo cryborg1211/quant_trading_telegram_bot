@@ -26,6 +26,11 @@ def _no_prod_paperlog(monkeypatch):
     # persist=True — stub it (incident 20-07-26: fake VCB/BID/VHM 'daily' rows
     # landed in the live experiment log during a pytest run).
     monkeypatch.setattr(main, "_paperlog_no_trade_day", lambda *a, **k: None)
+    # Same class of incident, same fix: _select_candidates' admission-
+    # hysteresis leg (20-07-26) opens a real duckdb.connect (read always,
+    # write under persist=True) — not under test here.
+    from config.settings import CONFIG
+    monkeypatch.setattr(CONFIG.trading, "hysteresis_enabled", False)
 
 
 def _make_polars_df(tickers: list[str] | None = None) -> pl.DataFrame:

@@ -23,6 +23,11 @@ def _no_prod_paperlog(monkeypatch):
     # can never pollute data/quant_v6_core.duckdb (incident 20-07-26: a test
     # run inserted fake VCB/BID/VHM 'daily' rows into the live experiment log).
     monkeypatch.setattr(main, "_paperlog_no_trade_day", lambda *a, **k: None)
+    # Same class of incident, same fix: _select_candidates' admission-
+    # hysteresis leg (20-07-26) opens a real duckdb.connect (read always,
+    # write under persist=True) — not under test here.
+    from config.settings import CONFIG
+    monkeypatch.setattr(CONFIG.trading, "hysteresis_enabled", False)
 
 def _make_polars_df(tickers: list[str] | None = None) -> pl.DataFrame:
     tickers = tickers or _TICKERS
