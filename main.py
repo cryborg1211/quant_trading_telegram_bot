@@ -40,7 +40,8 @@ from src.models.quant_agent_arbitrator import (
     scrape_centralized_news,
 )
 from src.trading.portfolio_manager import PortfolioManager
-from src.trading import signal_ledger
+from src.trading import sector_map, signal_ledger
+from src.trading.cohort_weights import prob_scaled_weights
 from src.trading import portfolio_guard
 from src.trading.risk_tier import classify_risk_tier
 from src.trading.serve_universe import liquid_universe
@@ -53,6 +54,7 @@ from src.utils.telegram_alerter import TelegramBot, format_source_links
 from src.reports.builders import (
     FEATURE_HUMAN_NAMES,
     SHORT_HORIZON_DAYS,
+    _HORIZON_LABEL,
     _MACRO_INNER_NAMES,
     _NUMERIC_SUFFIX_RE,
     _MACRO_PREFIX_RE,
@@ -67,6 +69,8 @@ from src.reports.builders import (
     _build_feature_explanation,
     _format_sentiment_status,
     build_regime_pulse,
+    build_position_report,
+    build_regret_report,
     _build_combined_report,
     _smart_truncate,
     _build_fallback_observability_report_vi,
@@ -997,7 +1001,7 @@ def _select_candidates(
                                key=lambda i: i[1][2], reverse=True)
         if t in universe_tickers and not meta_gate.get(t, True)
     ]
-    candidate_tickers = [
+    _survivors = [
         ticker
         for ticker, _probs in sorted(
             predictions.items(),
@@ -1005,7 +1009,36 @@ def _select_candidates(
             reverse=True,
         )
         if ticker in universe_tickers and meta_gate.get(ticker, True)
-    ][: min(max_candidates, _ARBITRATOR_POOL)]
+    ]
+
+    # July-2026 incident guards (applied BEFORE the pool slice so a skipped
+    # name frees its slot for the next-best candidate; the monitoring-only
+    # fallback branch below is deliberately NOT filtered — observability):
+    # (1) open-cohort dedup — never re-buy a name whose dispatched cohort is
+    #     still OPEN (BSR was re-dispatched 4 consecutive days into a knife);
+    # (2) sector cap — max N per sector_map sector (8/13 July dispatches were
+    #     one PVN energy complex). OTHER (unmapped) is uncapped.
+    if CONFIG.trading.dispatch_open_cohort_dedup_enabled:
+        _open_cohorts = signal_ledger.open_tickers()
+        _deduped = [t for t in _survivors if t.upper() not in _open_cohorts]
+        if len(_deduped) < len(_survivors):
+            LOGGER.info(
+                "[DispatchDedup] %s candidate(s) skipped — cohort still OPEN: %s",
+                len(_survivors) - len(_deduped),
+                [t for t in _survivors if t.upper() in _open_cohorts],
+            )
+        _survivors = _deduped
+    _survivors, _sector_trimmed = sector_map.apply_sector_cap(
+        _survivors, CONFIG.trading.arbitrator_sector_cap
+    )
+    if _sector_trimmed:
+        LOGGER.info(
+            "[SectorCap] %s candidate(s) trimmed beyond %s/sector: %s",
+            len(_sector_trimmed), CONFIG.trading.arbitrator_sector_cap,
+            _sector_trimmed,
+        )
+
+    candidate_tickers = _survivors[: min(max_candidates, _ARBITRATOR_POOL)]
     LOGGER.info(
         "[Brain] Meta-labeler gate: %s liquid tickers rejected (e.g. %s). "
         "Top-%s survivors → arbitrator pool: %s",
@@ -1090,6 +1123,73 @@ def _rescue_loop(
         LOGGER.warning("[EventLayer] overrides=%s (rescued=%s)",
                        {t: o["status"] for t, o in event_overrides.items()}, _rescued)
     return extended, event_overrides
+
+
+def _paperlog_snapshot_and_backfill(
+    db: Any,
+    horizon_predictions: dict[str, dict[str, list[float]]],
+    final_decisions: dict[str, int],
+    all_sentiments: dict[str, Any],
+) -> None:
+    """Never-raise `source='daily'` paperlog write + matured-outcome backfill.
+
+    Extracted (19-07-26) so ALL daily_inference exit paths can log the
+    cross-section — the happy dispatch path, the empty-live-prices early
+    return, AND the weak-market fallback return. The paperlog starved for 13
+    trading days (last daily row 06-30) because only the happy path wrote it,
+    and the τ-gate kept the book empty all July. No-trade days are data.
+    """
+    try:
+        logged = _log_sentiment_entry_paperlog(
+            db=db,
+            candidate_tickers=list(horizon_predictions.get("5d", {}).keys()),
+            stacking_5d=horizon_predictions.get("5d", {}),
+            stacking_20d=horizon_predictions.get("20d", {}),
+            final_decisions=final_decisions,
+            all_sentiments=all_sentiments,
+            source="daily",
+        )
+        backfilled = _backfill_paperlog_outcomes(db)
+        LOGGER.info(
+            "Paperlog: logged=%s new row(s); backfilled=%s matured row(s)",
+            logged, backfilled,
+        )
+    except Exception:  # noqa: BLE001 — observability must never kill inference
+        LOGGER.exception("Paperlog write failed — non-fatal.")
+
+
+def _paperlog_no_trade_day(
+    persist: bool,
+    horizon_predictions: dict[str, dict[str, list[float]]],
+    final_decisions: dict[str, int],
+    all_sentiments: dict[str, Any],
+) -> None:
+    """Paperlog write for daily_inference exit paths that hold no manager.
+
+    Mirrors verify_single_ticker's pattern: the DuckDBEngine singleton via lazy
+    import (no PortfolioManager construction — these paths never trade, they
+    only need the shared audit connection). Never raises.
+    """
+    if not (persist and CONFIG.trading.sentiment_entry_enabled):
+        return
+    try:
+        from src.data.db_engine import DuckDBEngine  # noqa: PLC0415
+
+        _paperlog_snapshot_and_backfill(
+            DuckDBEngine(), horizon_predictions, final_decisions, all_sentiments
+        )
+    except Exception:  # noqa: BLE001 — observability must never raise
+        LOGGER.exception("Paperlog no-trade-day write failed — non-fatal.")
+
+
+def _cancelled_hold_days(horizon: int) -> int:
+    """Real-tranche hold window for a cancelled signal's regret evaluation.
+
+    T5 → 5 sessions, T20 (and any other primary) → the validated 30-session
+    tranche book — the same T5=5 / T20=30 convention already established by the
+    paired dispatch tracking (parent plan Decision 3) and suggest_buy tracking.
+    """
+    return SHORT_HORIZON if int(horizon) == SHORT_HORIZON else 30
 
 
 def daily_inference(
@@ -1188,10 +1288,30 @@ def daily_inference(
     # BYPASSES run_trade_execution — guaranteeing no trades are executed.
     if fallback_mode:
         if not candidate_tickers:
+            _paperlog_no_trade_day(persist, horizon_predictions, final_decisions, all_sentiments)
             return (
                 "<b>[⚠️ THỊ TRƯỜNG YẾU]</b>\n<i>Không có mã nào trong vũ trụ "
                 "giao dịch sau bộ lọc thanh khoản/Universe hôm nay.</i>",
                 [],
+            )
+        # ── Capture point 1: log the weak-market rejects into cancelled_signals.
+        #    Fires regardless of broadcast/persist (so manual /suggest_buy taps are
+        #    captured too — Decision 5); record_cancelled is itself never-raise, so
+        #    it is called bare (mirrors record_dispatch's call sites).
+        if CONFIG.trading.cancelled_signal_tracking_enabled:
+            signal_ledger.record_cancelled(
+                [
+                    {
+                        "ticker": t,
+                        "p_down": stacking_predictions_5d.get(t, [0.0, 0.0, 0.0])[0],
+                        "p_side": stacking_predictions_5d.get(t, [0.0, 0.0, 0.0])[1],
+                        "p_up": stacking_predictions_5d.get(t, [0.0, 0.0, 0.0])[2],
+                        "reason": fallback_reasons.get(t, ""),
+                    }
+                    for t in candidate_tickers
+                ],
+                int(horizon),
+                _cancelled_hold_days(horizon),
             )
         # MR knife-catch scores for the monitored names → [🔪 BẮT ĐÁY] tag.
         mr_scores = mr_score_tickers(candidate_tickers)
@@ -1209,6 +1329,10 @@ def daily_inference(
             "[FallbackObservability] Returning monitoring-only report for %s "
             "— run_trade_execution SKIPPED (no trades).", candidate_tickers,
         )
+        # Paperlog starvation fix (19-07-26): this return bypassed the paperlog
+        # for 13 straight trading days while the τ-gate kept the pool empty.
+        # Weak-market days are exactly the slice the item-1 experiment needs.
+        _paperlog_no_trade_day(persist, horizon_predictions, final_decisions, all_sentiments)
         LOGGER.info(
             "Dual-horizon daily inference completed in %.2fs.",
             time.perf_counter() - total_start,
@@ -1293,6 +1417,23 @@ def daily_inference(
                 if d in _DEC_VI
                 else "Chưa đủ điều kiện MUA sau bộ lọc xác suất + thanh khoản "
                      "+ tin tức."
+            )
+        # ── Capture point 2: log the post-arbitration no-buy rejects. Mutually
+        #    exclusive with capture point 1 (that branch always returns first).
+        if CONFIG.trading.cancelled_signal_tracking_enabled:
+            signal_ledger.record_cancelled(
+                [
+                    {
+                        "ticker": t,
+                        "p_down": stacking_predictions_5d.get(t, [0.0, 0.0, 0.0])[0],
+                        "p_side": stacking_predictions_5d.get(t, [0.0, 0.0, 0.0])[1],
+                        "p_up": stacking_predictions_5d.get(t, [0.0, 0.0, 0.0])[2],
+                        "reason": reasons.get(t, ""),
+                    }
+                    for t in monitor
+                ],
+                int(horizon),
+                _cancelled_hold_days(horizon),
             )
         mr_scores = mr_score_tickers(monitor)
         fb_prices = _get_live_exec_prices(latest_df, monitor)
@@ -1447,6 +1588,28 @@ def _dispatch_signals(
     hold-horizon / barrier guidance to the card; None keeps legacy behavior.
     """
     tranche_fields = _tranche_signal_fields(strategy, len(top_buy_signals), horizon)
+    # Prob-scaled cohort weights (default OFF — backlog plan
+    # prob-scaled-tranche-weights_PLAN_20-07-26, pending backtest A/B).
+    # Same shared formula as walk_forward (src/trading/cohort_weights.py):
+    # fraction_i ∝ max(0, p_up − signal_gate), capped 2× equal weight; the
+    # per-name NAV weight re-splits the cohort's total equal-weight budget and
+    # keeps the 20% per-name ceiling from _tranche_signal_fields.
+    _prob_w_by_ticker: dict[str, float] = {}
+    if (tranche_fields and top_buy_signals
+            and getattr(CONFIG.trading, "prob_weighted_cohorts_enabled", False)):
+        _gate = float((strategy or {}).get("signal_threshold", 0.0) or 0.0)
+        _pups = [
+            float(stacking_predictions.get("5d", {}).get(t, [0, 0, 0])[2])
+            for t in top_buy_signals
+        ]
+        _cohort_total = tranche_fields["suggested_weight"] * len(top_buy_signals)
+        _prob_w_by_ticker = {
+            t: min(_cohort_total * f, 0.20)
+            for t, f in zip(top_buy_signals,
+                            prob_scaled_weights(_pups, _gate))
+        }
+        LOGGER.info("[ProbWeights] cohort re-split: %s",
+                    {t: round(w, 5) for t, w in _prob_w_by_ticker.items()})
     # Market-wide risk tier for the card's "Triển khai danh mục" section
     # (DISPLAY-ONLY — no sizing enforcement until the backtest A/B validates
     # the tier cap; see src/trading/risk_tier.py EVIDENCE STATUS). p_bull
@@ -1496,9 +1659,12 @@ def _dispatch_signals(
                 continue
             # Tranche artifacts size at the validated cohort weight
             # (NAV/hold_days across picks); legacy artifacts keep half-Kelly.
-            _w = tranche_fields.get(
-                "suggested_weight",
-                suggested_weight(float(_p5[2]), market_regime=_regime))
+            # Prob-scaled per-name weight (when enabled) overrides the equal split.
+            _w = (_prob_w_by_ticker[ticker]
+                  if ticker in _prob_w_by_ticker
+                  else tranche_fields.get(
+                      "suggested_weight",
+                      suggested_weight(float(_p5[2]), market_regime=_regime)))
             _regime_action_vi = "Không điều chỉnh"
             _arb_note_vi = "Không can thiệp"
             if (CONFIG.trading.regime_sizing_enabled
@@ -1612,6 +1778,12 @@ def run_trade_execution(
 
         if not live_exec_prices:
             LOGGER.warning("No executable live prices available. Skipping portfolio price updates and alerts.")
+            # Paperlog starvation fix (19-07-26): this early return used to
+            # skip the paperlog write below. No-trade days are data, not noise.
+            if persist and manager is not None and CONFIG.trading.sentiment_entry_enabled:
+                _paperlog_snapshot_and_backfill(
+                    manager.db, stacking_predictions, final_decisions, all_sentiments
+                )
             return "", dispatched_signals
 
         if persist:
@@ -1650,19 +1822,8 @@ def run_trade_execution(
                 # the Top-3) + backfill any matured rows. Observability only — no
                 # trading decision changes. Reuses `db = manager.db` (no new conn).
                 if CONFIG.trading.sentiment_entry_enabled:
-                    _paperlog_logged = _log_sentiment_entry_paperlog(
-                        db=db,
-                        candidate_tickers=list(stacking_predictions.get("5d", {}).keys()),
-                        stacking_5d=stacking_predictions.get("5d", {}),
-                        stacking_20d=stacking_predictions.get("20d", {}),
-                        final_decisions=final_decisions,
-                        all_sentiments=all_sentiments,
-                        source="daily",
-                    )
-                    _paperlog_backfilled = _backfill_paperlog_outcomes(db)
-                    LOGGER.info(
-                        "Paperlog: logged=%s new row(s); backfilled=%s matured row(s)",
-                        _paperlog_logged, _paperlog_backfilled,
+                    _paperlog_snapshot_and_backfill(
+                        db, stacking_predictions, final_decisions, all_sentiments
                     )
 
         LOGGER.info("Dispatching Telegram Alerts...")
@@ -1722,6 +1883,30 @@ def run_trade_execution(
         # /suggest_buy previews are not committed positions.
         if broadcast and dispatched_signals:
             signal_ledger.record_dispatch(dispatched_signals, _strategy, int(horizon))
+            # Paired T+5 tracking row per dispatched ticker — an independently
+            # graded 5-session paper position for every signal the user actually
+            # received. It never carries NAV weight and never feeds
+            # PortfolioManager (weight defaults to 0.0 because these ticker-only
+            # dicts omit `suggested_weight`).
+            #
+            # SYNTHETIC strategy dict here, NOT `_load_v3_bot(SHORT_HORIZON).strategy`:
+            # the T+5 GOLDEN artifact is backtested with the tranche book's
+            # `--hold-days 30` convention for cost-model realism, so its
+            # `.strategy["hold_days"]` is 30 — the 30-session portfolio window,
+            # NOT the model's own 5-trading-day label horizon. Using the loaded
+            # artifact's strategy would silently track the T+5 signal for 30
+            # sessions, defeating the point of an independent 5-session
+            # verification window. The `!= SHORT_HORIZON` guard is defensive:
+            # no current call path invokes run_trade_execution with the primary
+            # horizon already == SHORT_HORIZON, but if one ever did we must not
+            # double-book the same horizon.
+            if int(horizon) != SHORT_HORIZON:
+                _short_signals = [{"ticker": s["ticker"]} for s in dispatched_signals]
+                signal_ledger.record_dispatch(
+                    _short_signals,
+                    {"mode": "tranche", "hold_days": SHORT_HORIZON},
+                    horizon=SHORT_HORIZON,
+                )
 
     except Exception:
         LOGGER.exception("Error during trade execution")
@@ -2060,7 +2245,9 @@ def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> No
       2. refresh daily LLM news sentiment;
       3. run the daily inference (T+20 tranche Top-3 broadcast);
       4. alert tranche cohorts whose hold horizon has elapsed (signal ledger);
-      5. portfolio guard — EOD protective alert for non-cron user holdings.
+      5. portfolio guard — EOD protective alert for non-cron user holdings;
+      6. EOD position report — dual-horizon PnL/verdict broadcast (signal ledger);
+      7. EOD regret report — hypothetical PnL on rejected signals (signal ledger).
 
     Step 1 is the ONLY OHLCV ingestion entrypoint in the bot/CLI; the V4 backtest
     engine (train_models.py / run_backtest.py) reads the populated store and never
@@ -2118,10 +2305,21 @@ def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> No
     with timed_step("Portfolio guard EOD check"):
         notify_portfolio_guard()
 
+    # 6. EOD position report — dual-horizon (T+20 + T+5) live PnL / verdict
+    #    broadcast. AFTER notify_tranche_exits so this run's just-closed cohorts
+    #    surface in the "đã đóng hôm nay" section.
+    with timed_step("EOD position report (signal ledger)"):
+        notify_position_report()
+
+    # 7. EOD regret report — HYPOTHETICAL "if bought anyway" PnL on the day's
+    #    rejected buy signals (cancelled_signals ledger). Alert-only, event-gated.
+    with timed_step("EOD regret report (cancelled signals)"):
+        notify_regret_report()
+
 
 def inference_only() -> None:
-    """Steps 3–5 of `full_pipeline` only: daily inference + tranche exit alerts
-    + portfolio-guard EOD protective sweep.
+    """Steps 3–6 of `full_pipeline` only: daily inference + tranche exit alerts
+    + portfolio-guard EOD protective sweep + EOD position report + EOD regret report.
 
     For the operator who already ingested today's OHLCV (`--task crawl_hose`)
     and wants the EOD signal, paperlog row, and exit alerts WITHOUT the
@@ -2139,6 +2337,10 @@ def inference_only() -> None:
         notify_tranche_exits()
     with timed_step("Portfolio guard EOD check"):
         notify_portfolio_guard()
+    with timed_step("EOD position report (signal ledger)"):
+        notify_position_report()
+    with timed_step("EOD regret report (cancelled signals)"):
+        notify_regret_report()
 
 
 def notify_tranche_exits() -> int:
@@ -2163,8 +2365,9 @@ def notify_tranche_exits() -> int:
         for d in due:
             disp = d["dispatch_date"]
             disp_str = disp.strftime("%d/%m/%Y") if hasattr(disp, "strftime") else str(disp)
+            hz_tag = _HORIZON_LABEL.get(d.get("horizon"), "?")
             lines.append(
-                f"• <b>{html.escape(str(d['ticker']))}</b> — vào {disp_str}, "
+                f"• <b>{html.escape(str(d['ticker']))}</b> [{hz_tag}] — vào {disp_str}, "
                 f"đủ {int(d['hold_days'])} phiên (đã qua {int(d['sessions_elapsed'])})"
             )
         # Telegram hard limit is 4096 chars. A very large tranche book could
@@ -2334,6 +2537,107 @@ def notify_portfolio_guard() -> int:
         return len(cards)
     except Exception:  # noqa: BLE001
         LOGGER.exception("[guard] notify_portfolio_guard failed.")
+        return 0
+
+
+def notify_position_report() -> int:
+    """EOD dual-horizon position/verdict broadcast from the signal ledger.
+
+    Lists every currently-OPEN ledger row's live NET PnL% + trading sessions
+    remaining, and every row CLOSED on THIS run with a đúng/sai verdict + final
+    NET PnL%. Broadcast to all configured chats via `send_text_alert`. Returns 1
+    when a report was sent, else 0.
+
+    Event-gated (silent when nothing to report) and never-raises — copies
+    `notify_portfolio_guard`'s exact shape so a report hiccup can never abort the
+    EOD pipeline. Fully short-circuits (zero DB reads) when
+    `eod_position_report_enabled` is False. Called immediately AFTER
+    `notify_tranche_exits()` so the CLOSED section (a trailing
+    `eod_position_report_lookback_days`-day window) observes this run's
+    just-closed cohorts alongside recently-closed ones.
+    """
+    if not CONFIG.trading.eod_position_report_enabled:
+        LOGGER.info("[position_report] eod_position_report_enabled=False — skipped.")
+        return 0
+    try:
+        today = datetime.now().date()
+        lookback_days = CONFIG.trading.eod_position_report_lookback_days
+        open_raw = signal_ledger.list_open(today=today)
+        closed_raw = signal_ledger.list_closed_since(lookback_days, today)
+        if not open_raw and not closed_raw:
+            LOGGER.info("[position_report] no open/closed-today rows — nothing to report.")
+            return 0
+
+        def _enrich(rows: list[dict]) -> list[dict]:
+            out: list[dict] = []
+            for r in rows:
+                pnl = signal_ledger.evaluate_signal_pnl(
+                    r["ticker"], r["dispatch_date"], r["hold_days"], today=today)
+                if pnl.get("error"):
+                    LOGGER.warning("[position_report] %s PnL eval error: %s",
+                                   r.get("ticker"), pnl["error"])
+                out.append({**r, **pnl})
+            return out
+
+        open_rows = _enrich(open_raw)
+        closed_rows = _enrich(closed_raw)
+        msg = build_position_report(open_rows, closed_rows, today, lookback_days)
+        if not msg:
+            LOGGER.info("[position_report] all rows filtered out (errors) — nothing to send.")
+            return 0
+        TelegramBot().send_text_alert(msg, label="position_report")
+        LOGGER.info("[position_report] sent: %s open + %s closed-today row(s).",
+                    len(open_rows), len(closed_rows))
+        return 1
+    except Exception:  # noqa: BLE001
+        LOGGER.exception("[position_report] notify_position_report failed.")
+        return 0
+
+
+def notify_regret_report() -> int:
+    """EOD cancelled-signal regret broadcast — HYPOTHETICAL, never a recommendation.
+
+    Lists every cancelled signal within the trailing
+    `regret_report_lookback_days`-day window and renders each row's GROSS "if
+    bought anyway" PnL (via evaluate_regret_pnl — no cost deducted, Decision 3),
+    partitioned into still-tracking vs matured. Broadcast to all configured chats
+    via `send_text_alert`. Returns 1 when a report was sent, else 0.
+
+    Event-gated (silent when nothing to report) and never-raises — copies
+    `notify_position_report`'s exact shape so a report hiccup can never abort the
+    EOD pipeline. Fully short-circuits (zero DB reads) when
+    `cancelled_signal_tracking_enabled` is False (the SINGLE flag gates BOTH the
+    capture writes AND this send, Decision 4).
+    """
+    if not CONFIG.trading.cancelled_signal_tracking_enabled:
+        LOGGER.info("[regret_report] cancelled_signal_tracking_enabled=False — skipped.")
+        return 0
+    try:
+        today = datetime.now().date()
+        lookback_days = CONFIG.trading.regret_report_lookback_days
+        cancelled_raw = signal_ledger.list_cancelled_since(lookback_days, today)
+        if not cancelled_raw:
+            LOGGER.info("[regret_report] no cancelled signals in window — nothing to report.")
+            return 0
+
+        rows: list[dict] = []
+        for r in cancelled_raw:
+            pnl = signal_ledger.evaluate_regret_pnl(
+                r["ticker"], r["screen_date"], r["hold_days"], today=today)
+            if pnl.get("error"):
+                LOGGER.warning("[regret_report] %s regret eval error: %s",
+                               r.get("ticker"), pnl["error"])
+            rows.append({**r, **pnl})
+
+        msg = build_regret_report(rows, today, lookback_days)
+        if not msg:
+            LOGGER.info("[regret_report] all rows filtered out (errors) — nothing to send.")
+            return 0
+        TelegramBot().send_text_alert(msg, label="regret_report")
+        LOGGER.info("[regret_report] sent: %s cancelled signal(s) in window.", len(rows))
+        return 1
+    except Exception:  # noqa: BLE001
+        LOGGER.exception("[regret_report] notify_regret_report failed.")
         return 0
 
 

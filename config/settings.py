@@ -92,6 +92,23 @@ class TradingConfig:
     # set "garch_brake_enabled": false in settings.json + restart.
     garch_brake_enabled: bool = True
     garch_brake_floor: float = 0.2
+    # Drift brake (19-07-26): the GARCH brake is VOL-triggered and read ~0.99
+    # through the whole low-vol July grind-down (−12/13 dispatches red). This
+    # companion brake watches trailing WINDOW-session cumulative market-proxy
+    # return: ≥ trigger → ×1.0; ≤ full → ×floor; linear in between. Combined
+    # exposure = min(garch_scalar, drift_scalar). Fail-open like the GARCH
+    # brake. Kill-switch: "drift_brake_enabled": false in settings.json.
+    drift_brake_enabled: bool = True
+    drift_brake_window: int = 10
+    drift_brake_trigger: float = -0.03
+    drift_brake_full: float = -0.06
+    drift_brake_floor: float = 0.5
+    # Prob-scaled tranche cohort weights (plan prob-scaled-tranche-weights_PLAN_20-07-26):
+    # scale within-cohort dispatch weights by normalized edge over the serve
+    # signal gate (src/trading/cohort_weights.py, capped 2× equal weight).
+    # Default OFF — flips ON only after the backtest A/B acceptance gate
+    # (Sharpe up, MaxDD not >1pp worse, PBO not worse) passes.
+    prob_weighted_cohorts_enabled: bool = False
     # Intraday attack scanner (monitoring-only): a repeating in-bot job that
     # rescores the model on PROVISIONAL intraday bars during HOSE trading hours
     # and sends a compact "top movers" card when something notable moves before
@@ -133,6 +150,50 @@ class TradingConfig:
     # When False, only the quant/rule triggers run — alerts still ship, LLM-free.
     # Kill-switch: set "portfolio_guard_llm_enabled": false in settings.json + restart.
     portfolio_guard_llm_enabled: bool = True
+    # EOD dual-horizon position/verdict report: after each EOD run,
+    # notify_position_report() broadcasts every OPEN ledger row's live NET PnL% +
+    # sessions-remaining and every row closed that run with a đúng/sai verdict.
+    # Alert-only, event-gated (silent when nothing to report). Kill-switch: set
+    # "eod_position_report_enabled": false in settings.json + restart to disable.
+    # When False the report fully short-circuits (zero DB reads).
+    eod_position_report_enabled: bool = True
+    # Rolling lookback for the report's CLOSED section: rows closed within the
+    # trailing N days (inclusive) are shown, not only those closed today. Lets
+    # recently/backfilled-closed suggestions surface for a few days.
+    eod_position_report_lookback_days: int = 7
+    # /suggest_buy5 and /suggest_buy20 call daily_inference(broadcast=False,
+    # persist=False): the persist gate correctly skips PortfolioManager/paperlog
+    # writes, but that also means the cron-path signal_ledger.record_dispatch
+    # (gated on broadcast) never fires, so these manual picks went completely
+    # untracked. When True, the two suggest_buy commands paper-track their
+    # delivered picks into dispatched_signals (dedup key (ticker, horizon) per
+    # dispatch_date — repeated same-day calls no-op). Card delivery is never
+    # blocked by a ledger failure. Kill-switch: set
+    # "suggest_buy_ledger_tracking_enabled": false in settings.json + restart.
+    suggest_buy_ledger_tracking_enabled: bool = True
+    # Cancelled-signal regret tracking: when True, every daily_inference call that
+    # lands in the weak-market fallback OR the post-arbitration no-buy monitor logs
+    # its rejected Top-3 (probs + Vietnamese reason) into cancelled_signals, and the
+    # EOD notify_regret_report() broadcasts a HYPOTHETICAL "if bought anyway" report.
+    # SINGLE kill-switch: set "cancelled_signal_tracking_enabled": false in
+    # settings.json + restart to disable — gates BOTH the capture writes AND the
+    # regret report send (see plan Decision 4).
+    cancelled_signal_tracking_enabled: bool = True
+    # Rolling lookback (days, inclusive) for notify_regret_report's window — a
+    # DEDICATED knob, independently tunable from eod_position_report_lookback_days
+    # (plan Decision 8), defaulting to the same 7 for day-one consistency.
+    regret_report_lookback_days: int = 7
+    # July-2026 incident guards (BSR dispatched 4 consecutive days into a falling
+    # knife; 8 of 13 July dispatches were one PVN energy/fertilizer complex).
+    # (1) Open-cohort dedup: a ticker with ANY status='OPEN' dispatched_signals
+    # row is excluded from NEW candidate pools — no averaging down / re-buying
+    # while a cohort is already live. Kill-switch: set
+    # "dispatch_open_cohort_dedup_enabled": false in settings.json + restart.
+    dispatch_open_cohort_dedup_enabled: bool = True
+    # (2) Sector cap: at most N names per sector (src/trading/sector_map.py) in
+    # the arbitrator candidate pool; unmapped (OTHER) tickers are uncapped.
+    # 0 disables the cap entirely.
+    arbitrator_sector_cap: int = 2
 
 
 @dataclass

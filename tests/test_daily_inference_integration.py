@@ -7,10 +7,22 @@ import pandas as pd
 import polars as pl
 import pytest
 
+import main
+
 
 # ── shared fixtures ──────────────────────────────────────────────────────────
 
 _TICKERS = ["VCB", "BID", "VHM"]
+
+
+@pytest.fixture(autouse=True)
+def _no_prod_paperlog(monkeypatch):
+    # daily_inference's no-trade-day exit paths write the PROD DuckDB paperlog
+    # via the DuckDBEngine singleton (persist defaults to True). These tests
+    # assert inference wiring, not paperlog I/O — stub the writer so a test run
+    # can never pollute data/quant_v6_core.duckdb (incident 20-07-26: a test
+    # run inserted fake VCB/BID/VHM 'daily' rows into the live experiment log).
+    monkeypatch.setattr(main, "_paperlog_no_trade_day", lambda *a, **k: None)
 
 def _make_polars_df(tickers: list[str] | None = None) -> pl.DataFrame:
     tickers = tickers or _TICKERS
