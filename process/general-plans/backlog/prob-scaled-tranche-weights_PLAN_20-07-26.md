@@ -1,8 +1,22 @@
 # Probability-Scaled Tranche Cohort Weights — Backlog Plan
 
 **Date**: 20-07-26
-**Status**: 📋 BACKLOG (design ready, NOT started — requires backtest A/B before any serve change)
+**Status**: ❌ A/B FAILED THE GATE (20-07-26) — code shipped (`1693e86`), serve knob stays **OFF**
 **Origin**: July-2026 loss post-mortem optimization list, item #5 (user-approved direction, deferred from the 20-07 autopilot session for scope discipline).
+
+## A/B Result (20-07-26, T+5 checkpoint, hold=30, thr=0.44, 4 seeds)
+
+| Arm | mean Sharpe | mean NetPnL | mean DD |
+|---|---|---|---|
+| Equal weight (baseline) | **+0.545** | **+2,332M** | −13.31% |
+| Prob-scaled (`--prob-weights`) | +0.533 | +2,277M | −13.39% |
+
+Gate required Sharpe UP — it went DOWN (−0.012) with PnL −2.4% and DD flat.
+**Verdict: KEEP EQUAL WEIGHT.** Calibrated edge differences within a top-10
+cohort are too small/noisy to size on (P(UP) IQR is only ~0.37–0.44). The
+implementation stays in the tree behind `use_prob_weights` /
+`prob_weighted_cohorts_enabled=False` for cheap re-testing after any future
+calibration improvement; do NOT enable on the current models.
 
 ## Problem
 
