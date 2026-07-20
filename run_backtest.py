@@ -67,7 +67,7 @@ from src.models.statistical_gates import deflated_sharpe, cscv_pbo
 LOGGER = logging.getLogger("quant.backtest")
 
 CHECKPOINT_PATH = Path("models/saved/v3_training_checkpoint.joblib")
-DEFAULT_SWEEP_THRESHOLDS = [0.50, 0.45, 0.40, 0.35]
+DEFAULT_SWEEP_THRESHOLDS = [0.50, 0.48, 0.46, 0.44, 0.42]
 REQUIRED_CKPT_KEYS = ("ensembles", "tabular_features", "cutoff", "train_cfg")
 
 
@@ -83,7 +83,8 @@ def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
                      use_nav_tier_cap: bool = False,
                      admission_mode: str = "cross_sectional",
                      admission_floor: float = 0.45,
-                     admission_pool_cap: int = 6) -> WalkForwardConfig:
+                     admission_pool_cap: int = 6,
+                     use_prob_weights: bool = False) -> WalkForwardConfig:
     """Pure WalkForwardConfig builder — extracted from `run_oos` so the
     mode/hold-days plumbing is unit-testable without running the engine.
 
@@ -108,6 +109,7 @@ def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
         admission_mode=admission_mode,
         admission_floor=admission_floor,
         admission_pool_cap=admission_pool_cap,
+        use_prob_weights=use_prob_weights,
         constraints=PortfolioConstraints(
             max_weight=cfg.max_weight, long_only=True,
             target_leverage=0.95, target_vol=cfg.target_vol),
@@ -126,7 +128,8 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
             use_nav_tier_cap: bool = False,
             admission_mode: str = "cross_sectional",
             admission_floor: float = 0.45,
-            admission_pool_cap: int = 6) -> pd.DataFrame:
+            admission_pool_cap: int = 6,
+            use_prob_weights: bool = False) -> pd.DataFrame:
     """Walk-forward OOS using the pure-tabular ensemble oracle.
 
     The engine builds (n, 1, F) single-bar tensors internally (seq_len=1) and the
@@ -151,7 +154,7 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
     wf_cfg = _build_wf_config(tabular_features, cutoff, cfg, mode, hold_days,
                               pt_sigma, sl_sigma, use_regime_sizing,
                               use_nav_tier_cap, admission_mode, admission_floor,
-                              admission_pool_cap)
+                              admission_pool_cap, use_prob_weights)
     eng = WalkForwardEngine(wf_cfg, oracle)
     # Soft HMM regime scaling: P(Bull) multiplies the daily target weights.
     result = eng.run(sub, corporate_actions=corporate_actions, p_bull_series=p_bull_series,
@@ -321,7 +324,8 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
          use_nav_tier_cap: bool = False,
          admission_mode: str = "cross_sectional",
          admission_floor: float = 0.45,
-         admission_pool_cap: int = 6) -> None:
+         admission_pool_cap: int = 6,
+         use_prob_weights: bool = False) -> None:
     configure_logging()
     t_start = time.perf_counter()
     sweep_thresholds = list(sweep_thresholds or DEFAULT_SWEEP_THRESHOLDS)
@@ -416,7 +420,8 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
                                  use_nav_tier_cap=use_nav_tier_cap,
                                  admission_mode=admission_mode,
                                  admission_floor=admission_floor,
-                                 admission_pool_cap=admission_pool_cap)
+                                 admission_pool_cap=admission_pool_cap,
+                                 use_prob_weights=use_prob_weights)
                     m = equity_metrics(eq, cfg.initial_capital)
                     # Inline UP-precision @thr (no log spam)
                     if len(Xte_all) > 0:
@@ -804,6 +809,9 @@ def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
     p.add_argument("--regime-sizing", action="store_true", default=False,
                    help="enable per-ticker regime-conditional sizing in the tranche engine "
                         "(mirrors src/bot/sizing.py NO_TRADE/PENALTY logic; default off)")
+    p.add_argument("--prob-weights", action="store_true", default=False,
+                   help="A/B: prob-scaled within-cohort weights "
+                        "(src/trading/cohort_weights.py) instead of equal weight")
     p.add_argument("--nav-tier-cap", action="store_true", default=False,
                    help="enable the discrete 20/60/80%% NAV portfolio deployment cap "
                         "(src/trading/risk_tier.py; A/B experiment — default off)")
@@ -853,15 +861,16 @@ def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
     return (a.checkpoint, overrides, sweep, (not a.no_save), a.export_only,
             a.mode, a.hold_days, a.tranche_pt, a.tranche_sl, a.regime_sizing,
             a.nav_tier_cap, a.admission_mode, a.admission_floor,
-            a.admission_pool_cap)
+            a.admission_pool_cap, a.prob_weights)
 
 
 if __name__ == "__main__":
     (_ckpt, _overrides, _sweep, _save, _export,
      _mode, _hold, _pt, _sl, _regime, _tier_cap,
-     _adm_mode, _adm_floor, _adm_cap) = _cli()
+     _adm_mode, _adm_floor, _adm_cap, _prob_w) = _cli()
     main(_ckpt, eval_overrides=_overrides, sweep_thresholds=_sweep,
          save_bot_payload=_save, export_only=_export, mode=_mode, hold_days=_hold,
          pt_sigma=_pt, sl_sigma=_sl, use_regime_sizing=_regime,
          use_nav_tier_cap=_tier_cap, admission_mode=_adm_mode,
-         admission_floor=_adm_floor, admission_pool_cap=_adm_cap)
+         admission_floor=_adm_floor, admission_pool_cap=_adm_cap,
+         use_prob_weights=_prob_w)

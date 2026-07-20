@@ -79,6 +79,7 @@ from src.trading.regime_policy import (
     PENALTY_REGIMES,
     REGIME_PENALTY_FACTOR,
 )
+from src.trading.cohort_weights import prob_scaled_weights
 from src.trading.risk_tier import apply_nav_tier_cap, classify_risk_tier
 
 LOGGER = logging.getLogger("backtest.walk_forward")
@@ -105,6 +106,11 @@ class WalkForwardConfig:
     # Universe selection (per rebalance)
     signal_threshold: float = 0.40                 # min P(UP) to consider a long
     max_positions: int = 10
+    # Prob-scaled within-cohort weights (plan prob-scaled-tranche-weights_PLAN_20-07-26):
+    # OFF = validated equal-weight cohorts. ON = weight picks by normalized
+    # edge over the admission floor (src/trading/cohort_weights.py), capped at
+    # 2× equal weight. A/B-only until the acceptance gate passes.
+    use_prob_weights: bool = False
 
     # ── LIQUIDITY GATE (top-N ADV) ───────────────────────────────────────────
     # Restrict the daily candidate universe to the top-`liquid_top_n` names by
@@ -875,8 +881,17 @@ class WalkForwardEngine:
         # per_name divides the budget across the FULL cohort slot count. Under
         # regime sizing, a skipped/penalised name's share is NOT redistributed to
         # survivors — it stays as cash (smaller tranche on bad days = the
-        # DD-reducing behaviour). So the denominator stays `len(picks)`.
-        per_name = budget / len(picks)
+        # DD-reducing behaviour). So the denominator stays `len(picks)` — and the
+        # prob-weighted map below is likewise frozen over the full pick list.
+        if cfg.use_prob_weights:
+            _p_by_ticker = {tickers[j]: float(p_up[j]) for j in range(len(tickers))}
+            _floor = (cfg.admission_floor if cfg.admission_mode == "absolute_gate"
+                      else cfg.signal_threshold)
+            _fracs = prob_scaled_weights(
+                [_p_by_ticker.get(tk, 0.0) for tk in picks], _floor)
+            per_name_map = {tk: budget * f for tk, f in zip(picks, _fracs)}
+        else:
+            per_name_map = {tk: budget / len(picks) for tk in picks}
 
         positions: dict[str, dict] = {}
         for tk in picks:
@@ -888,14 +903,14 @@ class WalkForwardEngine:
             #   NO_TRADE {0,7} → skip (its per_name share stays cash);
             #   PENALTY  {1,6} → 0.5× notional (the freed half stays cash).
             # market_regime is absent on minimal panels → `.get` returns None → no-op.
-            notional = per_name
+            notional = per_name_map[tk]
             if cfg.use_regime_sizing:
                 regime = row.get("market_regime")
                 if regime is not None:
                     if regime in NO_TRADE_REGIMES:
                         continue
                     if regime in PENALTY_REGIMES:
-                        notional = per_name * REGIME_PENALTY_FACTOR
+                        notional = notional * REGIME_PENALTY_FACTOR
             qty = round_down_to_lot(int(notional / row["close"]), 100)
             if qty < 100:
                 continue
