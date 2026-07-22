@@ -2651,6 +2651,13 @@ def notify_regret_report() -> int:
     if not CONFIG.trading.cancelled_signal_tracking_enabled:
         LOGGER.info("[regret_report] cancelled_signal_tracking_enabled=False — skipped.")
         return 0
+    # Dispatch gate (22-07-26, user request): the CAPTURE keeps running (rows
+    # land in cancelled_signals for analysis), but the Telegram broadcast is
+    # off by default — data in DB only, no chat noise.
+    if not CONFIG.trading.regret_report_dispatch_enabled:
+        LOGGER.info("[regret_report] regret_report_dispatch_enabled=False — "
+                    "capture continues, Telegram dispatch skipped.")
+        return 0
     try:
         today = datetime.now().date()
         lookback_days = CONFIG.trading.regret_report_lookback_days

@@ -21,6 +21,22 @@ def test_notify_disabled_no_db_read(monkeypatch) -> None:
     assert reads == []                      # short-circuit before any DB read
 
 
+def test_notify_dispatch_gate_off_by_default_no_db_read(monkeypatch) -> None:
+    # 22-07-26 user request: capture keeps running (gated elsewhere), but the
+    # Telegram DISPATCH is off by default — data lands in DB only. The gate
+    # must short-circuit BEFORE any ledger read, and its default must be OFF.
+    reads: list = []
+    monkeypatch.setattr(main.CONFIG.trading, "cancelled_signal_tracking_enabled", True)
+    monkeypatch.setattr(main.CONFIG.trading, "regret_report_dispatch_enabled", False)
+    monkeypatch.setattr(main.signal_ledger, "list_cancelled_since",
+                        lambda *a, **k: reads.append(1) or [])
+    assert main.notify_regret_report() == 0
+    assert reads == []
+
+    from config.settings import TradingConfig
+    assert TradingConfig().regret_report_dispatch_enabled is False  # default OFF
+
+
 def test_notify_nothing_to_report_returns_zero(monkeypatch) -> None:
     constructed: list = []
 
@@ -32,6 +48,7 @@ def test_notify_nothing_to_report_returns_zero(monkeypatch) -> None:
             pass
 
     monkeypatch.setattr(main.CONFIG.trading, "cancelled_signal_tracking_enabled", True)
+    monkeypatch.setattr(main.CONFIG.trading, "regret_report_dispatch_enabled", True)
     monkeypatch.setattr(main.signal_ledger, "list_cancelled_since", lambda *a, **k: [])
     monkeypatch.setattr(main, "TelegramBot", _FakeBot)
     assert main.notify_regret_report() == 0
@@ -54,6 +71,7 @@ def test_notify_sends_combined_report(monkeypatch) -> None:
          "sessions_elapsed": 5, "sessions_remaining": 0},
     ]
     monkeypatch.setattr(main.CONFIG.trading, "cancelled_signal_tracking_enabled", True)
+    monkeypatch.setattr(main.CONFIG.trading, "regret_report_dispatch_enabled", True)
     monkeypatch.setattr(main.signal_ledger, "list_cancelled_since",
                         lambda *a, **k: cancelled_rows)
     # matured keyed off hold_days (30 → still tracking, 5 → matured).
@@ -76,5 +94,6 @@ def test_notify_never_raises_on_ledger_exception(monkeypatch) -> None:
         raise RuntimeError("ledger down")
 
     monkeypatch.setattr(main.CONFIG.trading, "cancelled_signal_tracking_enabled", True)
+    monkeypatch.setattr(main.CONFIG.trading, "regret_report_dispatch_enabled", True)
     monkeypatch.setattr(main.signal_ledger, "list_cancelled_since", _boom)
     assert main.notify_regret_report() == 0     # exception swallowed → 0

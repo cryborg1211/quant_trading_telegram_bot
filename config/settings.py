@@ -222,6 +222,14 @@ class TradingConfig:
     # DEDICATED knob, independently tunable from eod_position_report_lookback_days
     # (plan Decision 8), defaulting to the same 7 for day-one consistency.
     regret_report_lookback_days: int = 7
+    # Telegram DISPATCH of the regret report (22-07-26, user request): the
+    # cancelled-signal CAPTURE stays governed by
+    # cancelled_signal_tracking_enabled above (rows keep landing in
+    # cancelled_signals for analysis), but the "🔍 KIỂM CHỨNG TÍN HIỆU BỊ
+    # HUỶ" broadcast itself is noise the user doesn't want in chat — data
+    # in DB only. Default OFF. Re-enable: "regret_report_dispatch_enabled":
+    # true in settings.json + restart.
+    regret_report_dispatch_enabled: bool = False
     # July-2026 incident guards (BSR dispatched 4 consecutive days into a falling
     # knife; 8 of 13 July dispatches were one PVN energy/fertilizer complex).
     # (1) Open-cohort dedup: a ticker with ANY status='OPEN' dispatched_signals
