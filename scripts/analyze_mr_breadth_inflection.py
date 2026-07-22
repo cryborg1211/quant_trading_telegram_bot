@@ -51,6 +51,11 @@ MIN_RELIABLE_FIRES = 10  # below this, precision is too noisy to read
 BREADTH_WINDOW = 20  # matches src/trading/breadth.py's production default
 DELTA_WINDOW = 5  # "is breadth higher now than 5 sessions ago" — the inflection
 MIN_TICKERS_FOR_BREADTH = 30  # per-date reliability floor, matches breadth.py
+EXTENDED_HOLDOUT_DAYS = 1095  # ~3 years — the 365-day production holdout was
+# too thin (6 vs 8 fires) to confirm/deny the hypothesis independently. This
+# is STILL all historical parquet data already on disk — no new data needed,
+# just a wider out-of-training confirmation window than production's own
+# 1-year convention.
 
 
 def _breadth_time_series(ohlcv: pd.DataFrame) -> pd.DataFrame:
@@ -228,6 +233,56 @@ def main() -> None:
             "Low + Falling (predicted RISKY)": low_te & falling_te,
         },
         p_te, y_te,
+    )
+
+    # ── EXTENDED confirmatory check: ~3-year out-of-training window ────────
+    # Same historical parquets, no new data — just a wider carve-out than
+    # production's own 365-day holdout convention, specifically to get
+    # enough fires to actually read the hypothesis on unseen data. Cut
+    # points (lo_cut, delta_std) are the SAME train-derived values from
+    # above — reused unchanged, never peeked at this extended test slice.
+    max_d = pd.to_datetime(feat["date"]).max()
+    ext_cutoff = (max_d - pd.Timedelta(days=EXTENDED_HOLDOUT_DAYS)).date()
+    d_all = pd.to_datetime(feat["date"]).dt.date
+    ext_train = feat[d_all < ext_cutoff].reset_index(drop=True)
+    ext_test = feat[d_all >= ext_cutoff].reset_index(drop=True)
+    print(f"\n{'=' * 76}\nEXTENDED {EXTENDED_HOLDOUT_DAYS}-day (~3yr) out-of-training check "
+          f"| cutoff={ext_cutoff}\n{'=' * 76}")
+    print(f"  ext_train={len(ext_train)} rows (pos={100*ext_train['y'].mean():.3f}%)  "
+          f"ext_test={len(ext_test)} rows (pos={100*ext_test['y'].mean():.3f}%)")
+
+    ext_train = ext_train.sort_values(["date", "ticker"]).reset_index(drop=True)
+    x_ext_tr = X(ext_train)
+    y_ext_tr = ext_train["y"].to_numpy(np.int64)
+    ext_final = make_lgbm(_spw(y_ext_tr))
+    ext_final.fit(x_ext_tr, y_ext_tr)
+
+    x_ext_te = X(ext_test)
+    y_ext_te = ext_test["y"].to_numpy(np.int64)
+    p_ext_te = ext_final.predict_proba(x_ext_te)[:, 1]
+    breadth_ext_te = ext_test["breadth"].to_numpy()
+    delta_ext_te = ext_test["breadth_delta"].to_numpy()
+    low_ext_te = breadth_ext_te < lo_cut
+    rising_ext_te = delta_ext_te > (0.25 * delta_std)
+    falling_ext_te = delta_ext_te < (-0.25 * delta_std)
+    flat_ext_te = ~rising_ext_te & ~falling_ext_te
+
+    fire_ext_te = p_ext_te >= SHIPPED_TAU
+    n_ext_te = int(fire_ext_te.sum())
+    tp_ext_te = int((fire_ext_te & (y_ext_te == 1)).sum())
+    print(f"  extended-holdout overall: n={len(p_ext_te)}  fires={n_ext_te}  "
+          f"precision={(tp_ext_te / n_ext_te if n_ext_te else float('nan')):.3f}  "
+          f"recall={tp_ext_te / max(int(y_ext_te.sum()), 1):.3f}")
+
+    _print_bucket_table(
+        f"EXTENDED {EXTENDED_HOLDOUT_DAYS}-day HOLD-OUT: THE HYPOTHESIS "
+        f"(same train-derived cuts, never touched this slice)",
+        {
+            "Low + Rising (predicted SAFE)": low_ext_te & rising_ext_te,
+            "Low + Flat": low_ext_te & flat_ext_te,
+            "Low + Falling (predicted RISKY)": low_ext_te & falling_ext_te,
+        },
+        p_ext_te, y_ext_te,
     )
 
     print(f"\nDone. Overall OOF precision (informational, matches production "
