@@ -4,6 +4,8 @@
 **Complexity**: Simple
 **Status**: 🧪 TESTING — CODE DONE + VERIFIED (14-07-26, orchestrator-run evidence). Full suite: 653/653 green (independently re-confirmed via a full `pytest -q` run during UPDATE PROCESS, exit code 0, zero failures; 613 pre-existing + 40 new `tests/test_portfolio_guard.py`). `pytest --collect-only -q` clean (all `import main` files collect, zero circular-import breakage). Live-DB read-only dry run completed against `data/quant_v6_core.duckdb` (no write paths invoked by construction — only `load_guard_positions`/`closes_between`/`evaluate_position` were exercised; empirical before/after row-count DB diff was not run); price-normalization confirmed correct on real rows (entries `27.5`/`152.5` → `27,500`/`152,500` VND). Per this repo's plan-artifact convention (CODE DONE ≠ VERIFIED, see `intraday-attack-scanner_PLAN_06-07-26.md`'s Gate 5), this plan stays **ACTIVE** — archival is gated on confirming the first real production EOD run at the 15:30 ICT cron (same Gate-5-style precedent as the intraday scanner), not yet observed.
 
+**Manual verification (20-07-26, 00:06 ICT):** a live `python main.py --task full_pipeline` run (operator-triggered, not the scheduled cron) fired the guard for real — `[TelegramBot] Alert sent → 1818282405 for portfolio_guard` in `logs/quant_v6.log`. Confirms the wiring end-to-end against the real DB/holdings on a real trading day. Does **not** satisfy the plan's own stated gate (the specific 15:30 ICT scheduled cron invocation) — stays ACTIVE pending that.
+
 ## Execution Progress (13-07-26)
 
 - [x] 1. `src/trading/portfolio_guard.py` created — HARD CONTRACT + PURITY LAYERING docstring, "MUST NEVER import main" stated, exact imports per plan.

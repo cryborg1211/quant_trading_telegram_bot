@@ -1,6 +1,6 @@
 # Quant Engine V4.0 - All Tests
 
-Last updated: 2026-07-14
+Last updated: 2026-07-22
 
 Attach this file first when the task involves testing, verification, or test debugging.
 
@@ -50,7 +50,7 @@ Use this file when you need to:
 
 ### Use `pytest` for everything
 
-- All 653 tests run through pytest
+- All 895 tests run through pytest
 - `pytest -q` for quick output (default via `pytest.ini`)
 - No separate test runners, no browser tests, no e2e framework
 - Tests use in-memory DuckDB and stubs — no external services needed
@@ -67,7 +67,7 @@ Unless the task clearly needs a different path:
 
 | Scope | Command | Notes |
 |---|---|---|
-| Full suite | `pytest -q` | 653 tests, all in-memory |
+| Full suite | `pytest -q` | 895 tests, all in-memory |
 | Single file | `pytest -q tests/test_<name>.py` | targeted verification |
 | Single test | `pytest -q tests/test_<name>.py::test_<func>` | surgical |
 | Verbose | `pytest -v` | full test names + pass/fail |
@@ -94,11 +94,17 @@ Unless the task clearly needs a different path:
 | `test_foreign_flow_crawler.py` | SSI iBoard bulk snapshot crawler | 8 tests | added 05-07-26; also the shared `_fetch_ssi_hose_snapshot` retry logic reused by the intraday scanner |
 | `test_intraday_scanner.py` | intraday attack scanner (pure functions + degrade paths) | 40 tests | added 06-07-26; monitoring-only, no live HTTP, no paperlog/parquet writes in any test |
 | `test_portfolio_guard.py` | EOD alert-only guard: triggers, price-scale normalization, card rendering, orchestration | 40 tests | added 13-07-26; pure-function tests need no DB/stubs, loader+orchestration tests use in-memory DuckDB |
-| `conftest.py` (tests/) | shared fixtures | fixture definitions | in-memory DuckDB, sample data |
+| `test_dispatch_guards.py` | open-cohort dedup + sector cap + hysteresis in `_select_candidates` | 25 tests | added 20-07-26; July-2026 loss guards |
+| `test_candidate_hysteresis.py` | `candidate_qualify_streak` DuckDB table (own-connection, mirrors signal_ledger) | 10 tests | added 20-07-26; isolated tmp-path DB, never touches real DB |
+| `test_breadth.py` | market breadth: exposure scalar, time series, knife-catch inflection | 37 tests | added 20-07-26, extended 22-07-26 |
+| `test_promote_gate.py` | weekly-retrain promote/reject decision + `_persist_bot_payload` isolation | 13 tests | added 20-07-26; all filesystem-isolated via `chdir(tmp_path)`, never touches real `models/saved/` |
+| `test_rank_breadth_admission.py` | `admission_mode="rank_breadth"` — breadth-conditioned K, no absolute floor | 9 tests | added 22-07-26; A/B REJECTED but code+tests kept in-tree |
+| `test_mr_breadth_context.py` / `test_mr_score_breadth_wiring.py` | breadth-inflection annotation on the MR knife-catch display | 18 tests | added 22-07-26; display-only, never gates the fire decision |
+| `conftest.py` (tests/) | shared fixtures + global autouse guard defaulting new risky DB-touching config knobs OFF | fixture definitions | in-memory DuckDB, sample data; `_hysteresis_off_by_default` added 20-07-26 |
 
-**Note (06-07-26; count corrected 14-07-26):** this table covers the historically-significant/hub-adjacent
+**Note (06-07-26; count corrected 22-07-26):** this table covers the historically-significant/hub-adjacent
 test files and is not a complete 1:1 listing of every file under `tests/`
-(currently 50 files, 653 tests total — see `pytest --collect-only -q` for the
+(currently 72 files, 895 tests total — see `pytest --collect-only -q` for the
 exhaustive list). A full test-file-map refresh is recommended via
 `vc-audit-context` if this table's staleness becomes a recurring friction
 point.

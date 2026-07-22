@@ -4,6 +4,8 @@
 **Complexity**: COMPLEX (standard complex — one execution stream, ~6 files, achievable in one EXECUTE session; NOT a phase program)
 **Status**: 🔨 CODE DONE (all 6 phases implemented, full suite 703/703 green 16-07-26; stays ACTIVE — NOT ✅ VERIFIED — until the live 15:30 ICT cron gate in item 26 is observed)
 
+**Manual verification (20-07-26, 00:06 ICT):** first-ever live delivery. An operator-triggered `python main.py --task full_pipeline` run (not the scheduled cron) dispatched the position report to both chats — `[position_report] sent: 9 open + 4 closed-today row(s)` in `logs/quant_v6.log`. Confirms the ledger→report→send path works end-to-end against real data. Item 26's specific gate (the scheduled 15:30 ICT cron) is still unobserved — stays ACTIVE.
+
 ## Overview
 
 Add a daily EOD Telegram report that lists **every signal the user actually received** — both the

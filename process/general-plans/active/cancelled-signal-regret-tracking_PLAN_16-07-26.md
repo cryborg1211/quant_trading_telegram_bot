@@ -3,11 +3,17 @@
 **Date**: 16-07-26
 **Complexity**: COMPLEX (standard complex — one execution stream, ~7 files touched, achievable in one
 EXECUTE session; NOT a phase program)
-**Status**: 🔨 CODE DONE (code shipped uncommitted in this worktree; stale ⏳ PLANNED field corrected
+**Status**: 🔨 CODE DONE (code shipped, since committed — see `bfdb9aa` 20-07-26; stale ⏳ PLANNED field corrected
 17-07-26 during the auto-ca-price-adjustment follow-up. Retains its own pending live-cron confirmation
 gate — not yet ✅ VERIFIED. NOTE: the corporate-action "detect-and-hide" half of this plan has since been
 SUPERSEDED by auto-ca-price-adjustment_PLAN_17-07-26.md, which replaced the warning-line behavior with
 automatic PnL adjustment.)
+
+**Manual verification (20-07-26, 00:06 ICT):** an operator-triggered `python main.py --task full_pipeline`
+run (not the scheduled cron) fired the regret report for real —
+`[regret_report] sent: 12 cancelled signal(s) in window.` in `logs/quant_v6.log`, delivered to both chats.
+Confirms the capture→report→send path end-to-end. The scheduled 15:30 ICT cron gate is still unobserved —
+stays ACTIVE.
 
 ## Overview
 
