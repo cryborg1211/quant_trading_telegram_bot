@@ -11,10 +11,13 @@ from unittest.mock import patch
 import polars as pl
 import pytest
 
+import pandas as pd
+
 from src.trading.breadth import (
     breadth_delta_from_panel,
     breadth_from_panel,
     breadth_scalar,
+    breadth_time_series,
     live_breadth_inflection,
 )
 
@@ -219,3 +222,61 @@ def test_live_breadth_inflection_none_on_insufficient_data():
 def test_live_breadth_inflection_fails_open_on_exception():
     with patch("src.backtest.pipeline.load_ohlcv", side_effect=RuntimeError("no parquet")):
         assert live_breadth_inflection() is None  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# breadth_time_series (22-07-26, feeds rank_breadth admission in walk_forward)
+# ---------------------------------------------------------------------------
+
+
+def test_breadth_time_series_empty_panel_returns_empty_series():
+    result = breadth_time_series(pl.DataFrame({"ticker": [], "date": [], "close": []}))
+    assert isinstance(result, pd.Series)
+    assert result.empty
+
+
+def test_breadth_time_series_index_is_datetime64():
+    panel = _rising_panel()
+    result = breadth_time_series(panel, window=5, min_tickers=20)
+    assert not result.empty
+    assert pd.api.types.is_datetime64_any_dtype(result.index)
+
+
+def test_breadth_time_series_last_value_matches_breadth_from_panel():
+    # Cross-check: the two functions compute the SAME math (breadth_from_panel
+    # for a single snapshot, breadth_time_series for the whole history) — they
+    # must agree at the panel's own latest date.
+    panel = _rising_panel()
+    series = breadth_time_series(panel, window=5, min_tickers=20)
+    snapshot = breadth_from_panel(panel, window=5, min_tickers=20)
+    assert series.iloc[-1] == pytest.approx(snapshot)
+
+
+def test_breadth_time_series_rises_across_the_jump():
+    # _rising_panel: flat until day26, then +5% for every ticker. A date
+    # BEFORE the jump has breadth=0.0 (trailing window entirely flat); a date
+    # comfortably AFTER has breadth=1.0 (every ticker's window captured it).
+    panel = _rising_panel(n_tickers=30, n_days=30, jump_day=26)
+    series = breadth_time_series(panel, window=5, min_tickers=20)
+    before = pd.Timestamp("2026-01-24")   # day23 (0-idx) — window ends before jump
+    after = series.index.max()            # day29 (0-idx) — window captures the jump
+    assert series.loc[before] == pytest.approx(0.0)
+    assert series.loc[after] == pytest.approx(1.0)
+
+
+def test_breadth_time_series_drops_dates_below_min_tickers():
+    data = {f"T{i}": [100.0] * 30 for i in range(10)}  # only 10 tickers
+    rows = [
+        {"ticker": t, "date": f"2026-01-{d+1:02d}", "close": c}
+        for t, closes in data.items()
+        for d, c in enumerate(closes)
+    ]
+    panel = pl.DataFrame(rows)
+    result = breadth_time_series(panel, window=5, min_tickers=30)
+    assert result.empty  # every date has only 10 valid readings, below the floor
+
+
+def test_breadth_time_series_zero_window_returns_empty():
+    panel = _rising_panel()
+    result = breadth_time_series(panel, window=0)
+    assert result.empty

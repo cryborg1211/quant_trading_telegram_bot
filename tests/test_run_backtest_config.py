@@ -66,6 +66,24 @@ class TestBuildWfConfig:
         wf = _build_wf_config(FEATURES, CUTOFF, _cfg())
         assert wf.use_regime_sizing is False
 
+    def test_rank_breadth_knobs_propagate(self) -> None:
+        wf = _build_wf_config(FEATURES, CUTOFF, _cfg(),
+                              admission_mode="rank_breadth",
+                              rank_breadth_trigger=0.35,
+                              rank_breadth_floor_level=0.20,
+                              rank_breadth_floor=0.6)
+        assert wf.admission_mode == "rank_breadth"
+        assert wf.rank_breadth_trigger == 0.35
+        assert wf.rank_breadth_floor_level == 0.20
+        assert wf.rank_breadth_floor == 0.6
+
+    def test_rank_breadth_knobs_default(self) -> None:
+        wf = _build_wf_config(FEATURES, CUTOFF, _cfg())
+        assert wf.admission_mode == "cross_sectional"
+        assert wf.rank_breadth_trigger == 0.40
+        assert wf.rank_breadth_floor_level == 0.25
+        assert wf.rank_breadth_floor == 0.5
+
     def test_price_unit_default_untouched(self) -> None:
         # The thousand-VND scaling must stay active regardless of mode.
         for mode in ("tranche", "grid"):

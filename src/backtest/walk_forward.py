@@ -79,6 +79,7 @@ from src.trading.regime_policy import (
     PENALTY_REGIMES,
     REGIME_PENALTY_FACTOR,
 )
+from src.trading.breadth import breadth_scalar
 from src.trading.cohort_weights import prob_scaled_weights
 from src.trading.risk_tier import apply_nav_tier_cap, classify_risk_tier
 
@@ -207,9 +208,24 @@ class WalkForwardConfig:
     #       zero-candidate-day fall-to-cash economics (NOT its Vietnamese-text
     #       monitoring card, a display-layer concern out of scope here).
     # Default "cross_sectional" ⇒ existing `_tranche_day` admission byte-for-byte.
+    #   "rank_breadth"    → (22-07-26) NO absolute floor at all — always take
+    #       the best-ranked K names available. K = round(max_positions ×
+    #       breadth_scalar(today's market breadth)) via the SAME piecewise-
+    #       linear mapping already used for the exposure brake
+    #       (src/trading/breadth.py). K=0 on a breadth-famine day (cash, same
+    #       diagnostic as absolute_gate's zero-candidate days); K=max_positions
+    #       once breadth clears `rank_breadth_trigger`. Attacks both known
+    #       admission failure modes at once: absolute_gate's hard zero-outs on
+    #       days the market still has relatively-better names, AND
+    #       cross_sectional's chronic over-admission regardless of how thin
+    #       the whole tape is.
     admission_mode: str = "cross_sectional"
     admission_floor: float = 0.45
     admission_pool_cap: int = 6
+    rank_breadth_window: int = 20
+    rank_breadth_trigger: float = 0.40
+    rank_breadth_floor_level: float = 0.25
+    rank_breadth_floor: float = 0.5
 
     # OOS gate: only place trades on/after this date.  Days before it are still
     # iterated (NAV marked, corporate actions applied, features/cov built from
@@ -338,11 +354,18 @@ class WalkForwardEngine:
         corporate_actions: Sequence[CorporateActionEvent] | None = None,
         p_bull_series: pd.Series | None = None,
         inference_cache: dict[date, tuple[np.ndarray, list[str]]] | None = None,
+        breadth_series: pd.Series | None = None,
     ) -> WalkForwardResult:
         """
         `p_bull_series` — date-indexed HMM P(Bull) (leak-free filtered). Each
         rebalance scales target weights by that day's P(Bull). When None, the
         engine uses 1.0 (full exposure, no soft scaling).
+
+        `breadth_series` — date-indexed market breadth (see
+        `src.trading.breadth.breadth_time_series`), consumed ONLY by
+        `admission_mode="rank_breadth"`. When None (or a date is missing),
+        the engine assumes breadth=1.0 (fail-open — full K, matching every
+        other brake's fail-open contract in this codebase).
 
         `inference_cache` — optional ``{D: (p_up, tickers)}`` map, MUTATED in
         place.  The per-day oracle scoring (`_inference`) depends only on
@@ -362,6 +385,15 @@ class WalkForwardEngine:
             self._p_bull = {
                 pd.Timestamp(d).date(): float(v)
                 for d, v in p_bull_series.dropna().items()
+            }
+
+        # date → market breadth lookup; default 1.0 (fail-open, full K) when
+        # absent — see `admission_mode="rank_breadth"` in `_tranche_day`.
+        self._breadth: dict[date, float] = {}
+        if breadth_series is not None:
+            self._breadth = {
+                pd.Timestamp(d).date(): float(v)
+                for d, v in breadth_series.dropna().items()
             }
 
         self.cash = self.config.initial_capital
@@ -856,6 +888,20 @@ class WalkForwardEngine:
                 self._zero_candidate_days += 1
                 return n_orders, n_fills, n_rej
             picks = survivors[:cfg.max_positions]
+        elif cfg.admission_mode == "rank_breadth":
+            # NO absolute P(UP) floor at all — always take the best-ranked
+            # names available. Only the COUNT (K) responds to market breadth,
+            # via the SAME piecewise-linear scalar the exposure brake uses.
+            today_breadth = float(self._breadth.get(D, 1.0))  # fail-open
+            k_scalar = breadth_scalar(
+                today_breadth, cfg.rank_breadth_trigger,
+                cfg.rank_breadth_floor_level, cfg.rank_breadth_floor,
+            )
+            k = round(cfg.max_positions * k_scalar)
+            if k <= 0:
+                self._zero_candidate_days += 1
+                return n_orders, n_fills, n_rej
+            picks = [tickers[j] for j in order_idx][:k]
         else:
             # "cross_sectional" — UNCHANGED default: top-N above the relative
             # `signal_threshold` floor (byte-for-byte the pre-A/B admission).

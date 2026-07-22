@@ -61,6 +61,7 @@ from src.models.tabular_ensemble import TabularEnsemble, make_ensemble_oracle
 from src.models.macro_risk_hmm import build_market_proxy_returns, build_regime_observation
 from src.backtest.walk_forward import WalkForwardEngine, WalkForwardConfig
 from src.portfolio.construction import PortfolioConstraints
+from src.trading.breadth import breadth_time_series
 from src.execution.vn_cost_model import ExecutionConfig
 from src.models.statistical_gates import deflated_sharpe, cscv_pbo
 
@@ -84,7 +85,10 @@ def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
                      admission_mode: str = "cross_sectional",
                      admission_floor: float = 0.45,
                      admission_pool_cap: int = 6,
-                     use_prob_weights: bool = False) -> WalkForwardConfig:
+                     use_prob_weights: bool = False,
+                     rank_breadth_trigger: float = 0.40,
+                     rank_breadth_floor_level: float = 0.25,
+                     rank_breadth_floor: float = 0.5) -> WalkForwardConfig:
     """Pure WalkForwardConfig builder — extracted from `run_oos` so the
     mode/hold-days plumbing is unit-testable without running the engine.
 
@@ -110,6 +114,9 @@ def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
         admission_floor=admission_floor,
         admission_pool_cap=admission_pool_cap,
         use_prob_weights=use_prob_weights,
+        rank_breadth_trigger=rank_breadth_trigger,
+        rank_breadth_floor_level=rank_breadth_floor_level,
+        rank_breadth_floor=rank_breadth_floor,
         constraints=PortfolioConstraints(
             max_weight=cfg.max_weight, long_only=True,
             target_leverage=0.95, target_vol=cfg.target_vol),
@@ -129,7 +136,11 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
             admission_mode: str = "cross_sectional",
             admission_floor: float = 0.45,
             admission_pool_cap: int = 6,
-            use_prob_weights: bool = False) -> pd.DataFrame:
+            use_prob_weights: bool = False,
+            breadth_series: pd.Series | None = None,
+            rank_breadth_trigger: float = 0.40,
+            rank_breadth_floor_level: float = 0.25,
+            rank_breadth_floor: float = 0.5) -> pd.DataFrame:
     """Walk-forward OOS using the pure-tabular ensemble oracle.
 
     The engine builds (n, 1, F) single-bar tensors internally (seq_len=1) and the
@@ -154,11 +165,13 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
     wf_cfg = _build_wf_config(tabular_features, cutoff, cfg, mode, hold_days,
                               pt_sigma, sl_sigma, use_regime_sizing,
                               use_nav_tier_cap, admission_mode, admission_floor,
-                              admission_pool_cap, use_prob_weights)
+                              admission_pool_cap, use_prob_weights,
+                              rank_breadth_trigger, rank_breadth_floor_level,
+                              rank_breadth_floor)
     eng = WalkForwardEngine(wf_cfg, oracle)
     # Soft HMM regime scaling: P(Bull) multiplies the daily target weights.
     result = eng.run(sub, corporate_actions=corporate_actions, p_bull_series=p_bull_series,
-                     inference_cache=inference_cache)
+                     inference_cache=inference_cache, breadth_series=breadth_series)
     eq = result.equity_curve
     eq = eq[pd.to_datetime(eq["date"]).dt.date >= cutoff].reset_index(drop=True)
     # Surface the serve-mirror admission diagnostic to in-process callers (the
@@ -325,7 +338,10 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
          admission_mode: str = "cross_sectional",
          admission_floor: float = 0.45,
          admission_pool_cap: int = 6,
-         use_prob_weights: bool = False) -> None:
+         use_prob_weights: bool = False,
+         rank_breadth_trigger: float = 0.40,
+         rank_breadth_floor_level: float = 0.25,
+         rank_breadth_floor: float = 0.5) -> None:
     configure_logging()
     t_start = time.perf_counter()
     sweep_thresholds = list(sweep_thresholds or DEFAULT_SWEEP_THRESHOLDS)
@@ -389,6 +405,22 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
             LOGGER.warning("P(Bull) recompute failed (%s) — full exposure (no scaling).", exc)
             p_bull_series = None
 
+    # Market-wide breadth time series — only consumed by
+    # admission_mode="rank_breadth" (22-07-26); cheap to always compute so a
+    # sweep can freely mix admission modes across thresholds without refetching.
+    breadth_series = None
+    if admission_mode == "rank_breadth":
+        try:
+            breadth_series = breadth_time_series(ds.panel)
+            oos_breadth = breadth_series[breadth_series.index >= pd.Timestamp(cutoff)]
+            LOGGER.info("Breadth | OOS mean=%.3f  min=%.3f  max=%.3f",
+                        float(oos_breadth.mean()), float(oos_breadth.min()),
+                        float(oos_breadth.max()))
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Breadth series computation failed (%s) — rank_breadth "
+                           "admission will fail-open to full K every day.", exc)
+            breadth_series = None
+
     # ── 3. THRESHOLD SWEEP (the cheap goal-seeker) ───────────────────────────
     test_mask = ds.aligned.dates >= cutoff
     Xte_all = ds.aligned.X[test_mask]
@@ -421,7 +453,11 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
                                  admission_mode=admission_mode,
                                  admission_floor=admission_floor,
                                  admission_pool_cap=admission_pool_cap,
-                                 use_prob_weights=use_prob_weights)
+                                 use_prob_weights=use_prob_weights,
+                                 breadth_series=breadth_series,
+                                 rank_breadth_trigger=rank_breadth_trigger,
+                                 rank_breadth_floor_level=rank_breadth_floor_level,
+                                 rank_breadth_floor=rank_breadth_floor)
                     m = equity_metrics(eq, cfg.initial_capital)
                     # Inline UP-precision @thr (no log spam)
                     if len(Xte_all) > 0:
@@ -886,18 +922,30 @@ def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
     p.add_argument("--nav-tier-cap", action="store_true", default=False,
                    help="enable the discrete 20/60/80%% NAV portfolio deployment cap "
                         "(src/trading/risk_tier.py; A/B experiment — default off)")
-    p.add_argument("--admission-mode", choices=("cross_sectional", "absolute_gate"),
+    p.add_argument("--admission-mode",
+                   choices=("cross_sectional", "absolute_gate", "rank_breadth"),
                    default="cross_sectional",
                    help="tranche admission rule: 'cross_sectional' = top-N above "
                         "signal_threshold (default, unchanged); 'absolute_gate' = mirror "
                         "serve's meta-gate (p_up >= --admission-floor first, cap the pool "
-                        "at --admission-pool-cap, then top-N; A/B experiment — default off)")
+                        "at --admission-pool-cap, then top-N; A/B experiment — default off); "
+                        "'rank_breadth' = NO absolute floor, always take the top-K ranked "
+                        "names where K scales with market breadth (22-07-26 A/B — default off)")
     p.add_argument("--admission-floor", type=float, default=0.45,
                    help="absolute P(UP) floor for --admission-mode absolute_gate "
                         "(inclusive >=, mirrors serve's up_threshold; default 0.45)")
     p.add_argument("--admission-pool-cap", type=int, default=6,
                    help="survivor-pool cap before the top-N slice under absolute_gate "
                         "(mirrors serve's _ARBITRATOR_POOL; default 6)")
+    p.add_argument("--rank-breadth-trigger", type=float, default=0.40,
+                   help="--admission-mode rank_breadth: breadth >= this -> full K "
+                        "(default 0.40, matches the exposure brake's own default)")
+    p.add_argument("--rank-breadth-floor-level", type=float, default=0.25,
+                   help="--admission-mode rank_breadth: breadth <= this -> floor K "
+                        "(default 0.25)")
+    p.add_argument("--rank-breadth-floor", type=float, default=0.5,
+                   help="--admission-mode rank_breadth: minimum K fraction of "
+                        "max_positions at/below the floor level (default 0.5)")
     p.add_argument("--liquid-top-n", type=int, default=None, help="VN50 ADV gate (default 50)")
     p.add_argument("--max-positions", type=int, default=None)
     p.add_argument("--rebalance-frequency", type=int, default=None)
@@ -932,16 +980,19 @@ def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
     return (a.checkpoint, overrides, sweep, (not a.no_save), a.export_only,
             a.mode, a.hold_days, a.tranche_pt, a.tranche_sl, a.regime_sizing,
             a.nav_tier_cap, a.admission_mode, a.admission_floor,
-            a.admission_pool_cap, a.prob_weights)
+            a.admission_pool_cap, a.prob_weights, a.rank_breadth_trigger,
+            a.rank_breadth_floor_level, a.rank_breadth_floor)
 
 
 if __name__ == "__main__":
     (_ckpt, _overrides, _sweep, _save, _export,
      _mode, _hold, _pt, _sl, _regime, _tier_cap,
-     _adm_mode, _adm_floor, _adm_cap, _prob_w) = _cli()
+     _adm_mode, _adm_floor, _adm_cap, _prob_w,
+     _rb_trigger, _rb_floor_level, _rb_floor) = _cli()
     main(_ckpt, eval_overrides=_overrides, sweep_thresholds=_sweep,
          save_bot_payload=_save, export_only=_export, mode=_mode, hold_days=_hold,
          pt_sigma=_pt, sl_sigma=_sl, use_regime_sizing=_regime,
          use_nav_tier_cap=_tier_cap, admission_mode=_adm_mode,
          admission_floor=_adm_floor, admission_pool_cap=_adm_cap,
-         use_prob_weights=_prob_w)
+         use_prob_weights=_prob_w, rank_breadth_trigger=_rb_trigger,
+         rank_breadth_floor_level=_rb_floor_level, rank_breadth_floor=_rb_floor)

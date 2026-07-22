@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 
+import pandas as pd
 import polars as pl
 
 LOGGER = logging.getLogger(__name__)
@@ -53,6 +54,49 @@ def breadth_from_panel(
     if total < min_tickers:
         return None
     return positives / total
+
+
+def breadth_time_series(
+    panel: pl.DataFrame,
+    window: int = 20,
+    min_tickers: int = 30,
+) -> pd.Series:
+    """Market-wide breadth for EVERY date in `panel` (not just the latest).
+
+    Vectorized single polars pass: per-(ticker, date) trailing `window`-
+    session return, then per-date fraction positive. Dates with fewer than
+    `min_tickers` valid readings are dropped (same reliability floor as
+    `breadth_from_panel`). Returns a date-indexed pandas Series — the same
+    shape as `macro_risk_hmm.p_bull_series`, for a drop-in
+    `WalkForwardEngine.run(breadth_series=...)` argument (rank_breadth
+    admission mode, 22-07-26).
+    """
+    if panel is None or panel.is_empty() or window <= 0:
+        return pd.Series(dtype=float)
+    lf = panel.lazy().sort(["ticker", "date"])
+    lf = lf.with_columns(
+        (pl.col("close") / pl.col("close").shift(window).over("ticker") - 1.0)
+        .alias("_ret_w")
+    )
+    per_date = (
+        lf.group_by("date")
+        .agg([
+            (pl.col("_ret_w") > 0).sum().alias("_pos"),
+            pl.col("_ret_w").is_not_null().sum().alias("_valid"),
+        ])
+        .sort("date")
+        .collect()
+    )
+    per_date = per_date.filter(pl.col("_valid") >= min_tickers)
+    per_date = per_date.with_columns(
+        (pl.col("_pos") / pl.col("_valid")).alias("breadth")
+    )
+    result = per_date.select(["date", "breadth"]).to_pandas()
+    # Explicit datetime64 index (regardless of polars' default pl.Date ->
+    # pandas conversion) so callers can safely compare against pd.Timestamp,
+    # matching macro_risk_hmm.p_bull_series's index contract exactly.
+    result["date"] = pd.to_datetime(result["date"])
+    return result.set_index("date")["breadth"]
 
 
 def breadth_scalar(
