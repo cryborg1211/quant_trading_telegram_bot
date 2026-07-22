@@ -15,7 +15,11 @@ already matured.
 """
 from __future__ import annotations
 
+import logging
+
 import polars as pl
+
+LOGGER = logging.getLogger(__name__)
 
 
 def breadth_from_panel(
@@ -71,3 +75,69 @@ def breadth_scalar(
         return floor
     frac = (trigger - breadth) / (trigger - floor_level)
     return 1.0 - frac * (1.0 - floor)
+
+
+def breadth_delta_from_panel(
+    panel: pl.DataFrame,
+    window: int = 20,
+    delta_window: int = 5,
+    min_tickers: int = 30,
+) -> tuple[float, float] | None:
+    """(breadth_now, breadth_delta) as of the panel's latest date.
+
+    `breadth_delta` = breadth_now minus breadth as of `delta_window` sessions
+    earlier — the "inflection" from the 22-07-26 knife-catch research
+    (scripts/analyze_mr_breadth_inflection.py): positive = breadth turning
+    UP. Reuses `breadth_from_panel` on two date-truncated slices of the SAME
+    panel — no new math, no lookahead (both endpoints strictly ≤ their own
+    date). Returns None if either endpoint lacks enough history/tickers.
+    """
+    if panel is None or panel.is_empty():
+        return None
+    dates = panel.select("date").unique().sort("date")["date"].to_list()
+    if len(dates) <= delta_window:
+        return None
+    now_breadth = breadth_from_panel(panel, window=window, min_tickers=min_tickers)
+    if now_breadth is None:
+        return None
+    earlier_cutoff = dates[-1 - delta_window]
+    earlier_panel = panel.filter(pl.col("date") <= earlier_cutoff)
+    earlier_breadth = breadth_from_panel(earlier_panel, window=window, min_tickers=min_tickers)
+    if earlier_breadth is None:
+        return None
+    return now_breadth, now_breadth - earlier_breadth
+
+
+def live_breadth_inflection(
+    window: int = 20,
+    delta_window: int = 5,
+    low_cut: float = 0.41,
+    rising_threshold: float = 0.03,
+) -> dict | None:
+    """Live {breadth, breadth_delta, favorable} for today. Fail-open → None.
+
+    `favorable` = the "Low breadth + Rising delta" bucket from the
+    22-07-26 knife-catch research: OOF precision 0.667 (n=63 fires) vs 0.542
+    for Low+Falling (n=264) on a large purged-OOF sample — a REAL but
+    UNCONFIRMED gap (the strict 1-year hold-out was too thin, 6 vs 8 fires,
+    to independently verify; direction agreed but wasn't statistically
+    meaningful at that n). Informational only — this NEVER gates a trade or
+    changes the MR-LGBM fire decision; it only annotates the existing
+    knife-catch display so a human can weigh current breadth context. Any
+    failure (missing OHLCV, insufficient history) returns None and the
+    caller must degrade to "context unavailable", never block on it.
+    """
+    try:
+        from src.backtest.pipeline import RunConfig, load_ohlcv  # noqa: PLC0415
+
+        panel = load_ohlcv(RunConfig())
+        result = breadth_delta_from_panel(panel, window=window, delta_window=delta_window)
+        if result is None:
+            return None
+        breadth, delta = result
+        favorable = breadth < low_cut and delta > rising_threshold
+        return {"breadth": breadth, "breadth_delta": delta, "favorable": favorable}
+    except Exception:  # noqa: BLE001 — fail-open, never break the caller
+        LOGGER.warning("[breadth-inflection] live computation failed — "
+                       "context unavailable", exc_info=True)
+        return None

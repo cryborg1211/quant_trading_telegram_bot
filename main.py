@@ -40,7 +40,7 @@ from src.models.quant_agent_arbitrator import (
     scrape_centralized_news,
 )
 from src.trading.portfolio_manager import PortfolioManager
-from src.trading import candidate_hysteresis, sector_map, signal_ledger
+from src.trading import breadth, candidate_hysteresis, sector_map, signal_ledger
 from src.trading.cohort_weights import prob_scaled_weights
 from src.trading import portfolio_guard
 from src.trading.risk_tier import classify_risk_tier
@@ -278,11 +278,24 @@ def mr_score_tickers(tickers: list[str]) -> dict[str, dict[str, Any]]:
         return {}
 
     out: dict[str, dict[str, Any]] = {}
+    any_fired = bool((proba >= tau).any())
+    # Breadth-inflection context (22-07-26, informational only — see
+    # src/trading/breadth.py docstring): only computed when at least one
+    # name actually fired, since it's only ever displayed alongside a fire.
+    _breadth_ctx = None
+    if any_fired and CONFIG.trading.mr_breadth_context_enabled:
+        _breadth_ctx = breadth.live_breadth_inflection(
+            window=CONFIG.trading.mr_breadth_context_window,
+            delta_window=CONFIG.trading.mr_breadth_context_delta_window,
+            low_cut=CONFIG.trading.mr_breadth_context_low_cut,
+            rising_threshold=CONFIG.trading.mr_breadth_context_rising_threshold,
+        )
     for tk, p in zip(latest["ticker"].astype(str), proba, strict=False):
         out[tk.upper()] = {
             "prob": float(p),
             "fired": bool(p >= tau),
             "tau": float(tau),
+            "breadth_favorable": _breadth_ctx["favorable"] if _breadth_ctx else None,
         }
     return out
 

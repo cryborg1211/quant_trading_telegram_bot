@@ -6,10 +6,17 @@ garch_brake.drift_scalar_from_returns.
 """
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import polars as pl
 import pytest
 
-from src.trading.breadth import breadth_from_panel, breadth_scalar
+from src.trading.breadth import (
+    breadth_delta_from_panel,
+    breadth_from_panel,
+    breadth_scalar,
+    live_breadth_inflection,
+)
 
 
 def _panel(tickers_closes: dict[str, list[float]]) -> pl.DataFrame:
@@ -102,3 +109,113 @@ def test_july_shape_lands_mid_ramp():
 def test_degenerate_knobs_fail_open():
     assert breadth_scalar(0.10, trigger=0.25, floor_level=0.40, floor=0.5) == 1.0  # inverted
     assert breadth_scalar(0.10, trigger=0.40, floor_level=0.25, floor=0.0) == 1.0  # bad floor
+
+
+# ---------------------------------------------------------------------------
+# breadth_delta_from_panel (22-07-26, knife-catch inflection annotation)
+# ---------------------------------------------------------------------------
+
+
+def _rising_panel(n_tickers: int = 30, n_days: int = 30, jump_day: int = 26) -> pl.DataFrame:
+    """Breadth genuinely rises from 'earlier' to 'now' (window=delta_window=5).
+
+    All tickers flat until `jump_day` (26), then +5%. With the "now" window
+    ending at day29 comparing back to day24, the jump falls INSIDE that
+    window (24 < 26 <= 29) -> every ticker shows a positive trailing return
+    -> now_breadth=1.0. The "earlier" window ends at day24 comparing back to
+    day19, entirely BEFORE the jump (19 < 24 < 26) -> earlier_breadth=0.0.
+    """
+    rows = []
+    for i in range(n_tickers):
+        for d in range(n_days):
+            close = 100.0 if d < jump_day else 105.0
+            rows.append({"ticker": f"T{i}", "date": f"2026-01-{d+1:02d}", "close": close})
+    return pl.DataFrame(rows)
+
+
+def test_breadth_delta_detects_rising():
+    panel = _rising_panel()
+    result = breadth_delta_from_panel(panel, window=5, delta_window=5, min_tickers=20)
+    assert result is not None
+    now, delta = result
+    assert delta > 0  # breadth higher now than 5 sessions ago
+
+
+def test_breadth_delta_flat_series_is_zero():
+    data = {f"T{i}": [100.0] * 30 for i in range(30)}
+    rows = [
+        {"ticker": t, "date": f"2026-01-{d+1:02d}", "close": c}
+        for t, closes in data.items()
+        for d, c in enumerate(closes)
+    ]
+    panel = pl.DataFrame(rows)
+    result = breadth_delta_from_panel(panel, window=5, delta_window=5, min_tickers=20)
+    assert result is not None
+    now, delta = result
+    assert delta == pytest.approx(0.0)
+
+
+def test_breadth_delta_too_short_history_returns_none():
+    data = {f"T{i}": [100.0] * 3 for i in range(30)}
+    rows = [
+        {"ticker": t, "date": f"2026-01-{d+1:02d}", "close": c}
+        for t, closes in data.items()
+        for d, c in enumerate(closes)
+    ]
+    panel = pl.DataFrame(rows)
+    assert breadth_delta_from_panel(panel, window=5, delta_window=5) is None
+
+
+def test_breadth_delta_empty_panel_returns_none():
+    assert breadth_delta_from_panel(pl.DataFrame({"ticker": [], "date": [], "close": []})) is None
+
+
+def test_breadth_delta_below_min_tickers_returns_none():
+    data = {f"T{i}": [100.0] * 30 for i in range(5)}
+    rows = [
+        {"ticker": t, "date": f"2026-01-{d+1:02d}", "close": c}
+        for t, closes in data.items()
+        for d, c in enumerate(closes)
+    ]
+    panel = pl.DataFrame(rows)
+    assert breadth_delta_from_panel(panel, window=5, delta_window=5, min_tickers=30) is None
+
+
+# ---------------------------------------------------------------------------
+# live_breadth_inflection — fail-open contract
+# ---------------------------------------------------------------------------
+
+
+def test_live_breadth_inflection_favorable_low_and_rising():
+    with patch("src.backtest.pipeline.load_ohlcv", return_value="fake_panel"), \
+         patch("src.trading.breadth.breadth_delta_from_panel",
+               return_value=(0.20, 0.05)):
+        result = live_breadth_inflection(low_cut=0.41, rising_threshold=0.03)
+    assert result == {"breadth": 0.20, "breadth_delta": 0.05, "favorable": True}
+
+
+def test_live_breadth_inflection_unfavorable_low_but_falling():
+    with patch("src.backtest.pipeline.load_ohlcv", return_value="fake_panel"), \
+         patch("src.trading.breadth.breadth_delta_from_panel",
+               return_value=(0.20, -0.05)):
+        result = live_breadth_inflection(low_cut=0.41, rising_threshold=0.03)
+    assert result == {"breadth": 0.20, "breadth_delta": -0.05, "favorable": False}
+
+
+def test_live_breadth_inflection_unfavorable_high_level_even_if_rising():
+    with patch("src.backtest.pipeline.load_ohlcv", return_value="fake_panel"), \
+         patch("src.trading.breadth.breadth_delta_from_panel",
+               return_value=(0.80, 0.05)):
+        result = live_breadth_inflection(low_cut=0.41, rising_threshold=0.03)
+    assert result["favorable"] is False
+
+
+def test_live_breadth_inflection_none_on_insufficient_data():
+    with patch("src.backtest.pipeline.load_ohlcv", return_value="fake_panel"), \
+         patch("src.trading.breadth.breadth_delta_from_panel", return_value=None):
+        assert live_breadth_inflection() is None
+
+
+def test_live_breadth_inflection_fails_open_on_exception():
+    with patch("src.backtest.pipeline.load_ohlcv", side_effect=RuntimeError("no parquet")):
+        assert live_breadth_inflection() is None  # must not raise

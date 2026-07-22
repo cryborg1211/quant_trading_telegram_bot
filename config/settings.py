@@ -115,6 +115,20 @@ class TradingConfig:
     breadth_brake_trigger: float = 0.40
     breadth_brake_floor_level: float = 0.25
     breadth_brake_floor: float = 0.5
+    # MR-LGBM knife-catch breadth-inflection ANNOTATION (22-07-26, separate
+    # from the breadth_brake_* exposure-scalar leg above — different window,
+    # different purpose). Informational only: appends whether current market
+    # breadth is in the "Low + Rising" bucket the research found had
+    # OOF precision 0.667 vs 0.542 for Low+Falling — a REAL but UNCONFIRMED
+    # gap (strict hold-out was too thin, 6 vs 8 fires). NEVER gates a trade
+    # or the MR fire decision itself — text-only enrichment on the existing
+    # 🔪 tag/veto lines, always labeled as an unconfirmed research signal.
+    # Kill-switch: "mr_breadth_context_enabled": false in settings.json.
+    mr_breadth_context_enabled: bool = True
+    mr_breadth_context_window: int = 20
+    mr_breadth_context_delta_window: int = 5
+    mr_breadth_context_low_cut: float = 0.41
+    mr_breadth_context_rising_threshold: float = 0.03
     # Promote-gate for the weekly auto-retrain (20-07-26): retrain moved from
     # manual/occasional to EVERY Saturday (quant_weekly_retrain schtask), so a
     # single bad walk-forward run would otherwise auto-overwrite the live
