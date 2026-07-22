@@ -168,6 +168,19 @@ class WalkForwardConfig:
     tranche_pt_sigma: float | None = None
     tranche_sl_sigma: float | None = None
 
+    # ── BURST SIZING (22-07-26 concentration follow-up — A/B, default off) ───
+    # Decouples the DAILY BUDGET divisor from the hold length. The tranche
+    # budget is normally nav/tranche_hold_days (calendar-based: full deployment
+    # only if a cohort opens every single day). Under a selective admission
+    # gate (absolute_gate ≥0.46 opens ~5% of days) that leaves ~95% of capital
+    # permanently idle — the concentration A/B measured Sharpe 0.600 at just
+    # −4.4% DD but 1/8 the PnL. `tranche_budget_days = 10` deploys nav/10 on
+    # each day that DOES clear admission (3× the calendar budget), spending
+    # the unused risk headroom. None ⇒ nav/tranche_hold_days — existing
+    # behaviour byte-for-byte. Cash constraint still applies (a burst can
+    # never deploy more than available cash).
+    tranche_budget_days: int | None = None
+
     # ── REGIME-CONDITIONAL SIZING ────────────────────────────────────────────
     # When True, per-name allocations inside each tranche are modulated by the
     # ticker's `market_regime` (0-7, from build_regime_features), mirroring the
@@ -912,7 +925,10 @@ class WalkForwardEngine:
 
         p_bull = float(np.clip(self._p_bull.get(D, 1.0), 0.0, 1.0))
         nav = self._compute_nav(D)
-        budget = (nav / cfg.tranche_hold_days) * p_bull
+        # Burst sizing: budget divisor decoupled from hold length when set
+        # (None ⇒ calendar-based nav/hold_days, byte-identical default).
+        budget_days = cfg.tranche_budget_days or cfg.tranche_hold_days
+        budget = (nav / budget_days) * p_bull
         if cfg.use_nav_tier_cap:
             # Discrete portfolio cap (risk_tier.py): clamp NEW deployment so
             # total invested (nav − cash) stays under the tier ceiling. Uses

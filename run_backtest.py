@@ -88,7 +88,8 @@ def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
                      use_prob_weights: bool = False,
                      rank_breadth_trigger: float = 0.40,
                      rank_breadth_floor_level: float = 0.25,
-                     rank_breadth_floor: float = 0.5) -> WalkForwardConfig:
+                     rank_breadth_floor: float = 0.5,
+                     tranche_budget_days: int | None = None) -> WalkForwardConfig:
     """Pure WalkForwardConfig builder — extracted from `run_oos` so the
     mode/hold-days plumbing is unit-testable without running the engine.
 
@@ -117,6 +118,7 @@ def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
         rank_breadth_trigger=rank_breadth_trigger,
         rank_breadth_floor_level=rank_breadth_floor_level,
         rank_breadth_floor=rank_breadth_floor,
+        tranche_budget_days=tranche_budget_days,
         constraints=PortfolioConstraints(
             max_weight=cfg.max_weight, long_only=True,
             target_leverage=0.95, target_vol=cfg.target_vol),
@@ -140,7 +142,8 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
             breadth_series: pd.Series | None = None,
             rank_breadth_trigger: float = 0.40,
             rank_breadth_floor_level: float = 0.25,
-            rank_breadth_floor: float = 0.5) -> pd.DataFrame:
+            rank_breadth_floor: float = 0.5,
+            tranche_budget_days: int | None = None) -> pd.DataFrame:
     """Walk-forward OOS using the pure-tabular ensemble oracle.
 
     The engine builds (n, 1, F) single-bar tensors internally (seq_len=1) and the
@@ -167,7 +170,8 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
                               use_nav_tier_cap, admission_mode, admission_floor,
                               admission_pool_cap, use_prob_weights,
                               rank_breadth_trigger, rank_breadth_floor_level,
-                              rank_breadth_floor)
+                              rank_breadth_floor,
+                              tranche_budget_days=tranche_budget_days)
     eng = WalkForwardEngine(wf_cfg, oracle)
     # Soft HMM regime scaling: P(Bull) multiplies the daily target weights.
     result = eng.run(sub, corporate_actions=corporate_actions, p_bull_series=p_bull_series,

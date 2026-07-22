@@ -204,3 +204,48 @@ def test_absolute_gate_just_below_floor_excluded() -> None:
         _panel({"NEAR": 0.49}))
     assert _bought(res) == set()
     assert res.zero_candidate_days == N_DAYS - 1
+
+
+# ── Burst sizing (tranche_budget_days, 22-07-26) ─────────────────────────────
+
+def _engine_budget(budget_days: int | None) -> WalkForwardEngine:
+    cfg = WalkForwardConfig(
+        seq_len=1, feature_cols=["feat"],
+        rebalance_mode="tranche", tranche_hold_days=HOLD,
+        max_positions=1, signal_threshold=0.40,
+        liquid_top_n=None, initial_capital=1_000_000_000.0,
+        tranche_budget_days=budget_days,
+    )
+    return WalkForwardEngine(cfg, _oracle)
+
+
+def _first_buy_notional(res) -> float:
+    fills = pd.DataFrame(res.fills)
+    buys = fills.query("side == 'buy'").sort_values("date")
+    first = buys.iloc[0]
+    return float(first["qty"]) * float(first["price"])
+
+
+def test_budget_days_none_is_default_hold_divisor() -> None:
+    # None ⇒ byte-identical to the pre-knob engine (nav/hold_days budget).
+    default_res = _engine_budget(None).run(_panel({"AAA": 0.90}))
+    explicit_res = _engine_budget(HOLD).run(_panel({"AAA": 0.90}))
+    np.testing.assert_array_equal(
+        default_res.equity_curve["nav"].to_numpy(),
+        explicit_res.equity_curve["nav"].to_numpy(),
+    )
+
+
+def test_budget_days_smaller_divisor_deploys_more() -> None:
+    # budget_days=1 deploys nav/1 on day one vs nav/HOLD — the first buy's
+    # notional must be ~HOLD× bigger (lot rounding makes it approximate).
+    slow = _first_buy_notional(_engine_budget(None).run(_panel({"AAA": 0.90})))
+    burst = _first_buy_notional(_engine_budget(1).run(_panel({"AAA": 0.90})))
+    assert burst > slow * (HOLD - 1)  # ≈ HOLD× bigger, tolerant of lot rounding
+
+
+def test_budget_days_burst_capped_by_cash() -> None:
+    # Even nav/1 every day cannot deploy more than available cash — engine's
+    # existing cash constraint must keep NAV finite/sane (no negative cash).
+    res = _engine_budget(1).run(_panel({"AAA": 0.90}))
+    assert res.equity_curve["nav"].to_numpy().min() > 0
