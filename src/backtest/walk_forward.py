@@ -368,6 +368,7 @@ class WalkForwardEngine:
         p_bull_series: pd.Series | None = None,
         inference_cache: dict[date, tuple[np.ndarray, list[str]]] | None = None,
         breadth_series: pd.Series | None = None,
+        budget_days_series: pd.Series | None = None,
     ) -> WalkForwardResult:
         """
         `p_bull_series` — date-indexed HMM P(Bull) (leak-free filtered). Each
@@ -379,6 +380,12 @@ class WalkForwardEngine:
         `admission_mode="rank_breadth"`. When None (or a date is missing),
         the engine assumes breadth=1.0 (fail-open — full K, matching every
         other brake's fail-open contract in this codebase).
+
+        `budget_days_series` — date-indexed burst-budget divisor (see
+        `src.trading.vol_sizing.vol_scaled_budget_days`), overrides the flat
+        `cfg.tranche_budget_days` constant per-day when supplied. When None
+        (or a date is missing), falls back to `cfg.tranche_budget_days` /
+        `cfg.tranche_hold_days` unchanged.
 
         `inference_cache` — optional ``{D: (p_up, tickers)}`` map, MUTATED in
         place.  The per-day oracle scoring (`_inference`) depends only on
@@ -407,6 +414,15 @@ class WalkForwardEngine:
             self._breadth = {
                 pd.Timestamp(d).date(): float(v)
                 for d, v in breadth_series.dropna().items()
+            }
+
+        # date → burst-budget divisor lookup; empty ⇒ every `.get(D)` call
+        # returns None and the flat `cfg.tranche_budget_days` constant wins.
+        self._budget_days: dict[date, int] = {}
+        if budget_days_series is not None:
+            self._budget_days = {
+                pd.Timestamp(d).date(): int(v)
+                for d, v in budget_days_series.dropna().items()
             }
 
         self.cash = self.config.initial_capital
@@ -927,7 +943,10 @@ class WalkForwardEngine:
         nav = self._compute_nav(D)
         # Burst sizing: budget divisor decoupled from hold length when set
         # (None ⇒ calendar-based nav/hold_days, byte-identical default).
-        budget_days = cfg.tranche_budget_days or cfg.tranche_hold_days
+        # Vol-scaled override (22-07-26): a per-day divisor from
+        # `self._budget_days` (see `vol_sizing.vol_scaled_budget_days`) wins
+        # over the flat `cfg.tranche_budget_days` constant when supplied.
+        budget_days = self._budget_days.get(D) or cfg.tranche_budget_days or cfg.tranche_hold_days
         budget = (nav / budget_days) * p_bull
         if cfg.use_nav_tier_cap:
             # Discrete portfolio cap (risk_tier.py): clamp NEW deployment so

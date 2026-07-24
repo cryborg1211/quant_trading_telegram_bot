@@ -143,7 +143,8 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
             rank_breadth_trigger: float = 0.40,
             rank_breadth_floor_level: float = 0.25,
             rank_breadth_floor: float = 0.5,
-            tranche_budget_days: int | None = None) -> pd.DataFrame:
+            tranche_budget_days: int | None = None,
+            budget_days_series: pd.Series | None = None) -> pd.DataFrame:
     """Walk-forward OOS using the pure-tabular ensemble oracle.
 
     The engine builds (n, 1, F) single-bar tensors internally (seq_len=1) and the
@@ -175,7 +176,8 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
     eng = WalkForwardEngine(wf_cfg, oracle)
     # Soft HMM regime scaling: P(Bull) multiplies the daily target weights.
     result = eng.run(sub, corporate_actions=corporate_actions, p_bull_series=p_bull_series,
-                     inference_cache=inference_cache, breadth_series=breadth_series)
+                     inference_cache=inference_cache, breadth_series=breadth_series,
+                     budget_days_series=budget_days_series)
     eq = result.equity_curve
     eq = eq[pd.to_datetime(eq["date"]).dt.date >= cutoff].reset_index(drop=True)
     # Surface the serve-mirror admission diagnostic to in-process callers (the

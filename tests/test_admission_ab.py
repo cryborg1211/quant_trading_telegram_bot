@@ -249,3 +249,36 @@ def test_budget_days_burst_capped_by_cash() -> None:
     # existing cash constraint must keep NAV finite/sane (no negative cash).
     res = _engine_budget(1).run(_panel({"AAA": 0.90}))
     assert res.equity_curve["nav"].to_numpy().min() > 0
+
+
+# ── Vol-scaled budget_days_series override (22-07-26) ────────────────────────
+
+def _early_override_series(divisor: int, n: int = 5) -> pd.Series:
+    # Covers the first `n` calendar days (not just index 0) — the engine's
+    # first tranche fill lags the panel start by the feature warm-up/1-bar
+    # scoring delay, so a single-day-0 override can miss the actual first
+    # fill date entirely.
+    days = pd.bdate_range("2024-01-02", periods=N_DAYS).date
+    return pd.Series([divisor] * n, index=pd.to_datetime(days[:n]))
+
+
+def test_budget_days_series_overrides_absent_constant() -> None:
+    # No flat constant set (None) — an early-days series override must still
+    # burst-size the first fill, same shape as the flat-constant burst test.
+    slow = _first_buy_notional(_engine_budget(None).run(_panel({"AAA": 0.90})))
+    burst = _first_buy_notional(
+        _engine_budget(None).run(_panel({"AAA": 0.90}),
+                                 budget_days_series=_early_override_series(1))
+    )
+    assert burst > slow * (HOLD - 1)
+
+
+def test_budget_days_series_wins_over_flat_constant_when_both_set() -> None:
+    # Flat constant says conservative (nav/30); the per-day series says
+    # burst (nav/1) for the early days — the series must win on the first fill.
+    conservative = _first_buy_notional(_engine_budget(30).run(_panel({"AAA": 0.90})))
+    overridden = _first_buy_notional(
+        _engine_budget(30).run(_panel({"AAA": 0.90}),
+                               budget_days_series=_early_override_series(1))
+    )
+    assert overridden > conservative * 5
