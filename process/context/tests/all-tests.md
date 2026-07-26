@@ -50,7 +50,7 @@ Use this file when you need to:
 
 ### Use `pytest` for everything
 
-- All 895 tests run through pytest
+- All 894 tests run through pytest
 - `pytest -q` for quick output (default via `pytest.ini`)
 - No separate test runners, no browser tests, no e2e framework
 - Tests use in-memory DuckDB and stubs — no external services needed
@@ -67,7 +67,7 @@ Unless the task clearly needs a different path:
 
 | Scope | Command | Notes |
 |---|---|---|
-| Full suite | `pytest -q` | 895 tests, all in-memory |
+| Full suite | `pytest -q` | 894 tests, all in-memory |
 | Single file | `pytest -q tests/test_<name>.py` | targeted verification |
 | Single test | `pytest -q tests/test_<name>.py::test_<func>` | surgical |
 | Verbose | `pytest -v` | full test names + pass/fail |
@@ -100,11 +100,14 @@ Unless the task clearly needs a different path:
 | `test_promote_gate.py` | weekly-retrain promote/reject decision + `_persist_bot_payload` isolation | 13 tests | added 20-07-26; all filesystem-isolated via `chdir(tmp_path)`, never touches real `models/saved/` |
 | `test_rank_breadth_admission.py` | `admission_mode="rank_breadth"` — breadth-conditioned K, no absolute floor | 9 tests | added 22-07-26; A/B REJECTED but code+tests kept in-tree |
 | `test_mr_breadth_context.py` / `test_mr_score_breadth_wiring.py` | breadth-inflection annotation on the MR knife-catch display | 18 tests | added 22-07-26; display-only, never gates the fire decision |
+| `test_admission_ab.py` | tranche admission modes + burst-budget divisor (flat + `budget_days_series` override) | 17 tests | extended 22/24-07-26; burst nav/10 SHIPPED opt-in |
+| `test_vol_sizing.py` | vol-scaled burst-budget divisor: `market_vol_time_series`, `vol_scaled_budget_days` | 9 tests | added 24-07-26; A/B REJECTED but code+tests kept in-tree |
+| `test_mr_context_features.py` | MR volume-exhaustion + sector-relative oversold features | 10 tests | added 24-07-26; PROMISING-UNCONFIRMED, not wired into serve |
 | `conftest.py` (tests/) | shared fixtures + global autouse guard defaulting new risky DB-touching config knobs OFF | fixture definitions | in-memory DuckDB, sample data; `_hysteresis_off_by_default` added 20-07-26 |
 
-**Note (06-07-26; count corrected 22-07-26):** this table covers the historically-significant/hub-adjacent
+**Note (06-07-26; count corrected 24-07-26):** this table covers the historically-significant/hub-adjacent
 test files and is not a complete 1:1 listing of every file under `tests/`
-(currently 72 files, 895 tests total — see `pytest --collect-only -q` for the
+(currently 75 files, 894 tests total — see `pytest --collect-only -q` for the
 exhaustive list). A full test-file-map refresh is recommended via
 `vc-audit-context` if this table's staleness becomes a recurring friction
 point.

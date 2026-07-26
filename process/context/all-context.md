@@ -62,7 +62,7 @@ For most substantial tasks:
 | Group | Entry point | Scope |
 |---|---|---|
 | `planning/` | `process/context/planning/all-planning.md` | plan-shape calibration, planning examples, SIMPLE vs COMPLEX reference docs |
-| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 895 tests (72 files), in-memory DuckDB stubs, debugging quick-ref |
+| `tests/` | `process/context/tests/all-tests.md` | pytest runner, 894 tests (75 files), in-memory DuckDB stubs, debugging quick-ref |
 
 ## Task Routing Table
 
@@ -130,7 +130,7 @@ stock_price_v3/
   src/
     backtest/
       pipeline.py         -- Feature pipeline (build_features, FEATURE_RECIPE_VERSION)
-      walk_forward.py     -- Walk-forward engine: "tranche" mode (AFML staggered cohorts, evaluator default) + legacy "grid" mode; scales thousand-VND parquet prices to absolute VND (price_unit_vnd)
+      walk_forward.py     -- Walk-forward engine: "tranche" mode (AFML staggered cohorts, evaluator default) + legacy "grid" mode; scales thousand-VND parquet prices to absolute VND (price_unit_vnd); burst-budget divisor (`tranche_budget_days`, opt-in, SHIPPED) decouples the daily budget from hold length, optional per-day `budget_days_series` override (vol-scaled variant REJECTED as calibrated)
     bot/
       bot_inference.py    -- V3BotInference (serve-path model loading + prediction)
       sizing.py           -- Half-Kelly position sizing (20% NAV cap)
@@ -147,6 +147,8 @@ stock_price_v3/
       alpha360_generator.py  -- DEPRECATED (gutted in V4.0)
       market_regime.py    -- 8-regime HMM classifier + regime feature builder
       mr_features.py      -- Mean-reversion (knife-catch) features
+      mr_context_features.py -- MR volume-exhaustion + sector-relative oversold (research, PROMISING-UNCONFIRMED)
+      impulse_features.py -- Fast-attack/momentum-ignition features (research, REJECTED as a sub-model, kept for reuse)
     labels/
       triple_barrier.py   -- Triple barrier labeling (T+5, T+20 horizons)
     models/
@@ -168,6 +170,7 @@ stock_price_v3/
       candidate_hysteresis.py -- Admission hysteresis: N-consecutive-day qualify streak (20-07-26)
       cohort_weights.py    -- prob_scaled_weights: shared serve/backtest cohort weight formula (A/B, REJECTED)
       breadth.py           -- Market breadth: exposure scalar leg + knife-catch inflection annotation + rank_breadth admission time series (20/22-07-26)
+      vol_sizing.py         -- Vol-scaled burst-budget divisor (research, REJECTED as calibrated — miscalibrated triggers, kept for reuse)
     reports/
       __init__.py         -- Re-exports report builders
       builders.py         -- 10 report builder functions + 11 constants (extracted from main.py)
@@ -177,7 +180,7 @@ stock_price_v3/
       logging_utils.py    -- Centralized logging setup
       audit_evaluator.py  -- Trade audit evaluation
       version.py          -- Version string
-  tests/                  -- 72 test files, 895 tests (pytest)
+  tests/                  -- 75 test files, 894 tests (pytest)
   train_macro_regime.py   -- Train + serialize the GARCH-HMM regime overlay
   scripts/
     migrate_sqlite_to_duckdb.py -- Legacy SQLite → DuckDB migration
@@ -190,6 +193,15 @@ stock_price_v3/
     check_drift.py        -- Read-only drift/sampling-bias monitor (prediction dist, UP base-rate, regime pulse)
     analyze_mr_regime_conditioning.py -- MR-LGBM regime-gate + RSI-direction knife-catch research (both REJECTED)
     analyze_mr_breadth_inflection.py -- MR-LGBM breadth-inflection knife-catch research (promising, unconfirmed)
+    analyze_ranking_objective.py -- LGBMRanker vs pointwise admission research (REJECTED -- 2x DD, PBO 66.7%)
+    analyze_confluence_signal.py -- T+5/T+20 agreement paperlog research (INCONCLUSIVE -- confluence-UP bucket empty)
+    analyze_confluence_backtest.py -- T+5/T+20 agreement OOS backtest (confluence REJECTED; found T+20 gate does all the quality work)
+    analyze_concentration_ab.py -- Absolute-gate concentration A/B (barbell wins on risk, loses on PnL -- motivated burst sizing)
+    analyze_burst_sizing_ab.py -- Burst-budget divisor A/B (nav/10 SHIPPED opt-in, ~3x concentration PnL inside the DD comfort band)
+    analyze_vol_scaled_burst_ab.py -- Vol-scaled burst-divisor A/B (REJECTED -- miscalibrated, worse than flat nav/10)
+    analyze_impulse_attack.py -- Fast-attack/momentum-ignition sub-model research (REJECTED -- OOF precision misses both bars)
+    analyze_mr_context_features.py -- MR volume-exhaustion + sector-relative oversold research (PROMISING, UNCONFIRMED -- clears 0.60 OOF, holdout too thin)
+    analyze_dsr_calibration.py -- DSR/PBO calibration diagnostic (read-only -- failure is ROBUST, not inflated trials or small-sample noise)
     retrain_all.ps1       -- Full 3-model retrain (MR+T20+T5); scheduled weekly via Windows Task Scheduler
     ab_rank_breadth.ps1   -- rank_breadth admission A/B runner (REJECTED)
   deploy/
@@ -216,7 +228,7 @@ stock_price_v3/
 - **Bot:** python-telegram-bot 22.7 (async PTB framework)
 - **HTTP:** aiohttp 3.13, requests 2.33
 - **Config:** python-dotenv 1.2 (.env), dataclass-based settings with JSON overrides
-- **Testing:** pytest (895 tests, in-memory DuckDB stubs)
+- **Testing:** pytest (894 tests, in-memory DuckDB stubs)
 - **Deployment:** Bare metal VPS — systemd (bot), cron (daily pipeline at 15:30 ICT Mon–Fri); weekly full retrain via Windows Task Scheduler (`quant_weekly_retrain`, every Saturday 09:00) on the dev box
 
 ## Key Patterns and Conventions
@@ -304,6 +316,19 @@ Wired anyway (explicit user call, despite the "unconfirmed" verdict) as a DISPLA
 - **Rank-based admission with breadth-conditioned K** (`WalkForwardConfig.admission_mode="rank_breadth"`, `src/trading/breadth.py::breadth_time_series`) — no absolute P(UP) floor, top-K ranked names where K scales with market breadth. mean Sharpe 0.524→0.518, mean DD ~−13.5%→~−14.2% (worse both ways) on the 2022-11→2026-07 OOS window with default knobs.
 All three stay in-tree behind their flags (default OFF/unchanged), fully tested, cheap to revisit with different tuning later.
 
+**"Smarter system" research marathon (2026-07-22/24) — 9 experiments, 1 shipped win, 2 promising-unconfirmed, rest REJECTED/INCONCLUSIVE:**
+- **Ranking objective** (`scripts/analyze_ranking_objective.py`) — REJECTED. `LGBMRanker` (lambdarank) vs pointwise: Sharpe +0.554 vs +0.545 (noise-level) but MaxDD −26.56% vs −13.31% (nearly double) and PBO 66.7% (massive overfit). Caveat: minimal single-model test, not a fully clean kill of the idea itself.
+- **Confluence** (`scripts/analyze_confluence_signal.py` paperlog version, then `scripts/analyze_confluence_backtest.py` full-OOS version) — confluence itself REJECTED (Confluence-UP bucket empty in the paperlog; backtest version shows adding the T+5 gate on top of T+20 makes picks slightly WORSE, not better). **Real finding: the T+20 gate does ALL the quality work — T+20-gated ≈ 3x base rate, T+5-gated ≈ noise.** Directly explains why all 13 July-2026 losses came via the T+5 side-door.
+- **Concentration A/B** (`scripts/analyze_concentration_ab.py`) — the `absolute_gate≥0.46` barbell matches cross_sectional's Sharpe at 1/6.6 the DD but only 1/8.4 the PnL, because the gate opens ~5% of days and the calendar budget (nav/30) barely deploys. Motivated burst sizing below.
+- **Burst-budget divisor** (`scripts/analyze_burst_sizing_ab.py`) — **SHIPPED opt-in** (`WalkForwardConfig.tranche_budget_days`, default unchanged). nav/10 (3x calendar budget) on gate-open days: NetPnL +1.95B vs the nav/30 reference's +661M (~3x), Sharpe flat (0.594 vs 0.600), DD −12.86% lands just inside the ~−13% production comfort band. nav/5 (6x) overshoots the band for a worse Sharpe.
+- **Vol-scaled burst divisor** (`scripts/analyze_vol_scaled_burst_ab.py`, `src/trading/vol_sizing.py`) — REJECTED. Dynamic divisor (calm→smaller, stressed→bigger, via `market_vol_time_series`) landed at mean divisor 17.7 (not 10) — trigger levels were guessed absolutes, not calibrated to VN market's real vol distribution, so it sat conservative and lost to flat nav/10 on both PnL and Sharpe.
+- **Fast-attack / impulse sub-model** (`scripts/analyze_impulse_attack.py`, `src/features/impulse_features.py`) — REJECTED. Tail-event label (setup ∧ 3-bar return >+3%) mirroring MR-LGBM's exact scaffold: OOF precision 0.520 misses both the 0.60 target and MR-LGBM's own 0.578 bar. Volume-confirmed momentum doesn't predict continuation the way oversold+volume predicts a bounce.
+- **MR context features** (`scripts/analyze_mr_context_features.py`, `src/features/mr_context_features.py`) — **PROMISING, UNCONFIRMED** (same bucket as breadth-inflection). Volume-exhaustion + sector-relative-oversold (reuses `sector_map.sector_of`) added to the shipped 11 MR features: OOF precision 0.642 (+6.3pp, first config to clear 0.60), holdout 0.800 — but holdout fires collapse to n=5, too thin to trust. NOT wired into serve.
+- **DSR/PBO calibration diagnostic** (`scripts/analyze_dsr_calibration.py`, read-only, no formula changed) — the production sweep grid is genuinely diverse (mean daily-return correlation 0.420, NOT near-clone configs) so `n_trials` is a fair multiplicity count, not inflated. Block-bootstrap (2000 resamples): only 0.4% pass DSR even though bootstrap Sharpe ranges up to +1.42 at p95. **DSR failure is ROBUST, not a small-sample artifact** — the edge itself needs to be structurally bigger; further sizing/admission knobs are unlikely to close this gap.
+- **TWAP execution-cost** — rejected analytically, no script needed. Tranche fills are always ATC (`walk_forward.py`'s order construction sets `is_atc=True` unconditionally); the cost model's ATC branch has zero size-based slippage (flat clearing price, only a volume cap) — no impact exists to reduce.
+
+**Foreign-flow data via SSI FastConnect — researched, blocked on user action (2026-07-24, see `process/general-plans/backlog/foreign-flow-fastconnect-integration_PLAN_24-07-26.md`):** SSI's OFFICIAL documented API (distinct from the unofficial `iboard-query.ssi.com.vn` scrape already in `foreign_flow_crawler.py`) exposes historical, date-range-queryable foreign buy/sell volume + foreign room via its `DailyStockPrice` endpoint — free, but needs an SSI trading account (fully online eKYC, ~3min) PLUS a separate FastConnect API registration (branch visit or mailed docs, not self-serve). The existing `foreign_flow_crawler.py`/`flow_features.py`/`eda_flow_features.py` trio is confirmed schema-source-agnostic — zero rework needed once a backfill adapter exists; only new work is that one adapter (token auth + `DailyStockPrice` calls). Not started — user has no SSI account yet.
+
 ## Environment and Configuration
 
 **Config files:**
@@ -343,7 +368,7 @@ A local MCP server (`code-review-graph`) maintains a live graph database of the 
 ## Scan Metadata
 
 - Generated: 2026-06-09
-- Last content update: 2026-07-22
-- HEAD: main (70070dc)
+- Last content update: 2026-07-24
+- HEAD: main (fba7459)
 - Mode: fresh scaffold + study
 - Package manager: pip (requirements.txt, Python 3.11)
