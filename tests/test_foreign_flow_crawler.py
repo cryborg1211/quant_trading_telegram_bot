@@ -80,6 +80,9 @@ def test_crawl_today_parses_and_scales_to_thousands(monkeypatch) -> None:
     assert out.height == 1
     row = out.row(0, named=True)
     assert row["ticker"] == "SSI"
+    # FastConnect-only fields don't exist in the iBoard snapshot shape.
+    assert row["block_deal_val"] is None
+    assert row["buy_trade_count"] is None
     # absolute VND scaled to thousands (on-disk convention)
     assert row["foreign_buy_val"] == 2000.0
     assert row["foreign_sell_val"] == 1000.0
@@ -160,6 +163,12 @@ _FC_RAW_ROW = {
     "ForeignBuyVolTotal": "1059455",
     "ForeignSellVolTotal": "521650",
     "ForeignCurrentRoom": "1753039675",
+    "TotalDealVal": "5000000000",
+    "TotalDealVol": "200000",
+    "TotalBuyTrade": "3500",
+    "TotalBuyTradeVol": "6000000",
+    "TotalSellTrade": "3200",
+    "TotalSellTradeVol": "5800000",
 }
 
 
@@ -175,6 +184,12 @@ def test_parse_fastconnect_row_maps_and_scales_to_thousands() -> None:
     assert row["foreign_buy_vol"] == 1_059_455.0
     assert row["foreign_remain_room_vol"] == 1_753_039_675.0
     assert row["prop_buy_val"] is None
+    assert row["block_deal_val"] == 5_000_000.0
+    assert row["block_deal_vol"] == 200_000.0
+    assert row["buy_trade_count"] == 3500.0
+    assert row["buy_trade_vol"] == 6_000_000.0
+    assert row["sell_trade_count"] == 3200.0
+    assert row["sell_trade_vol"] == 5_800_000.0
     assert row["source"] == "ssi_fastconnect_history"
 
 
@@ -323,6 +338,9 @@ def test_backfill_idempotent_merge_with_existing_parquet(monkeypatch, tmp_path) 
         "foreign_buy_val": 1.0, "foreign_sell_val": 1.0, "foreign_net_val": 0.0,
         "foreign_buy_vol": 1.0, "foreign_sell_vol": 1.0, "foreign_remain_room_vol": 1.0,
         "prop_buy_val": None, "prop_sell_val": None, "prop_net_val": None,
+        "block_deal_val": None, "block_deal_vol": None,
+        "buy_trade_count": None, "buy_trade_vol": None,
+        "sell_trade_count": None, "sell_trade_vol": None,
         "source": "ssi_iboard_live_snapshot", "fetched_at": datetime(2026, 8, 7, 9, 0),
     }
     pl.DataFrame([old_row], schema=ffc._SCHEMA).write_parquet(path)

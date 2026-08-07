@@ -94,6 +94,14 @@ _SCHEMA: dict[str, pl.PolarsDataType] = {
     "prop_buy_val": pl.Float64,        # always NULL for now -- no verified tu-doanh source
     "prop_sell_val": pl.Float64,
     "prop_net_val": pl.Float64,
+    # FastConnect-only (SOURCE 2, 26-07-26) -- always NULL for SOURCE 1 rows,
+    # this data doesn't exist in the iBoard live-snapshot response shape.
+    "block_deal_val": pl.Float64,      # VND thousands -- negotiated/put-through (thoa thuan) trades, OFF the order book
+    "block_deal_vol": pl.Float64,
+    "buy_trade_count": pl.Float64,     # aggressor-side (buy-initiated) trade COUNT, not volume
+    "buy_trade_vol": pl.Float64,
+    "sell_trade_count": pl.Float64,
+    "sell_trade_vol": pl.Float64,
     "source": pl.Utf8,
     "fetched_at": pl.Datetime,
 }
@@ -325,6 +333,12 @@ def crawl_today(tickers: list[str] | None = None, exchange: str = "HOSE") -> pl.
             "prop_buy_val": None,
             "prop_sell_val": None,
             "prop_net_val": None,
+            "block_deal_val": None,
+            "block_deal_vol": None,
+            "buy_trade_count": None,
+            "buy_trade_vol": None,
+            "sell_trade_count": None,
+            "sell_trade_vol": None,
             "source": "ssi_iboard_live_snapshot",
             "fetched_at": fetched_at,
         })
@@ -429,6 +443,7 @@ def _parse_fastconnect_row(item: dict[str, Any], fetched_at: datetime) -> dict[s
         return None
 
     buy_val, sell_val, net_val = _f("ForeignBuyValTotal"), _f("ForeignSellValTotal"), _f("NetBuySellVal")
+    deal_val = _f("TotalDealVal")
     return {
         "date": row_date,
         "ticker": symbol,
@@ -441,6 +456,12 @@ def _parse_fastconnect_row(item: dict[str, Any], fetched_at: datetime) -> dict[s
         "prop_buy_val": None,
         "prop_sell_val": None,
         "prop_net_val": None,
+        "block_deal_val": (deal_val / 1000.0) if deal_val is not None else None,
+        "block_deal_vol": _f("TotalDealVol"),
+        "buy_trade_count": _f("TotalBuyTrade"),
+        "buy_trade_vol": _f("TotalBuyTradeVol"),
+        "sell_trade_count": _f("TotalSellTrade"),
+        "sell_trade_vol": _f("TotalSellTradeVol"),
         "source": "ssi_fastconnect_history",
         "fetched_at": fetched_at,
     }
