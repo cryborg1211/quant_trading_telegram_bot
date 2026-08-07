@@ -1,14 +1,13 @@
 # Foreign-Flow Data via SSI FastConnect — Backlog Plan
 
-**Date**: 24-07-26
-**Status**: 🔒 BLOCKED — user has no SSI trading account / FastConnect API access yet
+**Date**: 24-07-26 (unblocked + backfill launched 07-08-26)
+**Status**: 🟡 IN PROGRESS — credentials obtained, adapter built+live-verified, full-universe backfill running (kill-proof background job, launched 07-08-26 22:14, ~5h projected). Not yet done: quality comparison, EDA rerun, everything after.
 **Origin**: user asked to research "SSI's new API"; found FastConnect Data (`DailyStockPrice` endpoint) exposes historical, date-range-queryable foreign buy/sell volume + foreign room — the exact gap that stalled the 01-07-26 foreign-flow research (see project memory: "SSI per-ticker: only 1 day exists, ADF/correlation both empty (n=0)").
 
-## Precondition (external, not code)
+## Precondition (external, not code) — ✅ DONE 07-08-26
 
-1. User opens an SSI trading account — **fully online eKYC, ~3 min, free**, no branch visit. Needs chip-embedded national ID + phone camera + OTP.
-2. User registers for FastConnect Data API on top of that account — **NOT self-serve**: branch visit or mailed documents to SSI, then SSI emails an approval link, then ConsumerID/ConsumerSecret/PrivateKey are generated via iBoard's API Service screen. **FastConnect Data itself is free**, but needs renewal every 3 months (hotline/email call).
-3. Neither step has happened yet as of this session. Nothing below starts until the user has real credentials.
+1. ~~User opens an SSI trading account~~ — done.
+2. ~~User registers for FastConnect Data API~~ — done. Credentials were briefly pasted into chat (ConsumerID/Secret/PublicKey/PrivateKey) — flagged as exposed, user rotated via iBoard's API Service screen, new ConsumerID/ConsumerSecret placed directly in `.env` (`Consumer_Key`/`ConsumerSecret_Key`) going forward, never re-pasted.
 
 ## What already exists (confirmed by reading the code this session — zero rework needed)
 
@@ -18,17 +17,19 @@
 - Current adapter (`fetch_ssi_hose_snapshot` → unofficial `iboard-query.ssi.com.vn`) stays as the live/today path — no need to replace it, FastConnect is additive for HISTORY.
 - `src/data/etf_flow_proxy_crawler.py` (weak ETF proxy fallback) becomes unnecessary once real history lands — not broken, just superseded. No urgency to remove.
 
-## What's new work, once unblocked
+## What's new work
 
-1. **New backfill adapter** (`src/data/foreign_flow_crawler.py` or a sibling module): implement the FastConnect token flow (`AccessToken` POST with ConsumerID/ConsumerSecret) + signed `DailyStockPrice` GET, paginated (`pageIndex`/`pageSize`), mapped into the EXISTING `_SCHEMA`, tagged `source="ssi_fastconnect_history"`. Needs real ConsumerID/Secret to test against — cannot be built/verified blind.
-2. **Re-run `scripts/eda_flow_features.py` for real** — actual multi-year series instead of n=0. Decide for real (not a placeholder) whether foreign flow / knife-catch divergence is additive.
-3. **If EDA clears a bar**: walk-forward backtest with `flow_features` wired into `pipeline.build_features` (recipe-version bump, full retrain gate — same discipline as every other feature-recipe change this session).
-4. **Full system re-pass** (explicit user ask, not just the new feature): re-test the whole system once flow data is live, not just the isolated feature.
-5. **Full documentation deep-dive** (explicit user ask): go through every doc in `process/context/` — not just router files — and update anything stale, not just what this feature touches. Write up future-work / next-steps at that point.
+1. ~~**New backfill adapter**~~ — ✅ DONE 07-08-26 (`868d45b`, `59b1882`). FastConnect token flow (ConsumerID+ConsumerSecret only, no PrivateKey/RSA needed for Data), `DailyStockPrice` GET, mapped into `_SCHEMA` (+6 new columns: block-deal + aggressor-side trade fields, captured free from the same response). Live-verified: real auth, real historical rows, two undocumented API constraints found (30-calendar-day max range per call, real history depth starts ~2020-02 not further back) and handled (`_chunk_date_range`). 27 tests, all HTTP mocked.
+2. **Full-universe backfill** — 🟡 RUNNING (launched 07-08-26 22:14, kill-proof background, ~5h projected for 359 tickers × 2020-01-01→today). `scripts/backfill_ssi_foreign_flow.py` / `run_ssi_foreign_flow_backfill.ps1`.
+3. **Compare data QUALITY between SOURCE 1 (iBoard live snapshot) and SOURCE 2 (FastConnect history)** — explicit user ask (07-08-26), do this once the backfill completes. Both sources now have overlapping `(date, ticker)` rows for recent dates (SOURCE 1 from the daily production cron, SOURCE 2 from the backfill). Check: do `foreign_buy_val`/`foreign_sell_val`/`foreign_net_val` agree on the same (date, ticker) between the two sources, or diverge? If they diverge, which one is more trustworthy (SOURCE 2 is the OFFICIAL documented API vs SOURCE 1's reverse-engineered endpoint — prior is SOURCE 2 wins, but verify, don't assume). This should inform whether SOURCE 1's daily cron stays in production going forward or gets replaced by a daily FastConnect call.
+4. **Re-run `scripts/eda_flow_features.py` for real** — actual multi-year series instead of n=0. Decide for real (not a placeholder) whether foreign flow / knife-catch divergence is additive. Also worth a first look at whether the NEW block-deal/aggressor-trade fields (item 1) show any signal, even though they weren't the original ask.
+5. **If EDA clears a bar**: walk-forward backtest with `flow_features` wired into `pipeline.build_features` (recipe-version bump, full retrain gate — same discipline as every other feature-recipe change this session).
+6. **Full system re-pass** (explicit user ask, not just the new feature): re-test the whole system once flow data is live, not just the isolated feature.
+7. **Full documentation deep-dive** (explicit user ask): go through every doc in `process/context/` — not just router files — and update anything stale, not just what this feature touches. Write up future-work / next-steps at that point.
 
 ## Trigger to reactivate this plan
 
-Either: (a) the user says foreign-flow / SSI credentials are ready, or (b) a future session finds real rows in `data/foreign_flow_daily.parquet` with `source != "ssi_iboard_live_snapshot"`. Either signal means: start at item 1 above, not from scratch.
+Backfill (item 2) finishing is the next trigger — resume at item 3 (quality comparison), not from scratch.
 
 ## Notes
 
