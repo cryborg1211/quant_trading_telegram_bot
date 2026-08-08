@@ -1,7 +1,7 @@
 # Foreign-Flow Data via SSI FastConnect — Backlog Plan
 
 **Date**: 24-07-26 (unblocked + backfilled 07/08-08-26)
-**Status**: 🟡 MIXED — raw/unconditional foreign flow REJECTED (item 4), block-deal + aggressor-imbalance REJECTED, but the divergence-conditional angle (item 4b) came back CONFIRMED (small effect, real statistical power). Backlog stays open for: deciding whether to wire the divergence finding in (display-only, like breadth-inflection, or a minor feature), and the SOURCE-1 production bug (item 3b). Not active research otherwise.
+**Status**: 🟢 SHIPPED (display-only) — raw/unconditional foreign flow REJECTED (item 4), block-deal + aggressor-imbalance REJECTED, divergence-conditional angle (item 4b) CONFIRMED and wired into serve 08-08-26 (`d2d2ee9`) as a live annotation on the MR knife-catch display — no retrain, never gates the fire decision. Backlog stays open only for: the SOURCE-1 production bug (item 3b, unrelated, still unfixed) and confirming the live wiring against a real production fire (CODE DONE, pending Gate-5-style live observation, same as everything else this session).
 **Origin**: user asked to research "SSI's new API"; found FastConnect Data (`DailyStockPrice` endpoint) exposes historical, date-range-queryable foreign buy/sell volume + foreign room — the exact gap that stalled the 01-07-26 foreign-flow research (see project memory: "SSI per-ticker: only 1 day exists, ADF/correlation both empty (n=0)").
 
 ## Precondition (external, not code) — ✅ DONE 07-08-26
