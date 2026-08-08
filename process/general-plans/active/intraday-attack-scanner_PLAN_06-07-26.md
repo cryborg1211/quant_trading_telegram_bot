@@ -2,7 +2,7 @@
 
 **Date**: 06-07-26
 **Complexity**: COMPLEX-lite (new pure module + config knobs + bot job wiring + tests; no schema/retrain change)
-**Status**: PLANNED
+**Status**: 🔨 CODE DONE (stale header corrected 08-08-26 — `src/trading/intraday_scanner.py` exists, 542 lines, all listed public functions present; `tests/test_intraday_scanner.py` 40/40 green; the checklist below was simply never checked off as work landed). Stays ACTIVE — NOT ✅ VERIFIED — pending Gate 5 (live 09:15 ICT market-open smoke test), same convention as `portfolio-guard_PLAN_13-07-26.md` / `eod-position-report_PLAN_16-07-26.md`. Per `all-context.md`'s own note, Gate 5 was still unobserved as of the last content sync.
 
 ---
 

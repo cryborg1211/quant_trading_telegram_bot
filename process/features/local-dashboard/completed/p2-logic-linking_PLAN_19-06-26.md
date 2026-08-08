@@ -1,7 +1,7 @@
 # P2 — Logic Linking Plan
 
 **Date:** 2026-06-19
-**Status:** ACTIVE — ready to execute (P1 gate green)
+**Status:** ✅ COMPLETE (stale header corrected 08-08-26 — see p0-reuse-audit_PLAN_19-06-26.md)
 **Phase:** P2 of local-dashboard program
 **Complexity:** COMPLEX (multi-file wiring; one approved existing-source change; threading primitives; cross-tab state)
 **Umbrella plan:** `process/features/local-dashboard/active/dashboard-umbrella_PLAN_19-06-26.md`

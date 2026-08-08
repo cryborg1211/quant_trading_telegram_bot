@@ -1,7 +1,7 @@
 # Local Dashboard — Program Goal Charter + Umbrella Orchestration Plan
 
 **Date:** 2026-06-19
-**Status:** ACTIVE
+**Status:** 🟡 P0-P2 COMPLETE, P3 (launcher) not started (stale header corrected 08-08-26). P3/P4/P5 remain genuinely unplanned per `all-context.md`'s Current Features table — this umbrella stays active for that reason, not because P0-P2 are pending.
 **Complexity:** Phase Program (P0–P5)
 **Feature folder:** `process/features/local-dashboard/`
 

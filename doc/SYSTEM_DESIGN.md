@@ -1,9 +1,23 @@
 # Quant V6 — System Design & Continuation Brief
 
-> **For the next agent / chat:** this is the canonical context-transfer doc.
-> Read §1 (TL;DR) and §11 (Honest caveats) first, then §3 (Repo map) before
-> touching code. Numbers are real-OOS, sample sizes included. Nothing here
-> is aspirational — only what is actually built and verified.
+> ⚠️ **SUPERSEDED — DO NOT USE AS CURRENT-STATE TRUTH (flagged 08-08-26).**
+> This document describes the Alpha360-stacking / dual-model (5d + MR)
+> architecture from an earlier sprint (`main` HEAD `c906618` at the time).
+> The system has since moved to **Quant Engine V4.0** — a pure-tabular
+> stacking ensemble (LightGBM+XGBoost+CatBoost, no Alpha360 lags),
+> T+20-primary/T+5-verify serve, GARCH-HMM + drift + breadth exposure
+> brakes, portfolio guard, sentiment paperlog, sector caps, admission
+> hysteresis, and much more that postdates everything below.
+> `src/features/alpha360_generator.py` (central to §5.1/§6.1 here) is
+> explicitly DEPRECATED in the current codebase.
+>
+> **For current-state truth, read `process/context/all-context.md` instead**
+> — that file is the actively-maintained root context entrypoint and is
+> updated after every substantial session. This file is kept as a
+> historical design-rationale snapshot (some ideas here, e.g. the §13.1
+> Deflated Sharpe Ratio / PBO roadmap item, were later actually built —
+> see `src/models/statistical_gates.py` and the DSR/PBO research threads
+> in project memory) — not as an onboarding doc.
 
 **Generated:** end of the dual-model sprint · `main` HEAD `c906618` ·
 24 commits this sprint pushed to `origin/main`.

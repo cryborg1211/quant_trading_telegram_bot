@@ -207,7 +207,7 @@ stock_price_v3/
   deploy/
     quant-v6-bot.service  -- Systemd unit for run_bot.py
   doc/
-    SYSTEM_DESIGN.md      -- System design notes (partially stale)
+    SYSTEM_DESIGN.md      -- SUPERSEDED (flagged 08-08-26, banner added) -- describes the pre-V4.0 Alpha360-stacking architecture; kept as historical design-rationale, not current-state truth
   data/                   -- Runtime data directory (DuckDB, Parquet shards)
   models/                 -- Trained model artifacts (.joblib)
   logs/                   -- Runtime log output
