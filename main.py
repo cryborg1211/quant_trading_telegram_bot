@@ -40,7 +40,7 @@ from src.models.quant_agent_arbitrator import (
     scrape_centralized_news,
 )
 from src.trading.portfolio_manager import PortfolioManager
-from src.trading import breadth, candidate_hysteresis, sector_map, signal_ledger
+from src.trading import breadth, candidate_hysteresis, flow_context, sector_map, signal_ledger
 from src.trading.cohort_weights import prob_scaled_weights
 from src.trading import portfolio_guard
 from src.trading.risk_tier import classify_risk_tier
@@ -291,11 +291,19 @@ def mr_score_tickers(tickers: list[str]) -> dict[str, dict[str, Any]]:
             rising_threshold=CONFIG.trading.mr_breadth_context_rising_threshold,
         )
     for tk, p in zip(latest["ticker"].astype(str), proba, strict=False):
+        fired = bool(p >= tau)
+        # Flow-divergence context (08-08-26, informational only — see
+        # src\trading\flow_context.py). Per-ticker (unlike breadth, which
+        # is one market-wide reading) — only fetched on an actual fire.
+        _flow_ctx = None
+        if fired and CONFIG.trading.mr_flow_divergence_enabled:
+            _flow_ctx = flow_context.live_flow_divergence(tk.upper())
         out[tk.upper()] = {
             "prob": float(p),
-            "fired": bool(p >= tau),
+            "fired": fired,
             "tau": float(tau),
             "breadth_favorable": _breadth_ctx["favorable"] if _breadth_ctx else None,
+            "flow_divergence": _flow_ctx["divergence"] if _flow_ctx else None,
         }
     return out
 

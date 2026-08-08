@@ -142,6 +142,23 @@ def _mr_breadth_context_line(mr: dict | None) -> str:
     tag = "breadth đang cải thiện ✅" if fav else "breadth chưa cải thiện ⚠️"
     return f" (bối cảnh: {tag} — tín hiệu nghiên cứu, chưa xác nhận)"
 
+
+def _mr_flow_divergence_line(mr: dict | None) -> str:
+    """Short VI annotation for the 08-08-26 foreign-flow divergence signal
+    (src/trading/flow_context.py: live_flow_divergence). Empty string when
+    unavailable or the MR signal didn't fire. Unlike breadth-inflection,
+    this one is statistically CONFIRMED (T+20 +2.656% vs +1.387% baseline,
+    p<0.000001, Cohen's d~0.08 on 345 tickers) — real, but the effect size
+    is still small, so this stays an annotation, never a gate or a model
+    feature."""
+    if not mr or not mr.get("fired"):
+        return ""
+    div = mr.get("flow_divergence")
+    if div is None:
+        return ""
+    tag = "vốn ngoại gom mạnh ✅" if div else "chưa có tín hiệu vốn ngoại rõ ⚪"
+    return f" (dòng tiền: {tag} — tín hiệu có ý nghĩa thống kê, ảnh hưởng nhỏ)"
+
 # SHORT horizon rendered in report copy ("Đánh giá xu hướng (N ngày tới)").
 # The `_5d`-named vars/labels below mean "short horizon" — the artifact behind
 # them is T+5 (recovered 16-06-26; the short model stays verify-only role).
@@ -412,7 +429,7 @@ def _build_fallback_observability_report_vi(
         # sub-model fired on extreme panic.
         mr = (mr_scores or {}).get(t) or {}
         tag = " [\U0001f52a BẮT ĐÁY]" if mr.get("fired") else ""
-        _breadth_note = _mr_breadth_context_line(mr)
+        _context_note = _mr_breadth_context_line(mr) + _mr_flow_divergence_line(mr)
         _px = (live_prices or {}).get(t)
         price_str = f"{_px:,.0f} VND" if _px else "N/A"
         out += [
@@ -423,7 +440,7 @@ def _build_fallback_observability_report_vi(
             f"Cửa Giảm {p_dn:.1f}%",
             f"   • <b>Trạng thái:</b> ❌ HỦY BỎ TÍN HIỆU"
             + ("  →  \U0001f52a <b>nhưng MR phát hiện vùng bắt đáy!</b>"
-               f"{html.escape(_breadth_note)}"
+               f"{html.escape(_context_note)}"
                if mr.get("fired") else ""),
             f"   • <b>Lý do:</b> {html.escape(why)}",
             f"   • <b>Tin tức &amp; Tâm lý:</b> {html.escape(_smart_truncate(reason_vi, 800))}",
@@ -484,7 +501,8 @@ def _build_sell_hold_report(
         mr = (mr_scores or {}).get(ticker) or {}
         veto_line = ""
         if decision == _SELL_DECISION and mr.get("fired"):
-            veto_line = f"{_MR_SELL_VETO}{html.escape(_mr_breadth_context_line(mr))}\n"
+            _veto_note = _mr_breadth_context_line(mr) + _mr_flow_divergence_line(mr)
+            veto_line = f"{_MR_SELL_VETO}{html.escape(_veto_note)}\n"
 
         # Plain-language target / trailing-stop from the standing risk rules.
         tp = CONFIG.trading.take_profit_pct   # e.g. +0.15
@@ -542,7 +560,7 @@ def _mr_state_line(mr_state: dict | None) -> str:
             "\U0001f52a <b>Trạng thái Bắt đáy:</b> "
             "\U0001f6a8 <b>CẢNH BÁO HOẢNG LOẠN</b> — cổ phiếu đang ở vùng bán tháo "
             "cực đoan, xác suất cao có nhịp hồi chữ V."
-            f"{html.escape(_mr_breadth_context_line(mr_state))}"
+            f"{html.escape(_mr_breadth_context_line(mr_state) + _mr_flow_divergence_line(mr_state))}"
         )
     return (
         "\U0001f52a <b>Trạng thái Bắt đáy:</b> Chưa đạt "

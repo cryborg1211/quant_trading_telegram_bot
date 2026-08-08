@@ -129,6 +129,10 @@ class TradingConfig:
     mr_breadth_context_delta_window: int = 5
     mr_breadth_context_low_cut: float = 0.41
     mr_breadth_context_rising_threshold: float = 0.03
+
+    # Kill-switch: "mr_flow_divergence_enabled": false in settings.json.
+    # See src/trading/flow_context.py -- 08-08-26 SSI FastConnect research.
+    mr_flow_divergence_enabled: bool = True
     # Promote-gate for the weekly auto-retrain (20-07-26): retrain moved from
     # manual/occasional to EVERY Saturday (quant_weekly_retrain schtask), so a
     # single bad walk-forward run would otherwise auto-overwrite the live
