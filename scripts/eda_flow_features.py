@@ -98,12 +98,23 @@ def adf_report(flow_df: pl.DataFrame, ticker: str) -> dict[str, dict[str, float]
 
     diffed = np.diff(series)
 
-    def _run(x: np.ndarray) -> dict[str, float]:
+    def _run(x: np.ndarray, label: str) -> dict[str, float] | None:
+        # adfuller raises ValueError on a zero-variance series (e.g. a
+        # thinly-traded ticker with literally zero foreign flow its whole
+        # local history) -- real data surfaced this on the first run against
+        # the actual backfill (26-07-26); every prior run only ever saw a
+        # single day, never enough history for a constant series to appear.
+        if np.std(x) == 0.0:
+            LOGGER.warning("[adf] %s %s series is constant (no variance) -- ADF undefined, skipping.",
+                           ticker, label)
+            return None
         stat, pvalue, *_ = adfuller(x, autolag="AIC")
         return {"adf_stat": float(stat), "p_value": float(pvalue), "n_obs": float(len(x))}
 
-    raw_result = _run(series)
-    diff_result = _run(diffed)
+    raw_result = _run(series, "raw")
+    diff_result = _run(diffed, "diff")
+    if raw_result is None or diff_result is None:
+        return {}
     LOGGER.info(
         "[adf] %s  raw: stat=%.3f p=%.4f  |  diff: stat=%.3f p=%.4f  "
         "(p<0.05 = reject unit root = stationary)",
