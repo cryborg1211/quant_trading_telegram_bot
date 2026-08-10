@@ -31,6 +31,12 @@ import polars as pl  # noqa: E402
 REF_PUP = {"p10": 0.321, "median": 0.408, "p90": 0.463}
 # Train-period true-UP base rate (T+20 labels, same teardown).
 REF_UP_BASE_RATE = 0.415
+# The T+20 GOLDEN gate. The strategy admits on an ABSOLUTE threshold, so the
+# statistic that decides whether it ever fires is the UPPER TAIL, not the
+# median — a distribution can hold its centre while its p90 sinks below tau,
+# which shuts the gate with no median drift to warn about. Observed 10-08-26:
+# median shift only -0.015 ("OK") while p90 fell 0.463 -> 0.423, i.e. below tau.
+REF_TAU_T20 = 0.46
 DB = REPO / "data" / "quant_v6_core.duckdb"
 DATA = REPO / "data"
 
@@ -38,11 +44,19 @@ DATA = REPO / "data"
 def prediction_drift(days: int) -> None:
     print(f"\n── 1. Prediction drift (paperlog, last {days}d vs OOS reference) ──")
     with duckdb.connect(str(DB), read_only=True) as conn:
+        # REF_PUP is the T+20 teardown reference, so this must read the T+20
+        # probability. It previously read `p_up_20d`, which despite its name
+        # held the SECONDARY (T+5) probability — the monitor compared T+5
+        # serve output against a T+20 reference and reported "OK" (fixed
+        # 10-08-26 along with the column rename). `source='daily'` is required
+        # because /verify rows have T+5 as their PRIMARY.
         rows = conn.execute(
             """
-            SELECT p_up_20d FROM sentiment_entry_paperlog
+            SELECT p_up_primary FROM sentiment_entry_paperlog
             WHERE log_date >= current_date - ? * INTERVAL '1 day'
-              AND p_up_20d IS NOT NULL
+              AND p_up_primary IS NOT NULL
+              AND source = 'daily'
+              AND COALESCE(primary_horizon_days, 20) = 20
             """,
             [days],
         ).fetchall()
@@ -59,6 +73,22 @@ def prediction_drift(days: int) -> None:
     flag = "OK" if abs(shift) < 0.03 else ("⚠️ DRIFT" if abs(shift) < 0.06 else "🔴 SEVERE")
     print(f"  median shift {shift:+.3f} → {flag}"
           f"{'  (retrain or recalibrate before trusting the gate)' if flag != 'OK' else ''}")
+
+    # Tail-vs-gate check. This is the one that actually predicts whether the
+    # strategy can trade at all, and it is independent of the median.
+    tail_shift = p90 - REF_PUP["p90"]
+    pct_above = float((p >= REF_TAU_T20).mean()) * 100.0
+    print(f"  p90 shift {tail_shift:+.3f}  |  {pct_above:.1f}% of scores reach "
+          f"tau={REF_TAU_T20:.2f}")
+    if p90 < REF_TAU_T20:
+        print(f"  🔴 GATE STARVED: p90={p90:.3f} is BELOW tau={REF_TAU_T20:.2f} — "
+              f"the top decile of the model's own output no longer clears its "
+              f"gate, so the book stays empty regardless of signal quality. "
+              f"Recalibrate tau on the TRADEABLE universe, or widen the "
+              f"universe, before reading anything into the low dispatch count.")
+    elif pct_above < 2.0:
+        print(f"  ⚠️  gate rarely reachable ({pct_above:.1f}% of scores) — "
+              f"expect very few dispatches; too few bets to evaluate.")
 
 
 def label_base_rate(days: int) -> None:

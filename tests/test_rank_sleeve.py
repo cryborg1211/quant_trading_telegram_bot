@@ -1,4 +1,4 @@
-"""Tests for scripts/analyze_rank_sleeve.py::sleeve_verdict (item-1 frozen criteria)."""
+﻿"""Tests for scripts/analyze_rank_sleeve.py::sleeve_verdict (item-1 frozen criteria)."""
 from __future__ import annotations
 
 import datetime as dt
@@ -20,16 +20,16 @@ def _rows(day_specs: list[list[tuple[str, float, float | None, bool]]]) -> pl.Da
     for i, day in enumerate(day_specs):
         d = _D0 + dt.timedelta(days=i)
         for ticker, p_up, ret, filled in day:
-            recs.append({"log_date": d, "ticker": ticker, "p_up_20d": p_up,
+            recs.append({"log_date": d, "ticker": ticker, "p_up_secondary": p_up,
                          "ret_20d": ret, "outcome_filled": filled})
     return pl.DataFrame(recs, schema={"log_date": pl.Date, "ticker": pl.Utf8,
-                                      "p_up_20d": pl.Float64, "ret_20d": pl.Float64,
+                                      "p_up_secondary": pl.Float64, "ret_20d": pl.Float64,
                                       "outcome_filled": pl.Boolean})
 
 
 def test_empty_frame_is_insufficient() -> None:
     out = sleeve_verdict(pl.DataFrame(schema={"log_date": pl.Date, "ticker": pl.Utf8,
-                                              "p_up_20d": pl.Float64, "ret_20d": pl.Float64,
+                                              "p_up_secondary": pl.Float64, "ret_20d": pl.Float64,
                                               "outcome_filled": pl.Boolean}))
     assert out["verdict"] == "INSUFFICIENT_DATA"
     assert out["settled_sleeve_n"] == 0

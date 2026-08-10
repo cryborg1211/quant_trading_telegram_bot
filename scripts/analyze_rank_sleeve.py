@@ -1,4 +1,4 @@
-"""Item-1 pre-registered evaluation: paperlog rank-sleeve counterfactual.
+﻿"""Item-1 pre-registered evaluation: paperlog rank-sleeve counterfactual.
 
 Answers the FROZEN question from
 ``process/general-plans/backlog/attack-narrow-market-preregistration_05-07-26.md``:
@@ -6,8 +6,8 @@ Answers the FROZEN question from
     Does top-3-by-P(UP) (T+20), ignoring the absolute admission gate, make
     money at T+20 in the current regime?
 
-FROZEN criteria (do not edit after outcome data exists — see the backlog doc):
-  * Sleeve  = each day's top-3 tickers by ``p_up_20d`` (``source='daily'``
+FROZEN criteria (do not edit after outcome data exists â€” see the backlog doc):
+  * Sleeve  = each day's top-3 tickers by ``p_up_secondary`` (``source='daily'``
     rows only), equal-weight, T+20 horizon (``ret_20d``).
   * Minimum sample: n >= 60 settled sleeve name-days (``outcome_filled=TRUE``)
     before ANY conclusion is drawn.
@@ -15,10 +15,10 @@ FROZEN criteria (do not edit after outcome data exists — see the backlog doc):
     equal-weight cross-section mean (ranking must beat the tape, not ride it).
   * FAILURE: either condition misses -> item 2 (breadth-conditional sleeve
     A/B) is CANCELLED, not retuned.
-  * Max 3 evaluations total, one per month-of-data — count them by hand in
+  * Max 3 evaluations total, one per month-of-data â€” count them by hand in
     the backlog doc each time this script is run for a verdict.
 
-READ-ONLY on the DuckDB — never writes. Run with the bot stopped (the live
+READ-ONLY on the DuckDB â€” never writes. Run with the bot stopped (the live
 bot holds an exclusive lock).
 
 Usage:
@@ -54,7 +54,7 @@ def sleeve_verdict(
     Parameters
     ----------
     rows : pl.DataFrame
-        Columns: ``log_date, ticker, p_up_20d, ret_20d, outcome_filled``.
+        Columns: ``log_date, ticker, p_up_secondary, ret_20d, outcome_filled``.
         Caller pre-filters to ``source='daily'``.
 
     Returns
@@ -73,11 +73,11 @@ def sleeve_verdict(
         }
 
     # Sleeve membership is decided at LOG time from the full cross-section
-    # (top-N by p_up_20d per day), independent of whether the row later
-    # settles — settlement only gates which sleeve rows are EVALUATED.
+    # (top-N by p_up_secondary per day), independent of whether the row later
+    # settles â€” settlement only gates which sleeve rows are EVALUATED.
     sleeve = (
-        rows.filter(pl.col("p_up_20d").is_not_null())
-        .sort(["log_date", "p_up_20d", "ticker"], descending=[False, True, False])
+        rows.filter(pl.col("p_up_secondary").is_not_null())
+        .sort(["log_date", "p_up_secondary", "ticker"], descending=[False, True, False])
         .group_by("log_date", maintain_order=True)
         .head(sleeve_size)
     )
@@ -134,7 +134,7 @@ def main() -> int:
 
     try:
         raw = con.execute(
-            "SELECT log_date, ticker, p_up_20d, ret_20d, outcome_filled "
+            "SELECT log_date, ticker, p_up_secondary, ret_20d, outcome_filled "
             "FROM sentiment_entry_paperlog WHERE source = 'daily'"
         ).fetchall()
     finally:
@@ -142,7 +142,7 @@ def main() -> int:
 
     rows = pl.DataFrame(
         raw,
-        schema={"log_date": pl.Date, "ticker": pl.Utf8, "p_up_20d": pl.Float64,
+        schema={"log_date": pl.Date, "ticker": pl.Utf8, "p_up_secondary": pl.Float64,
                 "ret_20d": pl.Float64, "outcome_filled": pl.Boolean},
         orient="row",
     )
@@ -158,7 +158,7 @@ def main() -> int:
         LOGGER.info("control mean ret_20d     : %+.2f%%", res["control_mean"] * 100)
     LOGGER.info("VERDICT: %s", res["verdict"])
     if res["verdict"] == "INSUFFICIENT_DATA":
-        LOGGER.info("No conclusion drawn — rows mature 21 calendar days after "
+        LOGGER.info("No conclusion drawn â€” rows mature 21 calendar days after "
                     "log_date (first daily rows: 16-06-26 -> ~07-07-26).")
     else:
         LOGGER.info("Record this evaluation in the backlog doc (max 3 total).")

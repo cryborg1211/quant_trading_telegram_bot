@@ -701,14 +701,24 @@ def _log_sentiment_entry_paperlog(
     final_decisions: dict[str, int],
     all_sentiments: dict[str, dict],
     source: str,
+    primary_horizon_days: int | None = None,
 ) -> int:
     """Forward-log the candidate cross-section into `sentiment_entry_paperlog`.
 
-    One row per ticker in `candidate_tickers` that has a valid 5d prediction.
-    The row captures the T0 state (prediction probs, argmax decision, final
-    arbitrated decision, sentiment score). `entry_close` and realized returns
-    are left NULL at capture time and filled later by
+    One row per ticker in `candidate_tickers` that has a valid primary
+    prediction. The row captures the T0 state (prediction probs, argmax
+    decision, final arbitrated decision, sentiment score). `entry_close` and
+    realized returns are left NULL at capture time and filled later by
     `_backfill_paperlog_outcomes` once the windows mature.
+
+    HORIZON NAMING — `stacking_5d` is the PRIMARY horizon (T+20 on the daily
+    cron) and `stacking_20d` the SECONDARY (T+5); the `_5d`/`_20d` parameter
+    names are legacy, see `daily_inference`. Columns are therefore written as
+    `*_primary` / `*_secondary`. They were previously written as `*_5d`/`*_20d`,
+    which made every by-name consumer read the wrong horizon — `check_drift.py`
+    compared T+5 serve probabilities against a T+20 OOS reference and reported
+    no drift. `primary_horizon_days` is recorded so this cannot recur if the
+    primary horizon ever changes.
 
     Idempotent: the `UNIQUE (log_date, ticker, source)` constraint + INSERT OR
     IGNORE silently suppress same-day duplicates, so re-running a pipeline on
@@ -740,26 +750,30 @@ def _log_sentiment_entry_paperlog(
     log_date = datetime.now().strftime("%Y-%m-%d")
     inserted = 0
     for ticker in candidate_tickers:
-        probs_5d = stacking_5d.get(ticker)
-        if not probs_5d or len(probs_5d) < 3:
+        # `stacking_5d` is the PRIMARY horizon and `stacking_20d` the SECONDARY
+        # (legacy parameter names — see this function's docstring). Locals are
+        # named for what they ARE, so the mapping onto the *_primary /
+        # *_secondary columns below is checkable by eye.
+        probs_primary = stacking_5d.get(ticker)
+        if not probs_primary or len(probs_primary) < 3:
             continue
-        p_down_5d, p_side_5d, p_up_5d = (
-            float(probs_5d[0]),
-            float(probs_5d[1]),
-            float(probs_5d[2]),
+        p_down_primary, p_side_primary, p_up_primary = (
+            float(probs_primary[0]),
+            float(probs_primary[1]),
+            float(probs_primary[2]),
         )
         # argmax over [DOWN, SIDE, UP] → 0 | 1 | 2.
-        decision_5d = int(max(range(3), key=lambda i: probs_5d[i]))
+        decision_primary = int(max(range(3), key=lambda i: probs_primary[i]))
 
-        probs_20d = stacking_20d.get(ticker)
-        if probs_20d and len(probs_20d) >= 3:
-            p_down_20d, p_side_20d, p_up_20d = (
-                float(probs_20d[0]),
-                float(probs_20d[1]),
-                float(probs_20d[2]),
+        probs_secondary = stacking_20d.get(ticker)
+        if probs_secondary and len(probs_secondary) >= 3:
+            p_down_secondary, p_side_secondary, p_up_secondary = (
+                float(probs_secondary[0]),
+                float(probs_secondary[1]),
+                float(probs_secondary[2]),
             )
         else:
-            p_down_20d = p_side_20d = p_up_20d = None
+            p_down_secondary = p_side_secondary = p_up_secondary = None
 
         sent = all_sentiments.get(ticker) or {}
         sentiment_score = sent.get("sentiment_score")
@@ -769,16 +783,17 @@ def _log_sentiment_entry_paperlog(
             db.conn.execute(
                 """
                 INSERT OR IGNORE INTO sentiment_entry_paperlog
-                (log_date, ticker, source, p_down_5d, p_side_5d, p_up_5d,
-                 decision_5d, p_down_20d, p_side_20d, p_up_20d,
-                 final_decision, sentiment_score)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (log_date, ticker, source,
+                 p_down_primary, p_side_primary, p_up_primary, decision_primary,
+                 p_down_secondary, p_side_secondary, p_up_secondary,
+                 primary_horizon_days, final_decision, sentiment_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     log_date, ticker, source,
-                    p_down_5d, p_side_5d, p_up_5d, decision_5d,
-                    p_down_20d, p_side_20d, p_up_20d,
-                    final_decision, sentiment_score,
+                    p_down_primary, p_side_primary, p_up_primary, decision_primary,
+                    p_down_secondary, p_side_secondary, p_up_secondary,
+                    primary_horizon_days, final_decision, sentiment_score,
                 ],
             )
         inserted += 1
@@ -1176,6 +1191,7 @@ def _paperlog_snapshot_and_backfill(
     horizon_predictions: dict[str, dict[str, list[float]]],
     final_decisions: dict[str, int],
     all_sentiments: dict[str, Any],
+    primary_horizon_days: int | None = None,
 ) -> None:
     """Never-raise `source='daily'` paperlog write + matured-outcome backfill.
 
@@ -1194,6 +1210,7 @@ def _paperlog_snapshot_and_backfill(
             final_decisions=final_decisions,
             all_sentiments=all_sentiments,
             source="daily",
+            primary_horizon_days=primary_horizon_days,
         )
         backfilled = _backfill_paperlog_outcomes(db)
         LOGGER.info(
@@ -1209,6 +1226,7 @@ def _paperlog_no_trade_day(
     horizon_predictions: dict[str, dict[str, list[float]]],
     final_decisions: dict[str, int],
     all_sentiments: dict[str, Any],
+    primary_horizon_days: int | None = None,
 ) -> None:
     """Paperlog write for daily_inference exit paths that hold no manager.
 
@@ -1222,7 +1240,8 @@ def _paperlog_no_trade_day(
         from src.data.db_engine import DuckDBEngine  # noqa: PLC0415
 
         _paperlog_snapshot_and_backfill(
-            DuckDBEngine(), horizon_predictions, final_decisions, all_sentiments
+            DuckDBEngine(), horizon_predictions, final_decisions, all_sentiments,
+            primary_horizon_days=primary_horizon_days,
         )
     except Exception:  # noqa: BLE001 — observability must never raise
         LOGGER.exception("Paperlog no-trade-day write failed — non-fatal.")
@@ -1926,7 +1945,8 @@ def run_trade_execution(
             # skip the paperlog write below. No-trade days are data, not noise.
             if persist and manager is not None and CONFIG.trading.sentiment_entry_enabled:
                 _paperlog_snapshot_and_backfill(
-                    manager.db, stacking_predictions, final_decisions, all_sentiments
+                    manager.db, stacking_predictions, final_decisions, all_sentiments,
+                    primary_horizon_days=int(horizon),
                 )
             return "", dispatched_signals
 
@@ -1967,7 +1987,8 @@ def run_trade_execution(
                 # trading decision changes. Reuses `db = manager.db` (no new conn).
                 if CONFIG.trading.sentiment_entry_enabled:
                     _paperlog_snapshot_and_backfill(
-                        db, stacking_predictions, final_decisions, all_sentiments
+                        db, stacking_predictions, final_decisions, all_sentiments,
+                        primary_horizon_days=int(horizon),
                     )
 
         LOGGER.info("Dispatching Telegram Alerts...")
@@ -2289,6 +2310,11 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
                 final_decisions=final_decisions,
                 all_sentiments=all_sentiments,
                 source="verify",
+                # /verify's PRIMARY is the SHORT horizon, unlike the daily
+                # cron's T+20 — so the two sources write different horizons
+                # into the same columns. Recording it is what makes them
+                # separable at analysis time; without it they silently mix.
+                primary_horizon_days=int(SHORT_HORIZON),
             )
             _backfill_paperlog_outcomes(_vdb)
         except Exception:  # noqa: BLE001

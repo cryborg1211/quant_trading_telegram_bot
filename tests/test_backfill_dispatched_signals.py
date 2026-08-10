@@ -1,4 +1,4 @@
-"""Best-effort dispatched_signals backfill from the sentiment paperlog.
+﻿"""Best-effort dispatched_signals backfill from the sentiment paperlog.
 
 Covers the four load-bearing behaviors of the reconstruction core:
   1. T20 decision derived as argmax over the three 20d probs (NULL-safe).
@@ -38,7 +38,7 @@ class _FakePriceLookup:
     """Injectable stand-in for ``src.data.price_lookup``.
 
     ``sessions`` are the full trading calendar (strictly-after filtering mirrors
-    the real ``trading_dates_after`` contract). ``closes`` maps ticker → close;
+    the real ``trading_dates_after`` contract). ``closes`` maps ticker â†’ close;
     a missing ticker yields ``None`` (drives the no-price skip path).
     """
 
@@ -58,7 +58,7 @@ def _row(
     ticker: str = "HPG",
     log_date: date = date(2026, 6, 1),
     source: str = "daily",
-    decision_5d: int | None = 1,
+    decision_primary: int | None = 1,
     p20: tuple[float | None, float | None, float | None] = (0.6, 0.3, 0.1),
     entry_close: float | None = 100.0,
 ) -> PaperlogRow:
@@ -66,10 +66,10 @@ def _row(
         log_date=log_date,
         ticker=ticker,
         source=source,
-        decision_5d=decision_5d,
-        p_down_20d=p20[0],
-        p_side_20d=p20[1],
-        p_up_20d=p20[2],
+        decision_primary=decision_primary,
+        p_down_secondary=p20[0],
+        p_side_secondary=p20[1],
+        p_up_secondary=p20[2],
         entry_close=entry_close,
     )
 
@@ -78,9 +78,9 @@ def _row(
 
 class TestDecisionFromProbs:
     def test_sell_hold_buy_argmax(self) -> None:
-        assert decision_from_probs(0.5, 0.3, 0.2) == 0  # DOWN → SELL
-        assert decision_from_probs(0.2, 0.5, 0.3) == 1  # SIDE → HOLD
-        assert decision_from_probs(0.2, 0.3, 0.5) == 2  # UP   → BUY
+        assert decision_from_probs(0.5, 0.3, 0.2) == 0  # DOWN â†’ SELL
+        assert decision_from_probs(0.2, 0.5, 0.3) == 1  # SIDE â†’ HOLD
+        assert decision_from_probs(0.2, 0.3, 0.5) == 2  # UP   â†’ BUY
 
     def test_null_any_returns_none(self) -> None:
         assert decision_from_probs(None, 0.3, 0.5) is None
@@ -88,12 +88,12 @@ class TestDecisionFromProbs:
         assert decision_from_probs(0.2, 0.3, None) is None
 
     def test_tie_resolves_to_lowest_index(self) -> None:
-        # DOWN and UP tied → lowest index (0 = SELL) wins; never spuriously BUY.
+        # DOWN and UP tied â†’ lowest index (0 = SELL) wins; never spuriously BUY.
         assert decision_from_probs(0.4, 0.2, 0.4) == 0
 
     def test_t20_buy_row_planned_via_derived_argmax(self) -> None:
-        # decision_5d is HOLD (no T5 row), but the 20d probs argmax to BUY.
-        row = _row(decision_5d=1, p20=(0.1, 0.3, 0.6))
+        # decision_primary is HOLD (no T5 row), but the 20d probs argmax to BUY.
+        row = _row(decision_primary=1, p20=(0.1, 0.3, 0.6))
         pl = _FakePriceLookup({"HPG": 100.0}, _weekday_sessions(date(2026, 6, 1), 40))
         planned, stats = build_backfill_plan([row], set(), _TODAY, pl)
         assert stats.t5_found == 0
@@ -102,7 +102,7 @@ class TestDecisionFromProbs:
         assert planned[0].hold_days == 30
 
     def test_t20_null_prob_row_skipped_and_counted(self) -> None:
-        row = _row(decision_5d=1, p20=(0.1, None, 0.6))
+        row = _row(decision_primary=1, p20=(0.1, None, 0.6))
         pl = _FakePriceLookup({"HPG": 100.0}, _weekday_sessions(date(2026, 6, 1), 40))
         planned, stats = build_backfill_plan([row], set(), _TODAY, pl)
         assert planned == []
@@ -114,11 +114,11 @@ class TestDecisionFromProbs:
 class TestStatusBranching:
     def test_t5_matured_closed_t20_still_open_same_row(self) -> None:
         # One row that is BOTH a T5 BUY and a T20 BUY. With only 10 sessions
-        # elapsed (<= today): T5 (hold 5) matured → CLOSED @ sessions[4];
-        # T20 (hold 30) not matured → OPEN.
+        # elapsed (<= today): T5 (hold 5) matured â†’ CLOSED @ sessions[4];
+        # T20 (hold 30) not matured â†’ OPEN.
         d0 = date(2026, 6, 1)
         sessions = _weekday_sessions(d0, 10)
-        row = _row(log_date=d0, decision_5d=2, p20=(0.1, 0.2, 0.7))
+        row = _row(log_date=d0, decision_primary=2, p20=(0.1, 0.2, 0.7))
         pl = _FakePriceLookup({"HPG": 100.0}, sessions)
         planned, stats = build_backfill_plan([row], set(), _TODAY, pl)
 
@@ -129,18 +129,18 @@ class TestStatusBranching:
 
     def test_t20_matured_closed_date_is_thirtieth_session(self) -> None:
         d0 = date(2026, 6, 1)
-        sessions = _weekday_sessions(d0, 40)  # all <= today → T20 (hold 30) matured
-        row = _row(log_date=d0, decision_5d=1, p20=(0.1, 0.2, 0.7))
+        sessions = _weekday_sessions(d0, 40)  # all <= today â†’ T20 (hold 30) matured
+        row = _row(log_date=d0, decision_primary=1, p20=(0.1, 0.2, 0.7))
         pl = _FakePriceLookup({"HPG": 100.0}, sessions)
         planned, _ = build_backfill_plan([row], set(), _TODAY, pl)
         assert planned[0].status == "CLOSED"
-        assert planned[0].closed_date == sessions[29]  # hold_days=30 → 30th session
+        assert planned[0].closed_date == sessions[29]  # hold_days=30 â†’ 30th session
 
     def test_still_open_when_fewer_sessions_than_hold(self) -> None:
-        # Only 3 sessions elapsed → even T5 (hold 5) is still OPEN.
+        # Only 3 sessions elapsed â†’ even T5 (hold 5) is still OPEN.
         d0 = date(2026, 6, 1)
         sessions = _weekday_sessions(d0, 3)
-        row = _row(log_date=d0, decision_5d=2, p20=(0.6, 0.3, 0.1))  # T5 only
+        row = _row(log_date=d0, decision_primary=2, p20=(0.6, 0.3, 0.1))  # T5 only
         pl = _FakePriceLookup({"HPG": 100.0}, sessions)
         planned, stats = build_backfill_plan([row], set(), _TODAY, pl)
         assert [p.horizon for p in planned] == [5]
@@ -148,17 +148,17 @@ class TestStatusBranching:
         assert stats.open_count == 1 and stats.closed_count == 0
 
     def test_no_price_row_skipped_and_counted(self) -> None:
-        # entry_close absent AND no parquet close → no usable t0 → skip.
-        row = _row(decision_5d=2, p20=(0.6, 0.3, 0.1), entry_close=None)
+        # entry_close absent AND no parquet close â†’ no usable t0 â†’ skip.
+        row = _row(decision_primary=2, p20=(0.6, 0.3, 0.1), entry_close=None)
         pl = _FakePriceLookup({}, _weekday_sessions(date(2026, 6, 1), 40))
         planned, stats = build_backfill_plan([row], set(), _TODAY, pl)
         assert planned == []
         assert stats.t5_found == 1 and stats.t5_no_price == 1 and stats.t5_planned == 0
 
     def test_entry_close_used_as_t0_when_shard_missing(self) -> None:
-        # entry_close present (positive) → row still reconstructs even though the
+        # entry_close present (positive) â†’ row still reconstructs even though the
         # parquet close lookup would return None.
-        row = _row(decision_5d=2, p20=(0.6, 0.3, 0.1), entry_close=27.5)
+        row = _row(decision_primary=2, p20=(0.6, 0.3, 0.1), entry_close=27.5)
         pl = _FakePriceLookup({}, _weekday_sessions(date(2026, 6, 1), 40))
         planned, stats = build_backfill_plan([row], set(), _TODAY, pl)
         assert stats.t5_planned == 1 and planned[0].status == "CLOSED"
@@ -170,7 +170,7 @@ class TestDedup:
     def test_existing_key_skips_that_horizon_only(self) -> None:
         d0 = date(2026, 6, 1)
         # Row is BOTH T5 BUY and T20 BUY. Pre-seed only the T5 key as existing.
-        row = _row(log_date=d0, decision_5d=2, p20=(0.1, 0.2, 0.7))
+        row = _row(log_date=d0, decision_primary=2, p20=(0.1, 0.2, 0.7))
         pl = _FakePriceLookup({"HPG": 100.0}, _weekday_sessions(d0, 40))
         existing = {("HPG", d0, 5)}
         planned, stats = build_backfill_plan([row], existing, _TODAY, pl)
@@ -180,10 +180,10 @@ class TestDedup:
         assert [p.horizon for p in planned] == [20]  # T5 deduped, T20 inserted
 
     def test_same_key_not_double_planned_within_run(self) -> None:
-        # Two identical daily rows (e.g. re-run artifact) → the second is deduped
+        # Two identical daily rows (e.g. re-run artifact) â†’ the second is deduped
         # by the in-run key set, not re-planned.
         d0 = date(2026, 6, 1)
-        row = _row(log_date=d0, decision_5d=2, p20=(0.6, 0.3, 0.1))  # T5 only
+        row = _row(log_date=d0, decision_primary=2, p20=(0.6, 0.3, 0.1))  # T5 only
         pl = _FakePriceLookup({"HPG": 100.0}, _weekday_sessions(d0, 40))
         planned, stats = build_backfill_plan([row, row], set(), _TODAY, pl)
         assert stats.t5_planned == 1 and stats.t5_dup == 1
@@ -195,8 +195,8 @@ class TestDedup:
 class TestSourceExclusion:
     def test_verify_rows_excluded(self) -> None:
         d0 = date(2026, 6, 1)
-        # A verify row that WOULD qualify as both T5 and T20 BUY — must be skipped.
-        verify_row = _row(log_date=d0, source="verify", decision_5d=2, p20=(0.1, 0.2, 0.7))
+        # A verify row that WOULD qualify as both T5 and T20 BUY â€” must be skipped.
+        verify_row = _row(log_date=d0, source="verify", decision_primary=2, p20=(0.1, 0.2, 0.7))
         pl = _FakePriceLookup({"HPG": 100.0}, _weekday_sessions(d0, 40))
         planned, stats = build_backfill_plan([verify_row], set(), _TODAY, pl)
 
@@ -207,9 +207,9 @@ class TestSourceExclusion:
     def test_daily_kept_verify_dropped_in_mixed_batch(self) -> None:
         d0 = date(2026, 6, 1)
         daily = _row(ticker="FPT", log_date=d0, source="daily",
-                     decision_5d=2, p20=(0.6, 0.3, 0.1))  # T5 only
+                     decision_primary=2, p20=(0.6, 0.3, 0.1))  # T5 only
         verify = _row(ticker="HPG", log_date=d0, source="verify",
-                      decision_5d=2, p20=(0.1, 0.2, 0.7))
+                      decision_primary=2, p20=(0.1, 0.2, 0.7))
         pl = _FakePriceLookup({"FPT": 100.0, "HPG": 100.0}, _weekday_sessions(d0, 40))
         planned, stats = build_backfill_plan([daily, verify], set(), _TODAY, pl)
 

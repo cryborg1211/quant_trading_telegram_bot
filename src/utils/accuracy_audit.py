@@ -1,4 +1,4 @@
-"""Model accuracy auditor — confusion-matrix analytics over the paperlog.
+﻿"""Model accuracy auditor â€” confusion-matrix analytics over the paperlog.
 
 READ-SIDE ONLY. This module adds the one thing the existing audit stack does
 not have: it classifies the forward paper-logged predictions in
@@ -7,12 +7,12 @@ not have: it classifies the forward paper-logged predictions in
 
 It deliberately introduces NO new table and patches NO serve path. Capture and
 settlement already exist:
-    * capture   — ``main._log_sentiment_entry_paperlog`` (daily + /verify)
-    * settlement — ``main._backfill_paperlog_outcomes`` (progressive, T+20 terminal)
+    * capture   â€” ``main._log_sentiment_entry_paperlog`` (daily + /verify)
+    * settlement â€” ``main._backfill_paperlog_outcomes`` (progressive, T+20 terminal)
 A row is "settled" once its terminal ``ret_20d`` is filled
 (``outcome_filled = TRUE``); ``ret_20d`` is a fraction ``(t20 - t0) / t0``.
 
-Decision encoding (argmax over [DOWN, SIDE, UP], shared by ``decision_5d`` and
+Decision encoding (argmax over [DOWN, SIDE, UP], shared by ``decision_primary`` and
 the arbitrated ``final_decision``): ``0 = SELL/EXIT``, ``1 = HOLD``, ``2 = BUY``.
 """
 
@@ -24,9 +24,9 @@ from typing import Any
 _SELL, _HOLD, _BUY = 0, 1, 2
 _DECISION_LABEL = {_BUY: "BUY", _HOLD: "HOLD", _SELL: "SELL"}
 
-# Confusion-matrix tag → status emoji. Correct bullish call = green, correct
+# Confusion-matrix tag â†’ status emoji. Correct bullish call = green, correct
 # defensive call = blue, any wrong call (bad buy OR missed upside) = red.
-_TAG_EMOJI = {"TP": "🟢", "TN": "🔵", "FP": "🔴", "FN": "🔴"}
+_TAG_EMOJI = {"TP": "ðŸŸ¢", "TN": "ðŸ”µ", "FP": "ðŸ”´", "FN": "ðŸ”´"}
 
 _DEFAULT_TABLE_ROWS = 15
 
@@ -41,10 +41,10 @@ def classify_outcome(decision: int | None, ret: float | None) -> str | None:
 
     BUY is the positive class; SELL and HOLD are the defensive (negative) class.
 
-    * BUY  & ret > 0  → ``TP``  (acted, price rose)
-    * BUY  & ret <= 0 → ``FP``  (acted, price did not rise)
-    * SELL/HOLD & ret <= 0 → ``TN``  (stayed out, price fell/flat — correct)
-    * SELL/HOLD & ret > 0  → ``FN``  (stayed out, price rose — missed)
+    * BUY  & ret > 0  â†’ ``TP``  (acted, price rose)
+    * BUY  & ret <= 0 â†’ ``FP``  (acted, price did not rise)
+    * SELL/HOLD & ret <= 0 â†’ ``TN``  (stayed out, price fell/flat â€” correct)
+    * SELL/HOLD & ret > 0  â†’ ``FN``  (stayed out, price rose â€” missed)
 
     Returns ``None`` when the row is ungradable (no decision or no return).
     """
@@ -62,13 +62,13 @@ def fetch_settled_predictions(
     """Settled paperlog rows (terminal T+20 return present), newest first.
 
     ``db`` must expose ``.conn`` (DuckDB). Prefers the arbitrated
-    ``final_decision``; falls back to the raw ``decision_5d`` argmax when the
+    ``final_decision``; falls back to the raw ``decision_primary`` argmax when the
     arbitrated value is NULL. Degrades to ``[]`` on any read failure so an
     audit can never crash the caller.
     """
     sql = (
         "SELECT log_date, ticker, "
-        "COALESCE(final_decision, decision_5d) AS decision, "
+        "COALESCE(final_decision, decision_primary) AS decision, "
         "entry_close, ret_20d "
         "FROM sentiment_entry_paperlog "
         "WHERE outcome_filled = TRUE AND ret_20d IS NOT NULL "
@@ -81,7 +81,7 @@ def fetch_settled_predictions(
 
     try:
         rows = db.conn.execute(sql, params).fetchall()
-    except Exception:  # noqa: BLE001 — missing table / cold DB → empty audit.
+    except Exception:  # noqa: BLE001 â€” missing table / cold DB â†’ empty audit.
         return []
 
     return [
@@ -99,9 +99,9 @@ def fetch_settled_predictions(
 def summarize_accuracy(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate settled rows into the confusion matrix + precision/recall.
 
-    BUY precision   = TP / (TP + FP)   — of acted-on buys, how many rose.
-    Defensive recall = TN / (TN + FN)  — of true non-winners, how many we avoided.
-    Both are ``None`` when their denominator is zero (shown as "—" upstream).
+    BUY precision   = TP / (TP + FP)   â€” of acted-on buys, how many rose.
+    Defensive recall = TN / (TN + FN)  â€” of true non-winners, how many we avoided.
+    Both are ``None`` when their denominator is zero (shown as "â€”" upstream).
     """
     counts = {"TP": 0, "FP": 0, "TN": 0, "FN": 0}
     for row in rows:
@@ -121,8 +121,8 @@ def summarize_accuracy(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _fmt_pct(value: float | None) -> str:
-    """Percent with one decimal, or ``—`` for an undefined ratio."""
-    return f"{value * 100:.1f}%" if value is not None else "—"
+    """Percent with one decimal, or ``â€”`` for an undefined ratio."""
+    return f"{value * 100:.1f}%" if value is not None else "â€”"
 
 
 def build_accuracy_report(
@@ -137,7 +137,7 @@ def build_accuracy_report(
     ``DuckDBEngine`` singleton (lazy import) so callers can stay thin.
     """
     if db is None:
-        from src.data.db_engine import DuckDBEngine  # noqa: PLC0415 — lazy heavy import
+        from src.data.db_engine import DuckDBEngine  # noqa: PLC0415 â€” lazy heavy import
 
         db = DuckDBEngine()
 
@@ -149,19 +149,19 @@ def build_accuracy_report(
     c = summary["counts"]
 
     header = (
-        "📊 <b>HẬU KIỂM ĐỘ CHÍNH XÁC MÔ HÌNH</b>\n"
-        f"<b>Tổng đã chốt:</b> {summary['total_settled']}  ·  "
-        f"<b>BUY Precision:</b> {_fmt_pct(summary['buy_precision'])}  ·  "
+        "ðŸ“Š <b>Háº¬U KIá»‚M Äá»˜ CHÃNH XÃC MÃ” HÃŒNH</b>\n"
+        f"<b>Tá»•ng Ä‘Ã£ chá»‘t:</b> {summary['total_settled']}  Â·  "
+        f"<b>BUY Precision:</b> {_fmt_pct(summary['buy_precision'])}  Â·  "
         f"<b>Defensive Recall:</b> {_fmt_pct(summary['defensive_recall'])}\n"
-        f"<i>🟢 TP {c['TP']} · 🔴 FP {c['FP']} · 🔵 TN {c['TN']} · 🔴 FN {c['FN']}</i>"
+        f"<i>ðŸŸ¢ TP {c['TP']} Â· ðŸ”´ FP {c['FP']} Â· ðŸ”µ TN {c['TN']} Â· ðŸ”´ FN {c['FN']}</i>"
     )
 
     # Fixed-width table inside <pre> so columns align in Telegram HTML.
-    lines = [f"{'Mã':<6}{'Ngày':<12}{'Lệnh':<6}{'R%':>8}  KQ"]
+    lines = [f"{'MÃ£':<6}{'NgÃ y':<12}{'Lá»‡nh':<6}{'R%':>8}  KQ"]
     for row in rows[:last_n]:
         tag = classify_outcome(row["decision"], row["ret"])
         emoji = _TAG_EMOJI.get(tag, "")
-        ret_pct = f"{row['ret'] * 100:+.1f}" if row["ret"] is not None else "—"
+        ret_pct = f"{row['ret'] * 100:+.1f}" if row["ret"] is not None else "â€”"
         lines.append(
             f"{row['ticker']:<6}{str(row['log_date']):<12}"
             f"{decision_label(row['decision']):<6}{ret_pct:>8}  {emoji} {tag}"

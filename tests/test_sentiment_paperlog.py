@@ -1,12 +1,12 @@
-"""Sentiment-entry forward paper-log — capture + backfill unit tests.
+﻿"""Sentiment-entry forward paper-log â€” capture + backfill unit tests.
 
 Covers the two new pure-ish helpers in main.py:
-    * `_log_sentiment_entry_paperlog` — writes the candidate cross-section.
-    * `_backfill_paperlog_outcomes`   — fills realized T+3 / T+20 returns.
+    * `_log_sentiment_entry_paperlog` â€” writes the candidate cross-section.
+    * `_backfill_paperlog_outcomes`   â€” fills realized T+3 / T+20 returns.
 
 Both operate on a `db` object exposing `.conn` (DuckDB connection) and
 `._audit_lock` (threading.Lock). The tests build a lightweight in-memory stand-
-in for that object — a fresh `duckdb.connect()` with the paper-log DDL applied —
+in for that object â€” a fresh `duckdb.connect()` with the paper-log DDL applied â€”
 so no real DuckDBEngine singleton, no parquet shards, and no external services
 are touched. Price lookups are monkeypatched to deterministic floats.
 """
@@ -28,27 +28,71 @@ import main
 _PAPERLOG_DDL_SEQ = "CREATE SEQUENCE IF NOT EXISTS seq_sentiment_entry_id START 1"
 _PAPERLOG_DDL_TABLE = """
     CREATE TABLE IF NOT EXISTS sentiment_entry_paperlog (
-        id              INTEGER DEFAULT nextval('seq_sentiment_entry_id'),
-        log_date        DATE    NOT NULL,
-        ticker          VARCHAR NOT NULL,
-        source          VARCHAR NOT NULL,
-        p_down_5d       DOUBLE,
-        p_side_5d       DOUBLE,
-        p_up_5d         DOUBLE,
-        decision_5d     INTEGER,
-        p_down_20d      DOUBLE,
-        p_side_20d      DOUBLE,
-        p_up_20d        DOUBLE,
-        final_decision  INTEGER,
-        sentiment_score DOUBLE,
-        entry_close     DOUBLE,
-        ret_3d          DOUBLE,
-        ret_20d         DOUBLE,
-        outcome_filled  BOOLEAN DEFAULT FALSE,
+        id                   INTEGER DEFAULT nextval('seq_sentiment_entry_id'),
+        log_date             DATE    NOT NULL,
+        ticker               VARCHAR NOT NULL,
+        source               VARCHAR NOT NULL,
+        p_down_primary       DOUBLE,
+        p_side_primary       DOUBLE,
+        p_up_primary         DOUBLE,
+        decision_primary     INTEGER,
+        p_down_secondary     DOUBLE,
+        p_side_secondary     DOUBLE,
+        p_up_secondary       DOUBLE,
+        primary_horizon_days INTEGER,
+        final_decision       INTEGER,
+        sentiment_score      DOUBLE,
+        entry_close          DOUBLE,
+        ret_3d               DOUBLE,
+        ret_20d              DOUBLE,
+        outcome_filled       BOOLEAN DEFAULT FALSE,
         PRIMARY KEY (id),
         UNIQUE (log_date, ticker, source)
     )
 """
+# NOTE: this DDL duplicates `db_engine._init_sentiment_paperlog_table` and must
+# be kept in sync by hand — a column added there and not here fails only as an
+# opaque DuckDB BinderException, which is how the 10-08-26 rename first showed
+# up. `test_stub_schema_matches_production` below pins the two together.
+
+
+def test_stub_schema_matches_production():
+    """The stub DDL above must list the same columns as production.
+
+    Guards the duplication: without this, adding a column to
+    `db_engine._init_sentiment_paperlog_table` leaves these tests passing
+    against a stale schema, and the mismatch surfaces later as an opaque
+    BinderException from the writer.
+    """
+    import re
+
+    from src.data import db_engine as dbe
+
+    prod_sql = dbe.DuckDBEngine._init_sentiment_paperlog_table.__doc__ or ""
+    del prod_sql  # the DDL lives in the body, not the docstring — parse the source
+
+    import inspect
+    body = inspect.getsource(dbe.DuckDBEngine._init_sentiment_paperlog_table)
+    prod_block = body.split("CREATE TABLE IF NOT EXISTS sentiment_entry_paperlog", 1)[1]
+    prod_block = prod_block.split("PRIMARY KEY", 1)[0]
+    stub_block = _PAPERLOG_DDL_TABLE.split(
+        "CREATE TABLE IF NOT EXISTS sentiment_entry_paperlog", 1)[1]
+    stub_block = stub_block.split("PRIMARY KEY", 1)[0]
+
+    def names(block: str) -> set[str]:
+        out = set()
+        for line in block.splitlines():
+            m = re.match(r"\s*([a-z_]+)\s+(INTEGER|DOUBLE|VARCHAR|DATE|BOOLEAN)",
+                         line)
+            if m:
+                out.add(m.group(1))
+        return out
+
+    prod, stub = names(prod_block), names(stub_block)
+    assert prod, "failed to parse the production DDL — fix this test's parser"
+    assert prod == stub, (
+        f"paperlog schema drift — only in production: {sorted(prod - stub)}; "
+        f"only in the test stub: {sorted(stub - prod)}")
 
 
 @pytest.fixture()
@@ -67,13 +111,13 @@ def fake_db():
 
 
 # --------------------------------------------------------------------------- #
-# Test Group A — capture helper (_log_sentiment_entry_paperlog)
+# Test Group A â€” capture helper (_log_sentiment_entry_paperlog)
 # --------------------------------------------------------------------------- #
 
 _STACK_5D = {
-    "HPG": [0.6, 0.3, 0.1],   # argmax → 0 (DOWN)
-    "FPT": [0.1, 0.2, 0.7],   # argmax → 2 (UP)
-    "VCB": [0.2, 0.6, 0.2],   # argmax → 1 (SIDE)
+    "HPG": [0.6, 0.3, 0.1],   # argmax â†’ 0 (DOWN)
+    "FPT": [0.1, 0.2, 0.7],   # argmax â†’ 2 (UP)
+    "VCB": [0.2, 0.6, 0.2],   # argmax â†’ 1 (SIDE)
 }
 _STACK_20D = {
     "HPG": [0.5, 0.3, 0.2],
@@ -106,7 +150,7 @@ def test_log_writes_full_crosssection(fake_db) -> None:
     assert _count(fake_db) == 3
     # Spot-check the DOWN argmax + sentiment landed correctly for the treatment name.
     row = fake_db.conn.execute(
-        "SELECT decision_5d, sentiment_score, final_decision, source "
+        "SELECT decision_primary, sentiment_score, final_decision, source "
         "FROM sentiment_entry_paperlog WHERE ticker = 'HPG'"
     ).fetchone()
     assert row == (0, 0.85, 0, "daily")
@@ -123,7 +167,7 @@ def test_log_idempotent_same_day(fake_db) -> None:
     )
     main._log_sentiment_entry_paperlog(db=fake_db, **args)
     main._log_sentiment_entry_paperlog(db=fake_db, **args)  # same day, same tickers
-    # UNIQUE(log_date, ticker, source) + INSERT OR IGNORE → no duplicates.
+    # UNIQUE(log_date, ticker, source) + INSERT OR IGNORE â†’ no duplicates.
     assert _count(fake_db) == 3
 
 
@@ -140,7 +184,7 @@ def test_log_20d_none_stores_null(fake_db) -> None:
     nulls = int(
         fake_db.conn.execute(
             "SELECT COUNT(*) FROM sentiment_entry_paperlog "
-            "WHERE p_down_20d IS NULL AND p_side_20d IS NULL AND p_up_20d IS NULL"
+            "WHERE p_down_secondary IS NULL AND p_side_secondary IS NULL AND p_up_secondary IS NULL"
         ).fetchone()[0]
     )
     assert nulls == 3
@@ -181,7 +225,7 @@ def test_log_source_tagged_verify(fake_db) -> None:
 
 
 def test_log_skips_ticker_with_no_5d(fake_db) -> None:
-    # MWG has no 5d prediction → must be skipped, not written.
+    # MWG has no 5d prediction â†’ must be skipped, not written.
     n = main._log_sentiment_entry_paperlog(
         db=fake_db,
         candidate_tickers=["HPG", "MWG"],
@@ -202,7 +246,7 @@ def test_log_skips_ticker_with_no_5d(fake_db) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Test Group B — backfill helper (_backfill_paperlog_outcomes)
+# Test Group B â€” backfill helper (_backfill_paperlog_outcomes)
 # --------------------------------------------------------------------------- #
 
 
@@ -212,7 +256,7 @@ def _insert_raw_row(db, ticker: str, log_date: date) -> None:
         db.conn.execute(
             """
             INSERT OR IGNORE INTO sentiment_entry_paperlog
-            (log_date, ticker, source, p_down_5d, p_side_5d, p_up_5d, decision_5d)
+            (log_date, ticker, source, p_down_primary, p_side_primary, p_up_primary, decision_primary)
             VALUES (?, ?, 'daily', 0.6, 0.3, 0.1, 0)
             """,
             [log_date.strftime("%Y-%m-%d"), ticker],
@@ -269,7 +313,7 @@ def test_backfill_short_horizon_fills_progressively(fake_db, monkeypatch) -> Non
 
 
 def test_backfill_skips_ultra_fresh_row(fake_db, monkeypatch) -> None:
-    # Younger than the short-maturity gate → not even scanned.
+    # Younger than the short-maturity gate â†’ not even scanned.
     log_date = date.today() - timedelta(days=2)
     _insert_raw_row(fake_db, "VCB", log_date)
 
@@ -291,14 +335,14 @@ def test_backfill_skips_ultra_fresh_row(fake_db, monkeypatch) -> None:
 
 def test_backfill_long_horizon_completes_partial_row(fake_db, monkeypatch) -> None:
     # A row already carrying ret_3d (filled on an earlier run) gets ret_20d and
-    # flips terminal once the max horizon matures. entry_close is REUSED — the
+    # flips terminal once the max horizon matures. entry_close is REUSED â€” the
     # T0 lookup must not run, proven by a poisoned close_on_or_before.
     log_date = date.today() - timedelta(days=25)
     with fake_db._audit_lock:
         fake_db.conn.execute(
             """
             INSERT INTO sentiment_entry_paperlog
-            (log_date, ticker, source, p_down_5d, p_side_5d, p_up_5d, decision_5d,
+            (log_date, ticker, source, p_down_primary, p_side_primary, p_up_primary, decision_primary,
              entry_close, ret_3d, outcome_filled)
             VALUES (?, 'HPG', 'daily', 0.6, 0.3, 0.1, 0, 100.0, 0.05, FALSE)
             """,
@@ -328,7 +372,7 @@ def test_backfill_handles_missing_parquet(fake_db, monkeypatch) -> None:
     log_date = date.today() - timedelta(days=25)
     _insert_raw_row(fake_db, "DELISTED", log_date)
 
-    # T0 shard absent → close_on_or_before returns None → row left untouched.
+    # T0 shard absent â†’ close_on_or_before returns None â†’ row left untouched.
     monkeypatch.setattr(
         main.price_lookup, "close_on_or_before", lambda t, d, conn=None: None
     )
@@ -367,7 +411,7 @@ def test_backfill_returns_count(fake_db, monkeypatch) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Test Group C — corporate-action guard (2026-07-12, KLB Jul-2 stock dividend)
+# Test Group C â€” corporate-action guard (2026-07-12, KLB Jul-2 stock dividend)
 # --------------------------------------------------------------------------- #
 
 from src.data.price_lookup import has_ca_gap  # noqa: E402
@@ -382,7 +426,7 @@ def _no_ca_gap_by_default(monkeypatch):
 
 
 def test_has_ca_gap_normal_path_false() -> None:
-    assert has_ca_gap([100.0, 106.9, 100.1, 93.5]) is False  # inside ±7% band
+    assert has_ca_gap([100.0, 106.9, 100.1, 93.5]) is False  # inside Â±7% band
 
 
 def test_has_ca_gap_klb_shape_true() -> None:
@@ -411,7 +455,7 @@ def test_backfill_ca_gap_skips_short_fill(fake_db, monkeypatch) -> None:
     )
 
     n = main._backfill_paperlog_outcomes(fake_db)
-    assert n == 0  # nothing written — short skipped, long not mature
+    assert n == 0  # nothing written â€” short skipped, long not mature
     ret_3d, filled = fake_db.conn.execute(
         "SELECT ret_3d, outcome_filled FROM sentiment_entry_paperlog "
         "WHERE ticker = 'KLB'"

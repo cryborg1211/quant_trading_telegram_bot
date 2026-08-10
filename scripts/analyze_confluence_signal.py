@@ -1,16 +1,16 @@
-"""T+5/T+20 confluence signal analysis (2026-07-22, READ-ONLY).
+﻿"""T+5/T+20 confluence signal analysis (2026-07-22, READ-ONLY).
 
 Idea (from the "smarter system" brainstorm): both horizons are already
 scored for every arbitrated candidate and cross-checked by the arbitrator
 for veto purposes, but "do T+5 and T+20 AGREE on direction" is never fed
 back into ranking/admission as its own signal. Classic multi-timeframe
-confirmation — cheap to test because `sentiment_entry_paperlog` already
+confirmation â€” cheap to test because `sentiment_entry_paperlog` already
 carries both horizons' probabilities AND realized forward returns for
 every row logged since 2026-06-16 (no rebuild, no new data).
 
 Decision encoding (shared with the arbitrator, see accuracy_audit.py):
-0=DOWN/SELL, 1=SIDE/HOLD, 2=UP/BUY. `decision_5d` is stored directly;
-`decision_20d` is derived here via argmax(p_down_20d, p_side_20d, p_up_20d)
+0=DOWN/SELL, 1=SIDE/HOLD, 2=UP/BUY. `decision_primary` is stored directly;
+`decision_20d` is derived here via argmax(p_down_secondary, p_side_secondary, p_up_secondary)
 since no column stores it.
 
 Zero writes, zero schema changes, zero model changes.
@@ -51,9 +51,9 @@ def _bucket_stats(label: str, rets: list[float]) -> None:
 def main() -> None:
     conn = duckdb.connect(str(REPO / "data" / "quant_v6_core.duckdb"), read_only=True)
     rows = conn.execute("""
-        SELECT decision_5d, p_down_20d, p_side_20d, p_up_20d, ret_20d, ret_3d
+        SELECT decision_primary, p_down_secondary, p_side_secondary, p_up_secondary, ret_20d, ret_3d
         FROM sentiment_entry_paperlog
-        WHERE p_up_20d IS NOT NULL AND decision_5d IS NOT NULL
+        WHERE p_up_secondary IS NOT NULL AND decision_primary IS NOT NULL
           AND ret_20d IS NOT NULL
     """).fetchall()
     conn.close()

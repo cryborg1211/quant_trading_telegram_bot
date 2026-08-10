@@ -209,33 +209,105 @@ class DuckDBEngine:
         Split into two execute() calls — DuckDB's multi-statement execute() is
         version-sensitive (see the comment at the `seq_trade_id` block), so we
         run the sequence and table DDL separately to guarantee both fire.
+
+        COLUMN NAMING (renamed 10-08-26 — read this before querying)
+        ───────────────────────────────────────────────────────────
+        Probability columns are named PRIMARY / SECONDARY, not by horizon,
+        because that is what they have always held. `daily_inference` assigns
+        `stacking_predictions_5d = predict_v3_horizon(latest_df, horizon)` —
+        the PRIMARY horizon, which is T+20 for the daily cron — and
+        `stacking_predictions_20d` the secondary (T+5). The writer mapped those
+        straight onto `p_up_5d` / `p_up_20d`, so the old `p_up_20d` column held
+        T+5 values and `p_up_5d` held T+20. Every consumer read them by name
+        and therefore read the WRONG horizon; `check_drift.py` compared T+5
+        serve probabilities against a T+20 OOS reference and reported "OK".
+        `primary_horizon_days` is stored per row so a future change of primary
+        horizon cannot make history ambiguous again.
         """
         self.conn.execute(
             "CREATE SEQUENCE IF NOT EXISTS seq_sentiment_entry_id START 1"
         )
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS sentiment_entry_paperlog (
-                id              INTEGER DEFAULT nextval('seq_sentiment_entry_id'),
-                log_date        DATE    NOT NULL,
-                ticker          VARCHAR NOT NULL,
-                source          VARCHAR NOT NULL,
-                p_down_5d       DOUBLE,
-                p_side_5d       DOUBLE,
-                p_up_5d         DOUBLE,
-                decision_5d     INTEGER,
-                p_down_20d      DOUBLE,
-                p_side_20d      DOUBLE,
-                p_up_20d        DOUBLE,
-                final_decision  INTEGER,
-                sentiment_score DOUBLE,
-                entry_close     DOUBLE,
-                ret_3d          DOUBLE,
-                ret_20d         DOUBLE,
-                outcome_filled  BOOLEAN DEFAULT FALSE,
+                id                   INTEGER DEFAULT nextval('seq_sentiment_entry_id'),
+                log_date             DATE    NOT NULL,
+                ticker               VARCHAR NOT NULL,
+                source               VARCHAR NOT NULL,
+                p_down_primary       DOUBLE,
+                p_side_primary       DOUBLE,
+                p_up_primary         DOUBLE,
+                decision_primary     INTEGER,
+                p_down_secondary     DOUBLE,
+                p_side_secondary     DOUBLE,
+                p_up_secondary       DOUBLE,
+                primary_horizon_days INTEGER,
+                final_decision       INTEGER,
+                sentiment_score      DOUBLE,
+                entry_close          DOUBLE,
+                ret_3d               DOUBLE,
+                ret_20d              DOUBLE,
+                outcome_filled       BOOLEAN DEFAULT FALSE,
                 PRIMARY KEY (id),
                 UNIQUE (log_date, ticker, source)
             )
         """)
+        self._migrate_paperlog_horizon_columns()
+
+    # Old name -> new name. The rename is pure relabelling: every existing row
+    # already follows the primary/secondary convention, so no value is
+    # reinterpreted and no backfill is needed.
+    _PAPERLOG_RENAMES = (
+        ("p_down_5d", "p_down_primary"),
+        ("p_side_5d", "p_side_primary"),
+        ("p_up_5d", "p_up_primary"),
+        ("decision_5d", "decision_primary"),
+        ("p_down_20d", "p_down_secondary"),
+        ("p_side_20d", "p_side_secondary"),
+        ("p_up_20d", "p_up_secondary"),
+    )
+
+    def _migrate_paperlog_horizon_columns(self) -> None:
+        """Rename legacy horizon-named paperlog columns in place.
+
+        Idempotent and safe on a fresh DB (nothing to rename). Runs on every
+        engine init because the live DB predates the rename and there is no
+        migration framework here.
+        """
+        try:
+            existing = {
+                row[0] for row in self.conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'sentiment_entry_paperlog'"
+                ).fetchall()
+            }
+        except Exception:  # noqa: BLE001 — never block engine init
+            LOGGER.warning("[DuckDB] paperlog column introspection failed; "
+                           "skipping the horizon-column migration.", exc_info=True)
+            return
+
+        for old, new in self._PAPERLOG_RENAMES:
+            if old in existing and new not in existing:
+                try:
+                    self.conn.execute(
+                        f"ALTER TABLE sentiment_entry_paperlog "
+                        f"RENAME COLUMN {old} TO {new}"
+                    )
+                    LOGGER.info("[DuckDB] paperlog column %s -> %s", old, new)
+                except Exception:  # noqa: BLE001
+                    LOGGER.warning("[DuckDB] rename %s -> %s failed", old, new,
+                                   exc_info=True)
+        if "primary_horizon_days" not in existing:
+            try:
+                self.conn.execute(
+                    "ALTER TABLE sentiment_entry_paperlog "
+                    "ADD COLUMN primary_horizon_days INTEGER"
+                )
+                LOGGER.info("[DuckDB] paperlog gained primary_horizon_days "
+                            "(NULL on pre-migration rows = T+20, the only "
+                            "primary the daily cron has ever used).")
+            except Exception:  # noqa: BLE001
+                LOGGER.warning("[DuckDB] adding primary_horizon_days failed",
+                               exc_info=True)
 
     def log_user_action(
         self,

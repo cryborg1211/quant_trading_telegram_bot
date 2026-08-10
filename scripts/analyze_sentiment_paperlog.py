@@ -1,17 +1,17 @@
-"""Analyse the sentiment-entry forward paper-log (observability only).
+﻿"""Analyse the sentiment-entry forward paper-log (observability only).
 
 Reads the `sentiment_entry_paperlog` table populated by the daily pipeline +
 /verify command (see `_log_sentiment_entry_paperlog` in main.py) and reports
-the realized T+3 / T+20 returns for the TREATMENT slice — names where the 5d
-price model predicts DOWN but news sentiment is very positive — versus the
+the realized T+3 / T+20 returns for the TREATMENT slice â€” names where the 5d
+price model predicts DOWN but news sentiment is very positive â€” versus the
 control (every other matured row).
 
-The treatment filter (`decision_5d == 0 AND sentiment_score > threshold`) is
+The treatment filter (`decision_primary == 0 AND sentiment_score > threshold`) is
 applied HERE, at analysis time. Capture is unconditional, so the control group
 is always present. `threshold` is read from
 `CONFIG.trading.sentiment_entry_threshold` (default 0.7).
 
-This script changes NO data and makes NO trading decision — it is a read-only
+This script changes NO data and makes NO trading decision â€” it is a read-only
 report. It may report 0 filled rows until the T+20 windows mature (~21 calendar
 days after the first capture).
 
@@ -19,8 +19,8 @@ Run:
     python -X utf8 scripts/analyze_sentiment_paperlog.py
 
 Exit codes:
-    0 — analysis ran (possibly 0 filled rows; non-error).
-    1 — DB engine failed to initialize or a query raised.
+    0 â€” analysis ran (possibly 0 filled rows; non-error).
+    1 â€” DB engine failed to initialize or a query raised.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ def analyze() -> int:
         total, filled, total - filled,
     )
 
-    # Source breakdown — self-selection bias in /verify is visible here, since
+    # Source breakdown â€” self-selection bias in /verify is visible here, since
     # /verify rows are user-requested rather than a systematic cross-section.
     source_rows = db.conn.execute(
         "SELECT source, COUNT(*) FROM sentiment_entry_paperlog GROUP BY source ORDER BY source"
@@ -85,7 +85,7 @@ def analyze() -> int:
 
     if filled == 0:
         LOGGER.info(
-            "No matured rows yet — returns backfill once the T+20 window elapses "
+            "No matured rows yet â€” returns backfill once the T+20 window elapses "
             "(~21 calendar days after the first capture). Nothing to analyse."
         )
         return 0
@@ -95,10 +95,10 @@ def analyze() -> int:
     ).df()
 
     threshold = float(CONFIG.trading.sentiment_entry_threshold)
-    LOGGER.info("Treatment filter: decision_5d == 0 (DOWN) AND sentiment_score > %.2f", threshold)
+    LOGGER.info("Treatment filter: decision_primary == 0 (DOWN) AND sentiment_score > %.2f", threshold)
 
     treatment = df[
-        (df["decision_5d"] == 0) & (df["sentiment_score"] > threshold)
+        (df["decision_primary"] == 0) & (df["sentiment_score"] > threshold)
     ]
     control = df.drop(treatment.index)
 
@@ -107,7 +107,7 @@ def analyze() -> int:
         if n == 0:
             LOGGER.info("    %-10s : 0 rows", label)
             return
-        # Pandas .mean()/.median() skip NaN by default → matured-but-missing-shard
+        # Pandas .mean()/.median() skip NaN by default â†’ matured-but-missing-shard
         # rows (NULL ret) are excluded from the stat cleanly.
         ret3_mean = frame["ret_3d"].mean()
         ret3_med = frame["ret_3d"].median()

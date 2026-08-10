@@ -1,4 +1,4 @@
-"""Is the model's P(UP) honest? Calibration check on live paperlog data
+﻿"""Is the model's P(UP) honest? Calibration check on live paperlog data
 (09-08-26).
 
 WHY THIS MATTERS MOST FOR A HUMAN-IN-THE-LOOP PRODUCT
@@ -11,7 +11,7 @@ CalibratedClassifierCV, but that calibration was fitted on the TRAINING
 OOF matrix and has never been verified against live outcomes.
 
 DATA: `sentiment_entry_paperlog`, settled rows only (outcome_filled=TRUE).
-Every row holds the model's own p_up_5d / p_up_20d as displayed at
+Every row holds the model's own p_up_primary / p_up_secondary as displayed at
 decision time plus the realised ret_3d / ret_20d -- a genuine
 prediction-vs-outcome record, not a backtest reconstruction.
 
@@ -74,14 +74,14 @@ def _platt(p: np.ndarray, y: np.ndarray) -> None:
     eps = 1e-6
     logit = np.log(np.clip(p, eps, 1 - eps) / (1 - np.clip(p, eps, 1 - eps)))
     if len(np.unique(y)) < 2:
-        print("  Platt: outcome has a single class — cannot fit")
+        print("  Platt: outcome has a single class â€” cannot fit")
         return
     lr = LogisticRegression(C=1e6, solver="lbfgs", max_iter=1000)
     lr.fit(logit.reshape(-1, 1), y)
     slope, intercept = float(lr.coef_[0][0]), float(lr.intercept_[0])
     verdict = ("OVER-confident (probs too extreme)" if slope < 0.9
                else "UNDER-confident (probs too timid)" if slope > 1.1
-               else "slope near 1 — shape is about right")
+               else "slope near 1 â€” shape is about right")
     print(f"  Platt slope={slope:+.3f}  intercept={intercept:+.3f}   -> {verdict}")
 
 
@@ -102,13 +102,13 @@ def _report(name: str, p: np.ndarray, y: np.ndarray) -> None:
 def main() -> None:
     con = DuckDBEngine().get_connection()
     rows = con.execute("""
-        SELECT p_up_20d, ret_20d, p_up_5d, ret_3d,
-               COALESCE(final_decision, decision_5d) AS dec
+        SELECT p_up_secondary, ret_20d, p_up_primary, ret_3d,
+               COALESCE(final_decision, decision_primary) AS dec
         FROM sentiment_entry_paperlog
-        WHERE outcome_filled AND p_up_20d IS NOT NULL AND ret_20d IS NOT NULL
+        WHERE outcome_filled AND p_up_secondary IS NOT NULL AND ret_20d IS NOT NULL
     """).fetchall()
     if not rows:
-        print("No settled paperlog rows with a stored p_up_20d — nothing to check.")
+        print("No settled paperlog rows with a stored p_up_secondary â€” nothing to check.")
         return
 
     p20 = np.array([float(r[0]) for r in rows])
@@ -121,16 +121,16 @@ def main() -> None:
         f"{d}={int((dec == d).sum())}" for d in sorted(set(dec.tolist()))))
     print("  (0=SELL/EXIT, 1=HOLD, 2=BUY per the arbitrator encoding)")
 
-    _report("T+20 P(UP) vs realised ret_20d > 0  — ALL settled rows", p20, y20)
+    _report("T+20 P(UP) vs realised ret_20d > 0  â€” ALL settled rows", p20, y20)
 
     # The BUY slice is what an operator acts on; report it separately even
     # though it is thin, because an aggregate dominated by 1000+ SELL rows
     # says nothing about the probabilities that actually trigger a trade.
     buy = dec == 2
     if buy.sum() >= 30:
-        _report("T+20 P(UP) — BUY decisions only", p20[buy], y20[buy])
+        _report("T+20 P(UP) â€” BUY decisions only", p20[buy], y20[buy])
     else:
-        print(f"\n{'=' * 74}\nBUY-only slice: n={int(buy.sum())} — too thin to calibrate")
+        print(f"\n{'=' * 74}\nBUY-only slice: n={int(buy.sum())} â€” too thin to calibrate")
         print(f"{'=' * 74}")
         if buy.sum():
             print(f"  mean predicted {p20[buy].mean():.4f} vs realised hit rate "
@@ -148,7 +148,7 @@ def main() -> None:
     print("    without retraining the model.")
     print("  * a large negative gap in the HIGH bins is the dangerous case: it")
     print("    means confident BUY calls are the least trustworthy ones.")
-    print("\nNo artifacts written — read-only diagnostic.")
+    print("\nNo artifacts written â€” read-only diagnostic.")
 
 
 if __name__ == "__main__":

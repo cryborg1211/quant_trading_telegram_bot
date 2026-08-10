@@ -1,6 +1,6 @@
-"""Unit tests for the model-accuracy confusion-matrix auditor.
+﻿"""Unit tests for the model-accuracy confusion-matrix auditor.
 
-Pure read-side logic over mocked ``sentiment_entry_paperlog`` rows — no real
+Pure read-side logic over mocked ``sentiment_entry_paperlog`` rows â€” no real
 DuckDB, no parquet. Pins the confusion-matrix mapping, the precision/recall
 math, the settled-row query contract, and the rendered digest.
 """
@@ -23,7 +23,7 @@ _SELL, _HOLD, _BUY = 0, 1, 2
 
 
 # --------------------------------------------------------------------------- #
-# classify_outcome — the confusion matrix.
+# classify_outcome â€” the confusion matrix.
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.parametrize(
@@ -31,11 +31,11 @@ _SELL, _HOLD, _BUY = 0, 1, 2
     [
         (_BUY, 0.05, "TP"),    # acted, rose
         (_BUY, -0.03, "FP"),   # acted, fell
-        (_BUY, 0.0, "FP"),     # acted, flat → not a win
-        (_SELL, -0.04, "TN"),  # stayed out, fell → correct
-        (_HOLD, 0.0, "TN"),    # stayed out, flat → correct
-        (_HOLD, 0.06, "FN"),   # stayed out, rose → missed
-        (_SELL, 0.02, "FN"),   # stayed out, rose → missed
+        (_BUY, 0.0, "FP"),     # acted, flat â†’ not a win
+        (_SELL, -0.04, "TN"),  # stayed out, fell â†’ correct
+        (_HOLD, 0.0, "TN"),    # stayed out, flat â†’ correct
+        (_HOLD, 0.06, "FN"),   # stayed out, rose â†’ missed
+        (_SELL, 0.02, "FN"),   # stayed out, rose â†’ missed
         (None, 0.05, None),    # ungradable
         (_BUY, None, None),    # ungradable
     ],
@@ -45,7 +45,7 @@ def test_classify_outcome_matrix(decision, ret, expected) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# summarize_accuracy — precision / recall.
+# summarize_accuracy â€” precision / recall.
 # --------------------------------------------------------------------------- #
 
 def test_summarize_precision_and_recall() -> None:
@@ -67,7 +67,7 @@ def test_summarize_precision_and_recall() -> None:
 
 
 def test_summarize_zero_denominators_are_none() -> None:
-    # All HOLD with losses → no BUY calls and no FN → both ratios undefined.
+    # All HOLD with losses â†’ no BUY calls and no FN â†’ both ratios undefined.
     s = summarize_accuracy([{"decision": _HOLD, "ret": -0.01}])
     assert s["counts"] == {"TP": 0, "FP": 0, "TN": 1, "FN": 0}
     assert s["buy_precision"] is None       # 0 buy calls
@@ -77,7 +77,7 @@ def test_summarize_zero_denominators_are_none() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# fetch_settled_predictions — query contract.
+# fetch_settled_predictions â€” query contract.
 # --------------------------------------------------------------------------- #
 
 def _db_with_rows(rows: list[tuple]) -> MagicMock:
@@ -87,7 +87,7 @@ def _db_with_rows(rows: list[tuple]) -> MagicMock:
 
 
 def test_fetch_maps_rows_and_prefers_arbitrated_decision() -> None:
-    # (log_date, ticker, COALESCE(final_decision, decision_5d), entry_close, ret_20d)
+    # (log_date, ticker, COALESCE(final_decision, decision_primary), entry_close, ret_20d)
     db = _db_with_rows([
         (date(2026, 6, 1), "hpg", 2, 25.0, 0.08),
         (date(2026, 5, 28), "ssi", 0, 30.0, -0.02),
@@ -99,7 +99,7 @@ def test_fetch_maps_rows_and_prefers_arbitrated_decision() -> None:
     sql = db.conn.execute.call_args[0][0]
     assert "outcome_filled = TRUE" in sql
     assert "ret_20d IS NOT NULL" in sql
-    assert "COALESCE(final_decision, decision_5d)" in sql
+    assert "COALESCE(final_decision, decision_primary)" in sql
 
 
 def test_fetch_lookback_param_is_bound() -> None:
@@ -117,21 +117,21 @@ def test_fetch_degrades_to_empty_on_error() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# build_accuracy_report — rendered digest.
+# build_accuracy_report â€” rendered digest.
 # --------------------------------------------------------------------------- #
 
 def test_report_renders_header_table_and_emojis() -> None:
     db = _db_with_rows([
-        (date(2026, 6, 1), "HPG", _BUY, 25.0, 0.08),    # TP 🟢
-        (date(2026, 5, 30), "VHM", _BUY, 50.0, -0.04),  # FP 🔴
-        (date(2026, 5, 28), "SSI", _HOLD, 30.0, -0.02), # TN 🔵
+        (date(2026, 6, 1), "HPG", _BUY, 25.0, 0.08),    # TP ðŸŸ¢
+        (date(2026, 5, 30), "VHM", _BUY, 50.0, -0.04),  # FP ðŸ”´
+        (date(2026, 5, 28), "SSI", _HOLD, 30.0, -0.02), # TN ðŸ”µ
     ])
     out = build_accuracy_report(db=db, last_n=15)
-    assert "HẬU KIỂM ĐỘ CHÍNH XÁC MÔ HÌNH" in out
+    assert "Háº¬U KIá»‚M Äá»˜ CHÃNH XÃC MÃ” HÃŒNH" in out
     assert "BUY Precision:</b> 50.0%" in out   # 1 TP / (1 TP + 1 FP)
     assert "Defensive Recall:</b> 100.0%" in out
     assert "HPG" in out and "VHM" in out and "SSI" in out
-    assert "🟢" in out and "🔴" in out and "🔵" in out
+    assert "ðŸŸ¢" in out and "ðŸ”´" in out and "ðŸ”µ" in out
     assert "<pre>" in out and "</pre>" in out
 
 
