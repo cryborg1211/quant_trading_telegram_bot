@@ -227,8 +227,13 @@ class TelegramBot:
         if garch_scalar is not None:
             try:
                 _gs = float(garch_scalar)
-                _gs_txt = (f"Đang phanh — hạ tỷ trọng ×{_gs:.2f}" if _gs < 1.0
-                           else "Không kích hoạt (×1.00)")
+                # Branch on the ROUNDED value so the label and the number it
+                # prints agree by construction. The GARCH leg is a continuous
+                # P(Bull) clip, so comparing against 1.0 exactly made a routine
+                # 0.997 render as "Đang phanh — hạ tỷ trọng ×1.00" — a brake
+                # claim sitting next to a no-brake number.
+                _gs_txt = ("Không kích hoạt (×1.00)" if round(_gs, 2) >= 1.00
+                           else f"Đang phanh — hạ tỷ trọng ×{_gs:.2f}")
                 garch_line = f"Phanh biến động GARCH: <b>{_gs_txt}</b>"
             except (TypeError, ValueError):
                 garch_line = ""

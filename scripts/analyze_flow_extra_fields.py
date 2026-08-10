@@ -88,7 +88,11 @@ def lead_lag(flow_df: pl.DataFrame, flow_col: str, price_fwd: pl.DataFrame) -> p
 
 def main() -> None:
     flow_df = pl.read_parquet(_DEFAULT_PARQUET)
-    price_df = pl.read_parquet("data/ohlcv_*.parquet")
+    # `volume` dtype varies across shards (vnstock int64 vs FastConnect float64,
+    # 10-08-26) and a multi-file read unifies on the first shard's schema.
+    price_df = pl.read_parquet(
+        "data/ohlcv_*.parquet",
+        cast_options=pl.ScanCastOptions(integer_cast="allow-float"))
     price_fwd = _with_forward_returns(price_df)
 
     fc = flow_df.filter(pl.col("source") == "ssi_fastconnect_history")

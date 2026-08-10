@@ -183,14 +183,40 @@ def _breadth_leg_scalar(panel) -> float:
     return scalar
 
 
-def live_exposure_scalar() -> float:
-    """Market-wide exposure multiplier ∈ (0, 1.0] for today's dispatch.
+def _breadth_raw(panel) -> float | None:
+    """Trailing breadth FRACTION for display, not the exposure multiplier.
 
-    min(GARCH-HMM, drift, breadth) — three independent legs reading three
-    different signals (macro/vol regime, index-return drift, universe-wide
-    breadth). Each leg fails open to 1.0 independently; all disabled → 1.0.
-    Every call logs the full breakdown + the binding leg (module docstring
-    has the "why" for each leg).
+    The operator card reads "Độ rộng thị trường: 38% mã tăng", which is the
+    underlying fraction — `_breadth_leg_scalar` returns the multiplier derived
+    from it, so the two are not interchangeable. Kept separate rather than
+    widening `_breadth_leg_scalar`'s return type because tests patch that
+    function with a plain float. Cheap: the panel is already in memory.
+    """
+    if panel is None:
+        return None
+    try:
+        from src.trading.breadth import breadth_from_panel  # noqa: PLC0415
+
+        return breadth_from_panel(
+            panel, window=int(getattr(CONFIG.trading, "breadth_brake_window", 20)))
+    except Exception:  # noqa: BLE001 — display-only, never break dispatch
+        LOGGER.debug("[meta-controller] raw breadth unavailable", exc_info=True)
+        return None
+
+
+def live_exposure_legs() -> dict:
+    """Per-leg exposure breakdown, not just the combined minimum.
+
+    `live_exposure_scalar()` used to compute all three legs, log them, and then
+    throw the breakdown away — so `main._dispatch_signals` had only one number
+    to pass on, and the operator card's breadth and drift context lines could
+    never render (found 10-08-26 by driving the real dispatch builder with real
+    data: `breadth=None drift_scalar=None` while `garch_scalar` came through).
+
+    Returns `{combined, garch, drift, breadth, breadth_raw, binding}`.
+    `breadth_raw` is the display fraction; `breadth` is its multiplier.
+    `binding` is None when nothing is braking. Same fail-open contract as
+    before: any leg that fails reads 1.0 and the others are unaffected.
     """
     garch_scalar = 1.0
     drift_scalar = 1.0
@@ -254,4 +280,21 @@ def live_exposure_scalar() -> float:
         garch_scalar, drift_scalar, breadth_scalar, combined,
         binding if combined < 1.0 else "none",
     )
-    return combined
+    return {
+        "combined": combined,
+        "garch": garch_scalar,
+        "drift": drift_scalar,
+        "breadth": breadth_scalar,
+        "breadth_raw": _breadth_raw(panel),
+        "binding": binding if combined < 1.0 else None,
+    }
+
+
+def live_exposure_scalar() -> float:
+    """Combined market-wide exposure multiplier ∈ (0, 1.0] for today's dispatch.
+
+    Thin wrapper over `live_exposure_legs()` — kept as the narrow float
+    contract that existing callers and tests depend on. Use
+    `live_exposure_legs()` when the per-leg attribution is needed for display.
+    """
+    return float(live_exposure_legs()["combined"])

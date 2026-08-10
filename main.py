@@ -1683,8 +1683,14 @@ def _dispatch_signals(
     tau_primary: float | None = None,
     tau_secondary: float | None = None,
     mr_scores: dict[str, dict] | None = None,
+    brake_legs: dict | None = None,
 ) -> list[dict]:
     """Per-ticker signal build + Telegram dispatch loop.
+
+    `brake_legs` is `garch_brake.live_exposure_legs()`'s per-leg breakdown. It
+    exists so the card can name WHICH leg cut the size; passing only the
+    combined `exposure_scalar` left the breadth and drift context lines
+    permanently blank. Optional and market-wide — same value for every ticker.
 
     Reads module-level global `_LATEST_REGIME_BY_TICKER` set by
     `_compute_v3_features`. This coupling is intentional and documented.
@@ -1810,7 +1816,15 @@ def _dispatch_signals(
             # ── Attribution contract (unified card + downstream audit) ────
             "base_decision_vi": _BASE_DECISION_VI[_base_idx],
             "regime_action_vi": _regime_action_vi,
-            "garch_scalar": float(exposure_scalar),
+            # Per-leg, NOT the combined min. Feeding the combined value in as
+            # "garch_scalar" mislabelled a breadth- or drift-driven cut as a
+            # volatility brake — the card would read "GARCH ×0.50" on a day
+            # GARCH itself was 1.00. Falls back to the combined value only when
+            # the breakdown is unavailable, which preserves the old behaviour.
+            "garch_scalar": float((brake_legs or {}).get("garch", exposure_scalar)),
+            "drift_scalar": (brake_legs or {}).get("drift"),
+            "breadth": (brake_legs or {}).get("breadth_raw"),
+            "exposure_scalar": float(exposure_scalar),
             "arb_note_vi": _arb_note_vi,
             "risk_tier": _tier.name,
             "risk_tier_pct": _tier.nav_cap_pct,
@@ -1983,13 +1997,18 @@ def run_trade_execution(
         except Exception:  # noqa: BLE001 — dispatch must not die on artifact issues
             _strategy = None
 
-        # GARCH-HMM macro exposure brake — one market-wide scalar for the day.
-        # Fail-open: returns 1.0 (no brake) when disabled or on any failure.
+        # 3-leg market-wide exposure brake (GARCH + drift + breadth) for the day.
+        # `live_exposure_legs` rather than `live_exposure_scalar` so the card can
+        # explain WHICH leg reduced the size — the combined min alone left the
+        # breadth and drift context lines permanently blank.
+        # Fail-open: 1.0 (no brake) when disabled or on any failure.
+        _exposure_scalar, _brake_legs = 1.0, {}
         try:
-            from src.bot.garch_brake import live_exposure_scalar  # noqa: PLC0415
-            _exposure_scalar = live_exposure_scalar()
+            from src.bot.garch_brake import live_exposure_legs  # noqa: PLC0415
+            _brake_legs = live_exposure_legs()
+            _exposure_scalar = float(_brake_legs.get("combined", 1.0))
         except Exception:  # noqa: BLE001 — never let the brake break dispatch
-            _exposure_scalar = 1.0
+            _exposure_scalar, _brake_legs = 1.0, {}
 
         dispatched_signals = _dispatch_signals(
             top_buy_signals=top_buy_signals,
@@ -2007,6 +2026,7 @@ def run_trade_execution(
             tau_primary=tau_primary,
             tau_secondary=tau_secondary,
             mr_scores=mr_scores,
+            brake_legs=_brake_legs,
         )
         sent = len(dispatched_signals)
         LOGGER.info("Telegram alerts dispatched: %s (broadcast=%s)", sent, broadcast)

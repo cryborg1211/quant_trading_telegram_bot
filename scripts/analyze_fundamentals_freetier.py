@@ -126,7 +126,11 @@ def main() -> None:
         print("  free sample cannot answer it. Decide on the paid tier some other way.")
         return
 
-    price = (pl.read_parquet("data/ohlcv_*.parquet")
+    # `volume` dtype varies across shards (vnstock int64 vs FastConnect float64,
+    # 10-08-26) and a multi-file read unifies on the first shard's schema.
+    price = (pl.read_parquet(
+                 "data/ohlcv_*.parquet",
+                 cast_options=pl.ScanCastOptions(integer_cast="allow-float"))
              .select(["ticker", "date", "close"])
              .sort(["ticker", "date"]))
     price = price.with_columns(

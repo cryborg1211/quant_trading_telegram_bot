@@ -287,8 +287,21 @@ def load_ohlcv(cfg: RunConfig) -> pl.DataFrame:
     # (1) PRIMARY — fresh parquet shards (the live bot's exact source).
     files = sorted(Path().glob(cfg.parquet_glob))
     if files:
-        df = (pl.scan_parquet([str(f) for f in files])
+        # Numeric dtypes vary ACROSS shards: `volume` is int64 in files last
+        # written by vnstock and float64 where the FastConnect path wrote last
+        # (10-08-26). A multi-file `scan_parquet` unifies on the first shard's
+        # schema and raises
+        #   SchemaError: data type mismatch for column volume: Int64 != Float64
+        # on the first divergent file. That killed the meta-controller's panel
+        # load — silently dropping the drift AND breadth exposure legs to 1.0
+        # and leaving GARCH as the only surviving brake — and would break any
+        # backtest or training run against the same directory. The explicit
+        # cast after the select keeps this independent of scan-time options.
+        df = (pl.scan_parquet([str(f) for f in files],
+                              cast_options=pl.ScanCastOptions(integer_cast="allow-float"))
               .select(["ticker", "date", "open", "high", "low", "close", "volume"])
+              .with_columns([pl.col(c).cast(pl.Float64)
+                             for c in ("open", "high", "low", "close", "volume")])
               .collect())
         if df.height > 0:
             LOGGER.info("OHLCV ← %d parquet shards (%d rows)  [PRIMARY — fresh]",

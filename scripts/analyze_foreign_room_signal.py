@@ -83,7 +83,12 @@ def _decile_table(d: pl.DataFrame, value_col: str, ret_col: str, label: str) -> 
 def main() -> None:
     flow = pl.read_parquet(_DEFAULT_PARQUET).filter(
         pl.col("source") == "ssi_fastconnect_history")
-    price = pl.read_parquet("data/ohlcv_*.parquet").sort(["ticker", "date"])
+    # `volume` dtype varies across shards (vnstock int64 vs FastConnect float64,
+    # 10-08-26) and a multi-file read unifies on the first shard's schema.
+    price = pl.read_parquet(
+        "data/ohlcv_*.parquet",
+        cast_options=pl.ScanCastOptions(integer_cast="allow-float"),
+    ).sort(["ticker", "date"])
     for h in HORIZONS:
         price = price.with_columns(
             (pl.col("close").shift(-h).over("ticker") / pl.col("close") - 1.0).alias(f"fwd_ret_{h}d")

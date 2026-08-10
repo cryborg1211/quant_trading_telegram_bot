@@ -96,13 +96,20 @@ def load_ohlcv() -> pd.DataFrame:
     if not files:
         raise FileNotFoundError(f"No {OHLCV_GLOB} files found. Run the crawler.")
     LOGGER.info("Loading %s OHLCV parquet files ...", len(files))
+    # `volume` is int64 in shards last written by vnstock and float64 where the
+    # FastConnect path wrote last (10-08-26), so a multi-file scan raises
+    # SchemaError on the first divergent shard. This runs inside the unattended
+    # weekly retrain, so an uncaught mismatch here silently kills the retrain.
     df = (
-        pl.scan_parquet([str(p) for p in files])
+        pl.scan_parquet([str(p) for p in files],
+                        cast_options=pl.ScanCastOptions(integer_cast="allow-float"))
         .select(["ticker", "date", "open", "high", "low", "close", "volume"])
         .with_columns(
             [
                 pl.col("ticker").cast(pl.Utf8).str.to_uppercase(),
                 pl.col("date").cast(pl.Date),
+                *[pl.col(c).cast(pl.Float64)
+                  for c in ("open", "high", "low", "close", "volume")],
             ]
         )
         .sort(["ticker", "date"])
