@@ -289,8 +289,19 @@ class StockCrawler:
         end_date: Optional[str] = None,
         file_path: Optional[str] = None,
         sleep_before_request: bool = False,
+        prefetched: Optional[pd.DataFrame] = None,
+        prefetch_covers_from: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Fetch historical OHLCV with incremental local parquet append."""
+        """Fetch historical OHLCV with incremental local parquet append.
+
+        `prefetched` supplies already-fetched bars (see
+        `src/data/fastconnect_ohlcv.py`) so the network call AND the vnstock
+        throttle are both skipped. It is only honoured when
+        `prefetch_covers_from` proves the prefetch window reaches back far
+        enough to cover this ticker's gap — otherwise the ticker would keep a
+        permanent hole in its history. Falls through to the normal vnstock
+        path whenever the prefetch is absent or insufficient.
+        """
         ticker = ticker.upper().strip()
         df_old = pd.DataFrame()
 
@@ -322,6 +333,26 @@ class StockCrawler:
         if fetch_start > end_date:
             LOGGER.info("%s: up to date through %s.", ticker, end_date)
             return df_old
+
+        # ── FastConnect fast path ────────────────────────────────────────
+        # Usable only if the prefetch window starts at or before the gap we
+        # need to fill. A ticker that is further behind than the window (new
+        # listing, long outage) must go the slow route or it would never
+        # recover the missing stretch.
+        if prefetched is not None and not prefetched.empty and prefetch_covers_from:
+            if prefetch_covers_from <= fetch_start:
+                df_new = prefetched.copy()
+                df_new["date"] = pd.to_datetime(df_new["date"]).dt.date
+                df_new = df_new[df_new["date"].astype(str) >= fetch_start]
+                if not df_new.empty:
+                    df_new["ticker"] = ticker
+                    return self._merge_and_save(ticker, df_old, df_new, file_path)
+                LOGGER.info("%s: prefetch had no bars past %s.", ticker, fetch_start)
+                return df_old if not df_old.empty else pd.DataFrame()
+            LOGGER.info(
+                "%s: gap starts %s, before the prefetch window %s — using the slow path.",
+                ticker, fetch_start, prefetch_covers_from,
+            )
 
         if sleep_before_request:
             self._throttle_request()
@@ -376,14 +407,30 @@ class StockCrawler:
 
         if df_new.empty:
             LOGGER.warning("%s: no new records fetched.", ticker)
-            df_final = df_old
-        else:
-            if df_old.empty:
-                df_final = df_new
-            else:
-                df_final = pd.concat([df_old, df_new], ignore_index=True)
-                df_final.drop_duplicates(subset=["ticker", "date"], keep="last", inplace=True)
 
+        return self._merge_and_save(ticker, df_old, df_new, file_path)
+
+    def _merge_and_save(
+        self,
+        ticker: str,
+        df_old: pd.DataFrame,
+        df_new: pd.DataFrame,
+        file_path: Optional[str],
+    ) -> pd.DataFrame:
+        """Append new bars onto the local history and persist.
+
+        Shared by the vnstock and FastConnect paths so the dedup/sort/write
+        semantics can never drift between the two sources. Existing rows lose
+        to new ones on a (ticker, date) collision — a same-day re-run should
+        pick up the corrected/settled bar.
+        """
+        if df_new.empty:
+            df_final = df_old
+        elif df_old.empty:
+            df_final = df_new.sort_values(by=["ticker", "date"]).reset_index(drop=True)
+        else:
+            df_final = pd.concat([df_old, df_new], ignore_index=True)
+            df_final.drop_duplicates(subset=["ticker", "date"], keep="last", inplace=True)
             df_final = df_final.sort_values(by=["ticker", "date"]).reset_index(drop=True)
 
         if file_path and not df_final.empty:
@@ -426,6 +473,35 @@ class StockCrawler:
 
         LOGGER.info("Starting overnight HOSE crawl: %s tickers.", len(tickers))
 
+        # ── FastConnect concurrent prefetch (10-08-26) ───────────────────
+        # The network half of the crawl runs here, in parallel inside
+        # FastConnect's 60 req/min budget (~6 min for 359 tickers). The loop
+        # below then does only disk work for every ticker the prefetch
+        # covered — which is what turns a 26-minute crawl into ~7. Tickers
+        # the prefetch missed keep the original throttled vnstock path, so a
+        # FastConnect outage degrades to exactly the old behaviour.
+        prefetched: dict = {}
+        prefetch_from: Optional[str] = None
+        if CONFIG.crawler.fastconnect_ohlcv_enabled:
+            try:
+                from src.data import fastconnect_ohlcv as fc  # noqa: PLC0415
+
+                fc_end = (
+                    datetime.strptime(end_date, "%Y-%m-%d").date()
+                    if end_date else datetime.now().date()
+                )
+                prefetched, window_start = fc.bulk_prefetch(tickers, fc_end)
+                prefetch_from = window_start.strftime("%Y-%m-%d")
+            except BaseException as e:  # noqa: BLE001 — never block the crawl
+                self._log_crawler_error("*", e, "fastconnect prefetch")
+                LOGGER.warning(
+                    "FastConnect prefetch failed — falling back to the "
+                    "throttled vnstock crawl for all tickers.", exc_info=True,
+                )
+                prefetched, prefetch_from = {}, None
+
+        summary["prefetched"] = len(prefetched)
+
         for ticker in tqdm(tickers, desc="Crawling HOSE", unit="ticker"):
             try:
                 file_path = str(Path(data_dir) / f"ohlcv_{ticker}.parquet")
@@ -437,6 +513,8 @@ class StockCrawler:
                     end_date=end_date,
                     file_path=file_path,
                     sleep_before_request=True,
+                    prefetched=prefetched.get(ticker),
+                    prefetch_covers_from=prefetch_from,
                 )
                 if df.empty:
                     summary["skipped_empty"] += 1
@@ -456,7 +534,9 @@ class StockCrawler:
                 continue
 
         LOGGER.info(
-            "HOSE crawl completed: total=%s success=%s empty=%s failed=%s rows=%s",
-            summary["total"], summary["success"], summary["skipped_empty"], summary["failed"], summary["rows"],
+            "HOSE crawl completed: total=%s success=%s empty=%s failed=%s rows=%s "
+            "fastconnect_prefetched=%s",
+            summary["total"], summary["success"], summary["skipped_empty"], summary["failed"],
+            summary["rows"], summary.get("prefetched", 0),
         )
         return summary

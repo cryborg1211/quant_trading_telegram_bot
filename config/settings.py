@@ -261,6 +261,10 @@ class CrawlerConfig:
     rate_limit_cooldown_seconds: int = 75
     request_retry_total: int = 3
     request_backoff_factor: float = 1.5
+    # Concurrent SSI FastConnect prefetch ahead of the throttled vnstock
+    # crawl — measured 26min -> ~7min on the 359-ticker EOD run (10-08-26).
+    # Kill-switch: OFF restores the pure-vnstock path with no other change.
+    fastconnect_ohlcv_enabled: bool = True
 
 
 @dataclass
