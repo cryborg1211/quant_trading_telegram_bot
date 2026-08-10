@@ -124,20 +124,19 @@ EMPTY_PORTFOLIO_MESSAGE = (
 HELP_TEXT = (
     "🤖 <b>TRỢ LÝ ĐẦU TƯ — DANH SÁCH LỆNH</b>\n"
     "\n"
-    "<b>/suggest_buy20</b> — Khuyến nghị MUA T+20 (tranche, nắm giữ ~20 phiên).\n"
-    "<b>/suggest_buy5</b> — Khuyến nghị MUA T+5 (tầm nhìn ngắn).\n"
-    "📒 <b>/exits</b> — Vị thế tranche đang mở + số phiên còn lại.\n"
-    "🔴 <b>/suggest_sell</b> — Đánh giá NÊN BÁN hay GIỮ danh mục của bạn.\n"
-    "🛡️ <b>/guard</b> — Kiểm tra cảnh báo bảo vệ danh mục (cắt lỗ / trailing / pha thị trường).\n"
-    "⚖️ <b>/rebalance</b> — Tư vấn cơ cấu lại danh mục hiện tại.\n"
+    "📊 <b>/suggest</b> — Danh sách <b>ứng viên</b> MUA (T+20). Bạn tự quyết vào lệnh.\n"
     "🔍 <b>/verify</b> <i>[Mã]</i> — Soi nhanh 1 cổ phiếu, mô hình T+5 &amp; T+20 "
     "(VD: <code>/verify HPG</code>).\n"
+    "🎯 <b>/audit_accuracy</b> — <b>Bảng điểm</b>: mô hình đúng/sai bao nhiêu (nên xem trước khi tin).\n"
+    "🛡️ <b>/guard</b> — Kiểm tra cảnh báo bảo vệ danh mục (cắt lỗ / trailing / pha thị trường).\n"
+    "🔴 <b>/suggest_sell</b> — Đánh giá NÊN BÁN hay GIỮ danh mục của bạn.\n"
+    "📒 <b>/exits</b> — Vị thế tranche đang mở + số phiên còn lại.\n"
+    "⚖️ <b>/rebalance</b> — Gợi ý cơ cấu lại danh mục hiện tại.\n"
     "➕ <b>/add</b> <i>[Mã] [Số lượng] [Giá]</i> — Thêm cổ phiếu vào danh mục "
     "(VD: <code>/add VNE 1000 32.5</code>).\n"
     "➖ <b>/remove</b> <i>[Mã]</i> — Xóa cổ phiếu khỏi danh mục "
     "(VD: <code>/remove VNE</code>).\n"
     "📅 <b>/audit_weekly</b> — Xem lại hiệu quả các quyết định 7 ngày qua.\n"
-    "🎯 <b>/audit_accuracy</b> — Độ chính xác mô hình (ma trận nhầm lẫn, Precision/Recall).\n"
     "🗓️ <b>/audit_monthly</b> — Xem lại hiệu quả các quyết định 30 ngày qua.\n"
     "📰 <b>/news</b> — Tổng hợp tin tức thị trường mới nhất.\n"
     "💬 <b>/feedback</b> <i>[Nội dung]</i> — Gửi góp ý trực tiếp đến Admin.\n"
@@ -807,9 +806,28 @@ async def suggest_buy20_command(update: Update, context: ContextTypes.DEFAULT_TY
     await _suggest_buy_dispatch(update, horizon=20)
 
 
+_SUGGEST_BUY5_RETIRED = (
+    "⚠️ <b>/suggest_buy5 đã ngừng hoạt động</b>\n\n"
+    "Nghiên cứu 22-07-26 (<code>scripts/analyze_confluence_backtest.py</code>) cho thấy "
+    "cổng T+20 làm toàn bộ việc lọc chất lượng, còn tín hiệu chỉ qua cổng T+5 "
+    "gần như là <b>nhiễu</b> — và <b>13/13 lệnh lỗ tháng 7/2026</b> đều vào qua đúng cửa này.\n\n"
+    "Dùng <b>/suggest</b> (T+20) để lấy danh sách ứng viên.\n"
+    "Vẫn muốn xem góc nhìn T+5 cho một mã cụ thể thì dùng <b>/verify &lt;MÃ&gt;</b> — "
+    "ở đó T+5 đóng vai trò xác nhận chéo, không phải nguồn tín hiệu độc lập."
+)
+
+
 async def suggest_buy5_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: ARG001
-    """T+5 short-horizon BUY recommendations."""
-    await _suggest_buy_dispatch(update, horizon=5)
+    """Retired (10-08-26). Answers with the reason instead of vanishing silently.
+
+    Kept as a handler on purpose: a removed command that simply does nothing
+    invites the operator to wonder whether the bot is broken, and the reason it
+    was removed is exactly the thing worth restating at the point of use.
+    """
+    if update.message is None:
+        return
+    _log_request("/suggest_buy5", update)
+    await update.message.reply_text(_SUGGEST_BUY5_RETIRED, parse_mode=ParseMode.HTML)
 
 
 async def add_portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1712,19 +1730,27 @@ async def msg_id2_command(
 
 # The canonical command list pushed to Telegram via set_my_commands on startup.
 # This populates the "/" autocomplete menu in every chat.
+# Menu order and wording (10-08-26 review), for an operator who decides every
+# trade themselves:
+#   * ONE candidate command. /suggest_buy5 is retired — T+5-only signals are
+#     ~noise and produced every losing July-2026 dispatch.
+#   * "ứng viên" not "khuyến nghị": the system presents candidates, the operator
+#     decides. Live paperlog has BUY calls averaging -0.69 pct over 43 settled
+#     rows, which does not support recommendation language.
+#   * /audit_accuracy promoted near the top — it is the scoreboard that tells
+#     the operator how much to trust everything above it.
 _BOT_COMMANDS: list[BotCommand] = [
-    BotCommand("suggest_buy20", "Khuyến nghị MUA T+20 — tranche ~20 phiên"),
-    BotCommand("suggest_buy5", "Khuyến nghị MUA T+5 — tầm nhìn ngắn"),
-    BotCommand("exits", "Vị thế tranche đang mở + số phiên còn lại"),
-    BotCommand("suggest_sell", "Lấy khuyến nghị BÁN/HOLD cho danh mục cá nhân"),
-    BotCommand("guard", "Kiểm tra cảnh báo bảo vệ danh mục (cắt lỗ/trailing/pha)"),
-    BotCommand("rebalance", "AI tư vấn cơ cấu danh mục hiện tại"),
+    BotCommand("suggest", "Danh sách ứng viên MUA (T+20) — bạn tự quyết"),
     BotCommand("verify", "Kiểm định nhanh 1 cổ phiếu — T+5 & T+20 (VD: /verify HPG)"),
+    BotCommand("audit_accuracy", "Bảng điểm mô hình — TP/FP/TN/FN, Precision/Recall"),
+    BotCommand("guard", "Kiểm tra cảnh báo bảo vệ danh mục (cắt lỗ/trailing/pha)"),
+    BotCommand("suggest_sell", "Đánh giá BÁN/GIỮ cho danh mục cá nhân"),
+    BotCommand("exits", "Vị thế tranche đang mở + số phiên còn lại"),
     BotCommand("add", "Thêm cổ phiếu vào danh mục (VD: /add VNE 1000 32.5)"),
     BotCommand("remove", "Xóa cổ phiếu khỏi danh mục (VD: /remove VNE)"),
     BotCommand("audit_weekly", "Hậu kiểm /verify & /add trong 7 ngày qua"),
-    BotCommand("audit_accuracy", "Độ chính xác mô hình — TP/FP/TN/FN, Precision/Recall"),
     BotCommand("audit_monthly", "Hậu kiểm /verify & /add trong 30 ngày qua"),
+    BotCommand("rebalance", "AI gợi ý cơ cấu danh mục hiện tại"),
     BotCommand("news", "Tổng hợp tin tức từ 20 nguồn gần nhất"),
     BotCommand("feedback", "Gửi góp ý trực tiếp đến Admin (VD: /feedback ...)"),
     BotCommand("help", "Hiển thị danh sách lệnh"),
@@ -1887,6 +1913,10 @@ def build_application() -> Application:
     # Hyphens are NOT valid in slash commands. Canonical commands use the
     # underscore form; the hyphen MessageHandler regexes are fallbacks for
     # users typing the hyphenated forms manually.
+    # Single canonical candidate command (10-08-26): /suggest == T+20, the only
+    # horizon whose gate demonstrably filters for quality. /suggest_buy20 stays
+    # as a working alias so existing muscle memory keeps functioning.
+    app.add_handler(CommandHandler("suggest", suggest_buy20_command))
     app.add_handler(CommandHandler("suggest_buy20", suggest_buy20_command))
     app.add_handler(
         MessageHandler(
@@ -1894,7 +1924,9 @@ def build_application() -> Application:
             suggest_buy20_command,
         )
     )
-    # /suggest_buy5 restored — short horizon recovered to T+5 (18-06-26).
+    # /suggest_buy5 RETIRED — replies with the reason (T+5-only signals are
+    # ~noise and produced every losing July-2026 dispatch). Handler kept so the
+    # command explains itself rather than silently doing nothing.
     app.add_handler(CommandHandler("suggest_buy5", suggest_buy5_command))
     app.add_handler(
         MessageHandler(

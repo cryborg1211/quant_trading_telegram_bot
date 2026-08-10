@@ -261,46 +261,108 @@ class TelegramBot:
                 f"{source_line}"
             )
 
-        # ── Unified 4-section card ────────────────────────────────────────
-        oversight_lines = []
-        if regime_line:
-            oversight_lines.append(regime_line.rstrip("\n"))
-        regime_action = signal_data.get("regime_action_vi")
-        if regime_action:
-            oversight_lines.append(
-                f"Điều chỉnh theo pha: {html.escape(str(regime_action))}")
-        if garch_line:
-            oversight_lines.append(garch_line)
-        if arb_note:
-            oversight_lines.append(f"Trọng tài tin tức: {html.escape(str(arb_note))}")
-        oversight_block = ""
-        if oversight_lines:
-            oversight_block = ("<b>Lớp giám sát</b>\n"
-                               + "\n".join(oversight_lines) + "\n\n")
+        # ── Operator-decision card (10-08-26 redesign) ────────────────────
+        # Ordered to match how the reader actually decides: disqualifiers
+        # first, then the two probabilities, then the context that explains
+        # any size reduction, then a reference size, then the narrative.
+        # Header says ỨNG VIÊN (candidate), not KHUYẾN NGHỊ (recommendation):
+        # the operator decides every trade, and the live paperlog has BUY
+        # calls averaging -0.69 pct over 43 settled rows, so a confident
+        # recommendation header would overstate what the system knows.
+        from src.reports.regime_explain import regime_explain_lines  # noqa: PLC0415
+        from src.reports.signal_score import (  # noqa: PLC0415
+            build_facts,
+            score_line,
+            warning_lines,
+        )
 
-        deploy_lines = []
-        if tier_label and tier_pct is not None:
-            deploy_lines.append(
-                f"Hạng rủi ro thị trường: <b>{html.escape(str(tier_label))}</b> "
-                f"(trần {int(tier_pct)}% NAV toàn danh mục)")
-        deploy_lines.append(f"Khuyến nghị đi vốn: <b>{sizing_str}</b>")
-        if hold_line:
-            deploy_lines.append(hold_line.rstrip("\n"))
-        deploy_block = ("<b>Triển khai danh mục</b>\n"
-                        + "\n".join(deploy_lines) + "\n\n")
+        facts = build_facts(
+            p_up_20d=signal_data.get("p_up_20d"),
+            tau_20d=signal_data.get("tau_20d"),
+            p_up_5d=signal_data.get("p_up_5d"),
+            tau_5d=signal_data.get("tau_5d"),
+            room_exhausted=signal_data.get("room_exhausted"),
+            market_regime=regime_id,
+            garch_scalar=garch_scalar,
+            breadth=signal_data.get("breadth"),
+            sentiment_score=signal_data.get("sentiment_score"),
+            mr_fired=signal_data.get("mr_fired"),
+        )
+
+        warn_block = ""
+        warns = warning_lines(facts, market_regime=regime_id)
+        if warns:
+            warn_block = ("⚠️ <b>CẢNH BÁO</b>\n"
+                          + "\n".join(f"• {html.escape(w)}" for w in warns)
+                          + "\n\n")
+
+        # Probabilities, no inline commentary (the score block carries the
+        # judgement instead).
+        prob_lines = [trend_line]
+        p5 = signal_data.get("p_up_5d")
+        p20 = signal_data.get("p_up_20d")
+        if p5 is not None and p20 is not None:
+            try:
+                prob_lines = [f"T+5: <b>{float(p5) * 100:.1f}%</b>  |  "
+                              f"T+20: <b>{float(p20) * 100:.1f}%</b>"]
+            except (TypeError, ValueError):
+                pass
+        prob_block = ("📈 <b>KHẢ NĂNG TĂNG</b>\n" + "\n".join(prob_lines) + "\n\n")
+
+        # Context — expanded: each regime now explains what it IS and why it
+        # forces its size action, plus the other exposure legs.
+        ctx_lines: list[str] = []
+        ctx_lines.extend(html.escape(ln) for ln in regime_explain_lines(regime_id))
+        if garch_line:
+            ctx_lines.append(garch_line)
+        breadth = signal_data.get("breadth")
+        if breadth is not None:
+            try:
+                ctx_lines.append(
+                    f"Độ rộng thị trường: <b>{float(breadth) * 100:.0f}%</b> mã tăng")
+            except (TypeError, ValueError):
+                pass
+        drift = signal_data.get("drift_scalar")
+        if drift is not None:
+            try:
+                _d = float(drift)
+                ctx_lines.append(
+                    "Xu hướng chỉ số: "
+                    + ("đang suy yếu — hạ tỷ trọng ×%.2f" % _d if _d < 1.0
+                       else "bình thường"))
+            except (TypeError, ValueError):
+                pass
+        if arb_note:
+            ctx_lines.append(f"Trọng tài tin tức: {html.escape(str(arb_note))}")
+        mr_fired = signal_data.get("mr_fired")
+        if mr_fired is not None:
+            ctx_lines.append("Bắt đáy (MR): "
+                             + ("<b>đã kích hoạt</b>" if mr_fired else "chưa kích hoạt"))
+        if base_decision:
+            ctx_lines.append(f"Phân loại gốc của mô hình: "
+                             f"<b>{html.escape(str(base_decision))}</b>")
+        ctx_block = ""
+        if ctx_lines:
+            ctx_block = "🛡️ <b>BỐI CẢNH</b>\n" + "\n".join(ctx_lines) + "\n\n"
+
+        # Reference sizing only — capital and max hold, nothing else. Framed
+        # as THAM CHIẾU because the system is not sizing the operator's book.
+        ref_bits = [f"Đi vốn: <b>{sizing_str}</b>"]
+        hold_label_txt = signal_data.get("hold_label")
+        if hold_label_txt:
+            ref_bits.append(f"Nắm giữ tối đa: <b>{html.escape(str(hold_label_txt))}</b>")
+        ref_block = "💰 <b>THAM CHIẾU</b>\n" + "  |  ".join(ref_bits) + "\n\n"
 
         return (
-            f"<b>KHUYẾN NGHỊ MUA — {ticker}</b>\n"
-            f"{horizon_label} Model  |  {date_str}  |  Vùng giá: <b>{price}</b>\n"
+            f"📊 <b>{ticker} — {price}</b>  [ỨNG VIÊN {horizon_label}]\n"
+            f"{date_str}\n"
             f"{event_line}"
             f"\n"
-            f"<b>Xác suất xu hướng ({horizon_label})</b>\n"
-            f"{trend_line}\n"
-            f"{base_line}"
-            f"\n"
-            f"{oversight_block}"
-            f"{deploy_block}"
-            f"<b>Nhận định</b>\n"
+            f"{warn_block}"
+            f"{prob_block}"
+            f"{ctx_block}"
+            f"{ref_block}"
+            f"📰 <b>NHẬN ĐỊNH — {score_line(facts)}</b>\n"
             f"{analysis}\n"
             f"\n"
             f"{source_line}"

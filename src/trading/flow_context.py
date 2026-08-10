@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, timedelta
+from pathlib import Path
 
 import polars as pl
 
@@ -32,6 +33,39 @@ LOGGER = logging.getLogger(__name__)
 # trading days flow_features.py's rolling-20d windows want (min_samples=5
 # is the hard floor, but a fuller window gives a more reliable z-score).
 _LOOKBACK_DAYS = 50
+
+
+def latest_foreign_room(ticker: str) -> float | None:
+    """Most recent `foreign_remain_room_vol` for `ticker`, or None.
+
+    Reads the local backfill parquet (populated by
+    scripts/backfill_ssi_foreign_flow.py) rather than calling FastConnect —
+    room moves slowly and a dispatch must not wait on the network. None when
+    the parquet, the ticker, or the column is missing; the caller treats that
+    as "unknown", never as "room available".
+    """
+    try:
+        from src.data.foreign_flow_crawler import _DEFAULT_PARQUET  # noqa: PLC0415
+
+        path = Path(_DEFAULT_PARQUET)
+        if not path.exists():
+            return None
+        rows = (
+            pl.scan_parquet(path)
+            .filter((pl.col("ticker") == ticker.upper().strip())
+                    & pl.col("foreign_remain_room_vol").is_not_null())
+            .select(["date", "foreign_remain_room_vol"])
+            .sort("date", descending=True)
+            .limit(1)
+            .collect()
+        )
+        if rows.is_empty():
+            return None
+        return float(rows.row(0)[1])
+    except Exception:  # noqa: BLE001 -- informational only, never break a dispatch
+        LOGGER.warning("[flow-context] foreign-room lookup failed for %s", ticker,
+                       exc_info=True)
+        return None
 
 
 def live_flow_divergence(ticker: str) -> dict | None:

@@ -1292,8 +1292,10 @@ def daily_inference(
     # the primary probs per-ticker).  Short horizon = T+5 (verify-only model);
     # it serves here purely as the arbitrator's second opinion.
     _secondary_h = 20 if int(horizon) == SHORT_HORIZON else SHORT_HORIZON
+    thr_secondary: dict = {}
     try:
-        stacking_predictions_20d, _, _, _, _ = predict_v3_horizon(latest_df, _secondary_h)
+        stacking_predictions_20d, thr_secondary, _, _, _ = predict_v3_horizon(
+            latest_df, _secondary_h)
     except (FileNotFoundError, RuntimeError) as exc:
         LOGGER.warning(
             "Secondary horizon T+%d unavailable (%s) — running PRIMARY T+%d only; "
@@ -1441,6 +1443,9 @@ def daily_inference(
         broadcast=broadcast,
         event_overrides=event_overrides,
         persist=persist,
+        tau_primary=(thr_5d or {}).get("pnl_threshold_tau"),
+        tau_secondary=(thr_secondary or {}).get("pnl_threshold_tau"),
+        mr_scores=mr_score_tickers(top_buy_signals) if top_buy_signals else {},
     )
 
     if not dispatched_signals and not (report_html or "").strip():
@@ -1611,6 +1616,57 @@ _BASE_DECISION_VI: dict[int, str] = {
 }
 
 
+def _horizon_card_fields(
+    ticker: str,
+    stacking_predictions: dict[str, dict],
+    horizon: int,
+    tau_primary: float | None,
+    tau_secondary: float | None,
+) -> dict[str, Any]:
+    """Map PRIMARY/SECONDARY probabilities + gates onto explicit T+5 / T+20
+    card fields.
+
+    `stacking_predictions` keys "5d"/"20d" mean PRIMARY/SECONDARY, not the
+    literal horizons, so keying off them directly would mislabel the numbers.
+    `horizon` is the primary; the secondary is whichever of {5, 20} it is not.
+    """
+    primary = stacking_predictions.get("5d", {}).get(ticker)
+    secondary = stacking_predictions.get("20d", {}).get(ticker)
+
+    def _p_up(probs: Any) -> float | None:
+        try:
+            return float(probs[2])
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    p_primary, p_secondary = _p_up(primary), _p_up(secondary)
+    if int(horizon) == SHORT_HORIZON:          # PRIMARY is the short horizon
+        return {"p_up_5d": p_primary, "tau_5d": tau_primary,
+                "p_up_20d": p_secondary, "tau_20d": tau_secondary}
+    return {"p_up_20d": p_primary, "tau_20d": tau_primary,
+            "p_up_5d": p_secondary, "tau_5d": tau_secondary}
+
+
+def _room_exhausted(ticker: str) -> bool | None:
+    """True when foreign ownership room is exhausted for `ticker`.
+
+    Research (09-08-26, scripts/analyze_foreign_room_signal.py): het-room
+    names returned +0.52 pct over T+20 against +1.54 pct when room was
+    available (p<1e-6, 207 tickers, 15.4 pct of the universe), so this is a
+    genuine defensive filter worth surfacing. Fail-open to None — a lookup
+    failure must never block a dispatch, and None renders as "could not
+    evaluate" rather than a false all-clear.
+    """
+    try:
+        from src.trading.flow_context import latest_foreign_room  # noqa: PLC0415
+
+        room = latest_foreign_room(ticker)
+        return None if room is None else room <= 0.0
+    except Exception:  # noqa: BLE001 — informational only
+        LOGGER.debug("[room] lookup failed for %s", ticker, exc_info=True)
+        return None
+
+
 def _dispatch_signals(
     top_buy_signals: list[str],
     all_sentiments: dict[str, Any],
@@ -1624,6 +1680,9 @@ def _dispatch_signals(
     bot: TelegramBot,
     strategy: dict | None = None,
     exposure_scalar: float = 1.0,
+    tau_primary: float | None = None,
+    tau_secondary: float | None = None,
+    mr_scores: dict[str, dict] | None = None,
 ) -> list[dict]:
     """Per-ticker signal build + Telegram dispatch loop.
 
@@ -1633,6 +1692,18 @@ def _dispatch_signals(
     `strategy` — the artifact's portfolio-construction dict.  Tranche mode
     overrides the half-Kelly size with the validated cohort weight and adds
     hold-horizon / barrier guidance to the card; None keeps legacy behavior.
+
+    `tau_primary` / `tau_secondary` — the two horizons' meta-gate thresholds,
+    needed by the card's checklist score and by the "T+5-only" warning (the
+    T+20 gate does the quality filtering; every losing July-2026 dispatch
+    came through a T+5-only signal). Omitted → those checks report "could not
+    evaluate" rather than silently passing.
+
+    NAMING TRAP: `stacking_predictions` keys are legacy. "5d" holds the
+    PRIMARY horizon's probabilities and "20d" the SECONDARY's, whatever those
+    horizons actually are (see the comment above `predict_v3_horizon`'s call
+    site). Mapping them to the card by key name would label T+20 numbers as
+    T+5 and invert the warning, so the mapping below keys off `horizon`.
     """
     tranche_fields = _tranche_signal_fields(strategy, len(top_buy_signals), horizon)
     # Prob-scaled cohort weights (default OFF — backlog plan
@@ -1752,6 +1823,15 @@ def _dispatch_signals(
             "prob_up": round(_p5[2] * 100, 1),
             "prob_side": round(_p5[1] * 100, 1),
             "prob_down": round(_p5[0] * 100, 1),
+            # Both horizons + their gates, mapped by ACTUAL horizon (see the
+            # naming trap in this function's docstring), for the card's
+            # two-probability readout, checklist score and T+5-only warning.
+            **_horizon_card_fields(
+                ticker, stacking_predictions, int(horizon),
+                tau_primary, tau_secondary,
+            ),
+            "room_exhausted": _room_exhausted(ticker),
+            "mr_fired": (mr_scores or {}).get(ticker, {}).get("fired"),
             "conclusion": _reason_vi,
             "sentiment_score": sentiment_data.get("sentiment_score", 0.0),
             "sentiment_status": _format_sentiment_status(sentiment_data),
@@ -1784,6 +1864,9 @@ def run_trade_execution(
     broadcast: bool = True,
     event_overrides: dict | None = None,
     persist: bool = True,
+    tau_primary: float | None = None,
+    tau_secondary: float | None = None,
+    mr_scores: dict[str, dict] | None = None,
 ) -> tuple[str, list[dict]]:
     """Execute portfolio updates, RL outcome logging, and dispatch Telegram alerts.
 
@@ -1921,6 +2004,9 @@ def run_trade_execution(
             bot=bot,
             strategy=_strategy,
             exposure_scalar=_exposure_scalar,
+            tau_primary=tau_primary,
+            tau_secondary=tau_secondary,
+            mr_scores=mr_scores,
         )
         sent = len(dispatched_signals)
         LOGGER.info("Telegram alerts dispatched: %s (broadcast=%s)", sent, broadcast)
