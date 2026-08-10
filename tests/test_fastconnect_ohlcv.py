@@ -257,6 +257,58 @@ def test_prefetch_filters_bars_at_or_before_the_local_max(crawler, tmp_path):
     assert len(out) == 2
 
 
+def test_merge_canonicalizes_volume_dtype_across_sources(crawler, tmp_path):
+    """THE 10-08-26 PRODUCTION CRASH.
+
+    vnstock writes int64 volume, FastConnect float64. That split the 359
+    OHLCV shards into two parquet schemas, and the EOD pipeline's
+    `pl.concat(how="diagonal")` died with
+    `SchemaError: type Int64 is incompatible with expected type Float64`
+    (`failed to vstack column 'volume'`) — after a clean crawl, so the run
+    produced no signals at all.
+    """
+    path = tmp_path / "ohlcv_AAA.parquet"
+    old = pd.DataFrame({
+        "ticker": ["AAA"], "date": [date(2026, 8, 7)],
+        "open": [40.0], "high": [41.0], "low": [39.0], "close": [40.5],
+        "volume": pd.Series([1000], dtype="int64"),      # vnstock's dtype
+        "adj_close": [40.5],
+    })
+    old.to_parquet(path, index=False)
+    pre = fc._parse_rows("AAA", [_fc_row("10/08/2026")])  # FastConnect: float64
+
+    with patch("src.data.crawlers.Quote"):
+        crawler.fetch_ohlcv(ticker="AAA", end_date="2026-08-10", file_path=str(path),
+                            prefetched=pre, prefetch_covers_from="2026-07-12")
+
+    written = pd.read_parquet(path)
+    for col in ("open", "high", "low", "close", "volume", "adj_close"):
+        assert written[col].dtype == "float64", f"{col} is {written[col].dtype}"
+
+
+def test_merge_canonicalizes_dtype_on_the_vnstock_path_too(crawler, tmp_path):
+    # The fix must not be prefetch-only, or a fallback ticker would keep
+    # writing int64 and re-split the schemas.
+    path = tmp_path / "ohlcv_BBB.parquet"
+    old = pd.DataFrame({
+        "ticker": ["BBB"], "date": [date(2026, 8, 7)],
+        "open": [10.0], "high": [11.0], "low": [9.0], "close": [10.5],
+        "volume": pd.Series([500], dtype="int64"), "adj_close": [10.5],
+    })
+    old.to_parquet(path, index=False)
+    vn = pd.DataFrame({
+        "time": [pd.Timestamp("2026-08-10")], "open": [10.6], "high": [11.2],
+        "low": [10.1], "close": [11.0], "volume": pd.Series([700], dtype="int64"),
+    })
+    with patch("src.data.crawlers.Quote") as quote:
+        quote.return_value.history.return_value = vn
+        crawler.fetch_ohlcv(ticker="BBB", end_date="2026-08-10", file_path=str(path))
+
+    written = pd.read_parquet(path)
+    assert written["volume"].dtype == "float64"
+    assert len(written) == 2
+
+
 def test_prefetch_with_nothing_new_leaves_history_intact(crawler, tmp_path):
     path = _existing_parquet(tmp_path, "2026-08-10")
     pre = fc._parse_rows("AAA", [_fc_row("07/08/2026")])

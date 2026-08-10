@@ -433,6 +433,16 @@ class StockCrawler:
             df_final.drop_duplicates(subset=["ticker", "date"], keep="last", inplace=True)
             df_final = df_final.sort_values(by=["ticker", "date"]).reset_index(drop=True)
 
+        # Canonicalize numeric dtypes so the two sources cannot write different
+        # schemas for the same logical column. vnstock hands back int64 volume
+        # and FastConnect float64; letting that through split the 359 shards
+        # into two schemas and crashed the EOD pipeline's polars concat on
+        # 10-08-26. Float64 is lossless for share volumes.
+        if not df_final.empty:
+            for col in ("open", "high", "low", "close", "volume", "adj_close"):
+                if col in df_final.columns:
+                    df_final[col] = df_final[col].astype("float64")
+
         if file_path and not df_final.empty:
             try:
                 os.makedirs(os.path.dirname(file_path), exist_ok=True)

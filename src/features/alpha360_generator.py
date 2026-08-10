@@ -17,6 +17,12 @@ def setup_logging() -> logging.Logger:
 
 LOGGER = setup_logging()
 
+# Cast targets for the per-shard dtype normalization in
+# `_load_live_stock_window`. Float64 is the canonical choice: it is what 345
+# of the 359 shards already hold, and it is lossless for share volumes
+# (float64 represents integers exactly to 2^53).
+_NUMERIC_OHLCV_COLUMNS = ("open", "high", "low", "close", "volume", "adj_close")
+
 
 class Alpha360Generator:
     """Live RAW-OHLCV window loader (parquet-first).
@@ -84,11 +90,22 @@ class Alpha360Generator:
         for idx, path in enumerate(parquet_files, start=1):
             if idx == 1 or idx % 50 == 0 or idx == len(parquet_files):
                 LOGGER.info("Reading live parquet tails %s/%s...", idx, len(parquet_files))
+            # Numerics are cast per shard because dtypes legitimately vary
+            # across the 359 files: `volume` is int64 where vnstock wrote last
+            # and float64 where the FastConnect path did.
+            # `pl.concat(how="diagonal")` raises SchemaError on that mismatch
+            # and took down the whole EOD pipeline on 10-08-26. Some int64
+            # shards belong to inactive tickers that will never be rewritten,
+            # so the loader — not the writer — has to be the durable fix.
+            scan = pl.scan_parquet(str(path))
+            present = set(scan.collect_schema().names())
             frame = (
-                pl.scan_parquet(str(path))
+                scan
                 .with_columns([
                     pl.col("ticker").cast(pl.Utf8).str.to_uppercase(),
                     pl.col("date").cast(pl.Date),
+                    *[pl.col(c).cast(pl.Float64) for c in _NUMERIC_OHLCV_COLUMNS
+                      if c in present],
                 ])
                 .sort("date")
                 .tail(window_rows)
