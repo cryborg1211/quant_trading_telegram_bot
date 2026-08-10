@@ -137,7 +137,8 @@ stock_price_v3/
     crawlers/
       sentiment_crawler.py -- News sentiment crawler
     data/
-      crawlers.py         -- OHLCV data ingestion
+      crawlers.py         -- OHLCV data ingestion (FastConnect prefetch + throttled vnstock fallback)
+      fastconnect_ohlcv.py -- SSI FastConnect concurrent OHLCV prefetch (PRIMARY EOD source, 10-08-26)
       db_engine.py        -- DuckDB engine management
       price_lookup.py     -- Fresh-parquet price lookups
       tensor_builder.py   -- Feature tensor construction
@@ -365,10 +366,18 @@ A local MCP server (`code-review-graph`) maintains a live graph database of the 
 - `get_affected_flows_tool` — execution flows touching a node
 - `query_graph_tool` — arbitrary graph queries
 
+**EOD OHLCV crawl — FastConnect primary, vnstock fallback (2026-08-10):** the 15:30 ICT pipeline spent **25.4 of its 29.5 minutes** crawling OHLCV, and nearly all of it was deliberate sleeping — vnstock guest is capped ~20 req/min so `crawlers._throttle_request` paces at 4.25s/ticker even though one `Quote.history` call measures 0.42s. The network was never the bottleneck; the rate limit was. `src/data/fastconnect_ohlcv.py::bulk_prefetch` runs one concurrent pass (4 workers, shared sliding-window limiter at 55 req/min) before the existing serial loop, which then does disk work only. **Live-measured 10-08-26: crawl 1523s → 381s (4.0x), 354/357 prefetched, 4 throttle sleeps instead of 357.** Full pipeline 29.5 min → ~10 min.
+- **Serial FastConnect is NOT a win** (2.77s median latency × 359 = 16.6 min) — the concurrency is the point, and the *shared* limiter is what makes it safe. A per-thread limiter would let 4 workers each take the full budget.
+- **Value parity verified before wiring** (a faster source that disagrees on price would be worthless — every feature and label is built on these numbers): O/H/L/C matched vnstock to **0.0000%** across VCB/HPG/FPT/SSI/VNM × 9 sessions; volume matched exactly on 4 of 5 (VCB differed 0.372%, block-deal accounting). FastConnect also respects the requested window exactly where vnstock over-returns earlier dates.
+- **Window-sufficiency guard:** a ticker is served from the prefetch only when the window provably reaches back past its local max date. Serving a 30-day prefetch to a ticker 60 days behind would advance its parquet and orphan the gap forever (the next run reads only the new max). Verified live — `DMX: gap starts 2016-01-01, before the prefetch window 2026-07-12 — using the slow path`. Cold starts deliberately stay on vnstock so the fast path carries no chunking/paging logic.
+- **Dtype hazard (caused a production crash the same day, fixed in `ded6e4c`):** vnstock returns int64 volume, FastConnect float64 — one crawl split the 359 shards into two parquet schemas (345 double / 15 int64) and `alpha360_generator._load_live_stock_window`'s `pl.concat(how="diagonal")` died with `SchemaError: type Int64 is incompatible with expected type Float64`. Fixed at BOTH ends: `crawlers._merge_and_save` casts numerics to float64 on every write, AND the loader casts per shard on read — the writer alone is insufficient because several int64 shards belong to inactive tickers that will never be rewritten. **Any new OHLCV source must go through `_merge_and_save`.**
+- Kill-switch `CONFIG.crawler.fastconnect_ohlcv_enabled` (default ON) restores the pure-vnstock path with no other change. Credentials are the same `Consumer_Key`/`ConsumerSecret_Key` as the foreign-flow module. Tests: `tests/test_fastconnect_ohlcv.py` (24).
+- **Remaining 15:30 cost is external-API-bound, deliberately not optimized:** sentiment ~2.4–3.3 min (GNews per-ticker loop has an intentional politeness sleep — concurrency risks a Google block that would kill sentiment entirely; the 5 Gemini calls are paid and were already cost-tuned) and inference ~1.3 min (dominated by the arbitrator's news scrape + Gemini). Chasing those ~2 min means risking the paid path and the scrape-sensitive path for marginal gain.
+
 ## Scan Metadata
 
 - Generated: 2026-06-09
-- Last content update: 2026-07-24
+- Last content update: 2026-08-10
 - HEAD: main (fba7459)
 - Mode: fresh scaffold + study
 - Package manager: pip (requirements.txt, Python 3.11)
