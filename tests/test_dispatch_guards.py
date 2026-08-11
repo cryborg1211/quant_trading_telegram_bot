@@ -78,6 +78,49 @@ def test_open_tickers_never_raises(tmp_path):
     assert signal_ledger.open_tickers(db_path=str(tmp_path / "missing" / "x.duckdb")) == set()
 
 
+def test_open_tickers_excludes_paper_rows(tmp_path):
+    """Reconstructed rows must NOT veto a real dispatch.
+
+    `scripts/backfill_dispatched_signals_from_paperlog.py` writes OPEN rows for
+    historical model suggestions that were never real positions. Counting them
+    here inverts the guard: it exists to stop re-buying a name you already HOLD.
+    Measured on the real 10-08-26 backfill, 2 liquid names (PVD, VHM) would have
+    been blocked for weeks.
+    """
+    db = str(tmp_path / "ledger.duckdb")
+    with duckdb.connect(db) as conn:
+        signal_ledger.ensure_table(conn)
+        conn.execute(
+            f"INSERT INTO {signal_ledger.TABLE} "
+            "(ticker, dispatch_date, horizon, hold_days, weight, status, is_paper) "
+            "VALUES "
+            "('BSR', DATE '2026-07-14', 5, 5, 0.05, 'OPEN', FALSE), "
+            "('PVD', DATE '2026-07-15', 20, 30, 0.0, 'OPEN', TRUE), "
+            "('VHM', DATE '2026-07-15', 5, 5, 0.0, 'OPEN', TRUE)"
+        )
+    assert signal_ledger.open_tickers(db_path=db) == {"BSR"}
+
+
+def test_open_tickers_counts_legacy_null_is_paper_as_real(tmp_path):
+    # Ledgers predating the column hold only real dispatches, so a NULL flag
+    # must read as real — dropping them would silently disable the dedup guard.
+    db = str(tmp_path / "legacy.duckdb")
+    with duckdb.connect(db) as conn:
+        conn.execute(
+            f"CREATE TABLE {signal_ledger.TABLE} ("
+            "ticker VARCHAR, dispatch_date DATE, horizon INTEGER, "
+            "hold_days INTEGER, weight DOUBLE, status VARCHAR, closed_date DATE, "
+            "dispatched_at TIMESTAMP)"
+        )
+        conn.execute(
+            f"INSERT INTO {signal_ledger.TABLE} "
+            "(ticker, dispatch_date, horizon, hold_days, weight, status) VALUES "
+            "('BSR', DATE '2026-07-14', 5, 5, 0.05, 'OPEN')"
+        )
+    # ensure_table (called inside open_tickers) must ALTER the legacy schema.
+    assert signal_ledger.open_tickers(db_path=db) == {"BSR"}
+
+
 # ---------------------------------------------------------------------------
 # _select_candidates integration (monkeypatched ledger + config)
 # ---------------------------------------------------------------------------

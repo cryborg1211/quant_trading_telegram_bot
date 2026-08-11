@@ -313,14 +313,21 @@ def fetch_existing_keys(conn: Any) -> set[tuple[str, date, int]]:
 
 
 def insert_planned_rows(conn: Any, planned: list[PlannedRow]) -> int:
-    """INSERT the planned rows into ``dispatched_signals``. Returns rows written."""
+    """INSERT the planned rows into ``dispatched_signals``. Returns rows written.
+
+    Every row is written with ``is_paper = TRUE``. That flag is what keeps these
+    reconstructions out of ``signal_ledger.open_tickers``, and therefore out of
+    the open-cohort dedup veto — without it an OPEN paper row would block a REAL
+    dispatch of the same ticker for weeks (measured: PVD and VHM).
+    """
     if not planned:
         return 0
     signal_ledger.ensure_table(conn)
     conn.executemany(
         f"INSERT INTO {signal_ledger.TABLE} "
-        "(ticker, dispatch_date, horizon, hold_days, weight, status, closed_date) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "(ticker, dispatch_date, horizon, hold_days, weight, status, closed_date, "
+        " is_paper) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, TRUE)",
         [
             (p.ticker, p.dispatch_date, p.horizon, p.hold_days,
              p.weight, p.status, p.closed_date)

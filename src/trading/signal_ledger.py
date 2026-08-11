@@ -56,6 +56,16 @@ def _opt_float(x: Any) -> float | None:
 
 
 def ensure_table(conn: Any) -> None:
+    """Create the ledger table, and add `is_paper` to a pre-existing one.
+
+    `is_paper` marks rows that were RECONSTRUCTED rather than really dispatched
+    (see scripts/backfill_dispatched_signals_from_paperlog.py). It exists because
+    `open_tickers` feeds the open-cohort dedup veto in `_select_candidates`: an
+    OPEN paper row would silently block a REAL dispatch of that ticker for weeks,
+    which inverts the guard's purpose — it is there to stop re-buying something
+    you already HOLD. Discriminating on `weight == 0.0` instead would be unsafe,
+    since `record_dispatch` also writes 0.0 when `suggested_weight` is missing.
+    """
     conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -66,10 +76,27 @@ def ensure_table(conn: Any) -> None:
             weight        DOUBLE,
             status        VARCHAR DEFAULT 'OPEN',
             closed_date   DATE,
-            dispatched_at TIMESTAMP DEFAULT current_timestamp
+            dispatched_at TIMESTAMP DEFAULT current_timestamp,
+            is_paper      BOOLEAN DEFAULT FALSE
         )
         """
     )
+    # Idempotent migration for ledgers created before is_paper existed. Their
+    # rows are all real dispatches, so FALSE is the correct backfill value.
+    try:
+        cols = {
+            r[0] for r in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                f"WHERE table_name = '{TABLE}'"
+            ).fetchall()
+        }
+        if "is_paper" not in cols:
+            conn.execute(
+                f"ALTER TABLE {TABLE} ADD COLUMN is_paper BOOLEAN DEFAULT FALSE")
+            conn.execute(f"UPDATE {TABLE} SET is_paper = FALSE WHERE is_paper IS NULL")
+            LOGGER.info("[SignalLedger] added is_paper (existing rows = real dispatches).")
+    except Exception:  # noqa: BLE001 — never block the dispatch path
+        LOGGER.warning("[SignalLedger] is_paper migration skipped.", exc_info=True)
 
 
 def record_dispatch(
@@ -170,18 +197,24 @@ def list_open(db_path: str | None = None, today: date | None = None) -> list[dic
 
 
 def open_tickers(db_path: str | None = None) -> set[str]:
-    """Uppercased tickers with ANY status='OPEN' row, across all horizons.
+    """Uppercased tickers with ANY REAL status='OPEN' row, across all horizons.
 
     Feeds the dispatch open-cohort dedup (July-2026 incident: BSR re-dispatched
     4 consecutive days into a falling knife). Cheap single-column read — no
     session counting. Never raises: an unreadable ledger returns an empty set
     (candidate selection must not die because dedup data is unavailable).
+
+    `is_paper` rows are EXCLUDED. The guard's purpose is "do not re-buy a name
+    you already hold", and a reconstructed row is not a holding — counting them
+    would veto real dispatches (measured: 2 liquid names, PVD and VHM, would
+    have been blocked for weeks by the 10-08-26 backfill).
     """
     try:
         with _connect(db_path) as conn:
             ensure_table(conn)
             rows = conn.execute(
-                f"SELECT DISTINCT ticker FROM {TABLE} WHERE status = 'OPEN'"
+                f"SELECT DISTINCT ticker FROM {TABLE} "
+                "WHERE status = 'OPEN' AND COALESCE(is_paper, FALSE) = FALSE"
             ).fetchall()
         return {str(r[0]).upper() for r in rows}
     except Exception:  # noqa: BLE001
