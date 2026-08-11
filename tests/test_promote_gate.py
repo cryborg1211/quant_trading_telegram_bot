@@ -43,20 +43,72 @@ def test_sharpe_within_tolerance_promotes():
     assert promote
 
 
-def test_dd_regression_rejected():
-    new = {"oos_sharpe": 0.60, "oos_max_dd": -0.20, "golden_mean_up_precision": 0.40}
-    old = {"oos_sharpe": 0.60, "oos_max_dd": -0.13, "golden_mean_up_precision": 0.40}
+def test_dd_is_not_compared_against_the_incumbent():
+    """MaxDD is an extremum, so it is NOT comparable across OOS windows.
+
+    THE DEADLOCK THIS FIXES (10-08-26). Every walk-forward runs from a fixed
+    start to the newest bar, so a candidate's OOS window strictly CONTAINS the
+    incumbent's — same start, ~21 more days. A max over the longer window can
+    only rise once any new drawdown lands, so a relative DD check rejects good
+    candidates by construction. It rejected four consecutive retrains and froze
+    the live T+20 artifact at 2026-07-17.
+
+    This case is the real 08-08 T+20 candidate: Sharpe essentially unchanged
+    (0.645 -> 0.646) while DD jumped 12.60% -> 19.26%. That signature means a
+    longer window holding a bigger drawdown, not a worse model.
+    """
+    new = {"oos_sharpe": 0.646, "oos_max_dd": -0.1926,
+           "golden_mean_up_precision": 0.548,
+           "trained_at": "2026-08-08T03:03:33Z"}
+    old = {"oos_sharpe": 0.645, "oos_max_dd": -0.1260,
+           "golden_mean_up_precision": 0.5698,
+           "trained_at": "2026-07-17T08:47:10Z"}
+    promote, reason = _promote_decision(new, old, -0.10, 3.0, 0.35)
+    assert promote, reason
+    assert "NOT comparable" in reason
+
+
+def test_dd_still_blocked_by_the_absolute_ceiling():
+    # Dropping the relative check must not remove the DD guard entirely — a
+    # runaway drawdown is still a reject, judged on its own merits.
+    new = {"oos_sharpe": 0.80, "oos_max_dd": -0.40, "golden_mean_up_precision": 0.50}
+    old = {"oos_sharpe": 0.60, "oos_max_dd": -0.13, "golden_mean_up_precision": 0.45}
     promote, reason = _promote_decision(new, old, -0.10, 3.0, 0.35)
     assert not promote
-    assert "MaxDD regression" in reason
+    assert "absolute MaxDD ceiling" in reason
 
 
-def test_dd_within_tolerance_promotes():
-    # 2pp worse, tolerance is 3pp.
-    new = {"oos_sharpe": 0.60, "oos_max_dd": -0.15, "golden_mean_up_precision": 0.40}
-    old = {"oos_sharpe": 0.60, "oos_max_dd": -0.13, "golden_mean_up_precision": 0.40}
-    promote, _ = _promote_decision(new, old, -0.10, 3.0, 0.35)
+def test_genuine_sharpe_regression_still_rejected_after_the_fix():
+    # The real 08-08 T+5 candidate. Sharpe fell 0.590 -> 0.489 on a near-
+    # identical window: a real degradation, and the one rejection of the four
+    # that SHOULD stand. Guards against the DD fix loosening the gate wholesale.
+    new = {"oos_sharpe": 0.489, "oos_max_dd": -0.1943,
+           "golden_mean_up_precision": 0.550,
+           "trained_at": "2026-08-08T04:06:24Z"}
+    old = {"oos_sharpe": 0.590, "oos_max_dd": -0.1344,
+           "golden_mean_up_precision": 0.4585,
+           "trained_at": "2026-07-19T16:59:19Z"}
+    promote, reason = _promote_decision(new, old, -0.10, 3.0, 0.35)
+    assert not promote
+    assert "Sharpe regression" in reason
+
+
+def test_absolute_sharpe_floor_blocks_a_broken_run():
+    # Needs an incumbent: with none, the gate promotes unconditionally rather
+    # than leave the bot with no artifact at all.
+    new = {"oos_sharpe": 0.05, "oos_max_dd": -0.05, "golden_mean_up_precision": 0.50}
+    old = {"oos_sharpe": 0.60, "oos_max_dd": -0.13, "golden_mean_up_precision": 0.45}
+    promote, reason = _promote_decision(new, old, -0.10, 3.0, 0.35)
+    assert not promote
+    assert "absolute Sharpe floor" in reason
+
+
+def test_no_incumbent_promotes_even_a_weak_candidate():
+    # Explicit: the absolute floors must NOT wedge the very first deploy.
+    new = {"oos_sharpe": 0.05, "oos_max_dd": -0.40, "golden_mean_up_precision": 0.10}
+    promote, reason = _promote_decision(new, None, -0.10, 3.0, 0.35)
     assert promote
+    assert "no incumbent" in reason
 
 
 def test_precision_floor_rejected_even_if_better_than_incumbent():
@@ -76,13 +128,20 @@ def test_all_gates_pass_promotes():
     assert "passed" in reason
 
 
-def test_missing_keys_treated_as_worst_case():
-    # Malformed incumbent metadata (missing oos_sharpe) must not crash — and
-    # must not accidentally auto-pass via a bad default.
+def test_malformed_incumbent_does_not_let_a_weak_candidate_through():
+    # Malformed incumbent metadata (missing oos_sharpe) must not crash, and must
+    # not auto-pass: old_sharpe defaults to -inf, which makes the RELATIVE check
+    # vacuous, so the absolute floor is the backstop that has to catch this.
     new = {"oos_sharpe": 0.10, "oos_max_dd": 0.0, "golden_mean_up_precision": 0.40}
-    old = {}
-    promote, _ = _promote_decision(new, old, -0.10, 3.0, 0.35)
-    assert promote  # old defaults to -inf sharpe → any real new value clears it
+    promote, reason = _promote_decision(new, {}, -0.10, 3.0, 0.35)
+    assert not promote
+    assert "absolute Sharpe floor" in reason
+
+
+def test_malformed_incumbent_still_promotes_a_healthy_candidate():
+    new = {"oos_sharpe": 0.62, "oos_max_dd": -0.14, "golden_mean_up_precision": 0.46}
+    promote, reason = _promote_decision(new, {}, -0.10, 3.0, 0.35)
+    assert promote, reason
 
 
 # ---------------------------------------------------------------------------

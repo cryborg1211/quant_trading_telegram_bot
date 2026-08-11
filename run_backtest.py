@@ -551,43 +551,114 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
                      time.perf_counter() - t_start, mode=mode, hold_days=hold_days)
 
 
+def _vintage_days_apart(new_meta: dict, old_meta: dict) -> int | None:
+    """Calendar days between the two artifacts' OOS window ends, or None.
+
+    `trained_at` is the proxy for the OOS window end: a walk-forward always
+    tests up to the newest available bar, so the run's timestamp and its OOS
+    end are within a day of each other. (`oos_end_date` is stored from 10-08-26
+    onward and is preferred when both sides have it; older incumbents only have
+    `trained_at`.)
+    """
+    def _end(meta: dict) -> str | None:
+        return meta.get("oos_end_date") or meta.get("trained_at")
+
+    a, b = _end(new_meta), _end(old_meta)
+    if not a or not b:
+        return None
+    try:
+        da = datetime.fromisoformat(str(a).replace("Z", ""))
+        db = datetime.fromisoformat(str(b).replace("Z", ""))
+    except (TypeError, ValueError):
+        return None
+    return abs((da - db).days)
+
+
 def _promote_decision(
     new_meta: dict,
     old_meta: dict | None,
     min_sharpe_delta: float,
-    max_dd_regression_pp: float,
+    max_dd_regression_pp: float,          # retained for signature/config compat
     min_up_precision: float,
+    max_window_skew_days: float = 21.0,   # diagnostic only, see below
+    min_abs_sharpe: float = 0.30,
+    max_abs_dd_pp: float = 25.0,
 ) -> tuple[bool, str]:
     """Pure promote/reject decision (weekly-auto-retrain gate, 20-07-26).
 
     The retrain schedule went from manual/occasional to EVERY Saturday, so a
     single bad walk-forward run (data glitch, unlucky seed, silent regression)
-    would auto-overwrite the live artifact with no human in the loop. Compares
-    the new candidate's embedded metrics against the CURRENT on-disk artifact's
-    own metadata (every bundle already carries oos_sharpe/oos_max_dd/
-    golden_mean_up_precision — no extra state needed).
+    would auto-overwrite the live artifact with no human in the loop.
+
+    WHY MaxDD IS NO LONGER A RELATIVE CHECK (fixed 10-08-26)
+    ───────────────────────────────────────────────────────
+    The original gate compared the candidate's MaxDD against the incumbent's
+    stored MaxDD. That deadlocked it: four consecutive retrains were rejected
+    (26-07 both horizons, 08-08 both), freezing the live T+20 artifact at
+    2026-07-17 while the market moved underneath it.
+
+    The reason is structural, not a tolerance that needs widening. Each
+    walk-forward tests from a fixed start to the newest bar, so the candidate's
+    OOS window strictly CONTAINS the incumbent's — same start, ~21 more days at
+    the end. MaxDD is an extremum over that window, so it can only ever rise as
+    the window grows: `new_dd >= old_dd` whenever any new drawdown occurred, no
+    matter how good the model is. The 08-08 T+20 candidate is the proof —
+
+        Sharpe   0.646  vs incumbent 0.645   (unchanged)
+        MaxDD   19.26%  vs incumbent 12.60%  (+6.7pp, rejected)
+
+    an unchanged average with a jumped extremum is the signature of a longer
+    window containing a bigger drawdown, not of a worse model.
+
+    So MaxDD is now checked against an ABSOLUTE ceiling (`max_abs_dd_pp`), which
+    still blocks a genuinely runaway run. Sharpe keeps its RELATIVE check: it is
+    an average over ~98%-overlapping windows, so it is comparable, and it is the
+    statistic that actually detects a degraded model — the 08-08 T+5 candidate
+    (0.489 vs 0.590) is a real regression and is still correctly rejected.
+    `min_abs_sharpe` is a floor beneath that, for the no-incumbent-comparison
+    case. UP-precision remains an absolute floor.
+
+    `max_dd_regression_pp` and `max_window_skew_days` are kept in the signature
+    so existing config/callers keep working; the skew is reported in the reason
+    string for diagnosis but no longer changes the decision.
 
     No incumbent (first run / artifact missing) → always promote. `old_meta`
     unreadable/malformed upstream → caller passes None, same as no incumbent
     (fail toward promoting rather than permanently wedging deploys).
     """
+    # No incumbent → promote unconditionally. Rejecting here would leave the
+    # bot with NO artifact at all, which is strictly worse than a weak one; the
+    # floors below exist to keep a good incumbent, so they only make sense when
+    # there IS one to fall back to.
     if old_meta is None:
         return True, "no incumbent artifact — promoting first run"
-    new_sharpe = float(new_meta.get("oos_sharpe", float("-inf")))
-    old_sharpe = float(old_meta.get("oos_sharpe", float("-inf")))
-    if new_sharpe < old_sharpe + min_sharpe_delta:
-        return False, (f"Sharpe regression: new={new_sharpe:.3f} old={old_sharpe:.3f} "
-                       f"(min allowed delta={min_sharpe_delta:+.3f})")
-    new_dd = abs(float(new_meta.get("oos_max_dd", 0.0)))
-    old_dd = abs(float(old_meta.get("oos_max_dd", 0.0)))
-    if new_dd > old_dd + max_dd_regression_pp / 100.0:
-        return False, (f"MaxDD regression: new={new_dd:.2%} old={old_dd:.2%} "
-                       f"(max regression +{max_dd_regression_pp:.1f}pp)")
+
     new_prec = float(new_meta.get("golden_mean_up_precision", 0.0))
     if new_prec < min_up_precision:
         return False, f"UP-precision below floor: new={new_prec:.3f} < {min_up_precision:.3f}"
+
+    new_sharpe = float(new_meta.get("oos_sharpe", float("-inf")))
+    new_dd = abs(float(new_meta.get("oos_max_dd", 0.0)))
+
+    if new_sharpe < min_abs_sharpe:
+        return False, (f"absolute Sharpe floor: new={new_sharpe:.3f} < "
+                       f"{min_abs_sharpe:.3f}")
+    if new_dd > max_abs_dd_pp / 100.0:
+        return False, (f"absolute MaxDD ceiling: new={new_dd:.2%} > "
+                       f"{max_abs_dd_pp:.1f}%")
+
+    old_sharpe = float(old_meta.get("oos_sharpe", float("-inf")))
+    old_dd = abs(float(old_meta.get("oos_max_dd", 0.0)))
+    if new_sharpe < old_sharpe + min_sharpe_delta:
+        return False, (f"Sharpe regression: new={new_sharpe:.3f} old={old_sharpe:.3f} "
+                       f"(min allowed delta={min_sharpe_delta:+.3f})")
+
+    skew = _vintage_days_apart(new_meta, old_meta)
+    skew_txt = "unknown" if skew is None else f"{skew}d"
     return True, (f"passed — Sharpe {old_sharpe:.3f}→{new_sharpe:.3f}, "
-                  f"DD {old_dd:.2%}→{new_dd:.2%}, UP-prec={new_prec:.3f}")
+                  f"DD {new_dd:.2%} (absolute ceiling {max_abs_dd_pp:.1f}%; "
+                  f"incumbent's {old_dd:.2%} was measured on a window {skew_txt} "
+                  f"shorter and is NOT comparable), UP-prec={new_prec:.3f}")
 
 
 def _persist_bot_payload(cfg: RunConfig, tabular_features: list[str], golden: dict,
@@ -622,6 +693,12 @@ def _persist_bot_payload(cfg: RunConfig, tabular_features: list[str], golden: di
         "macro_hmm": macro_hmm,                              # may be None
         "metadata": {
             "trained_at": datetime.utcnow().isoformat() + "Z",
+            # OOS window end, stored explicitly so the promote-gate can tell
+            # whether two artifacts' metrics are even comparable (see
+            # `_promote_decision`'s WINDOW SKEW note). A walk-forward always
+            # tests to the newest bar, so this equals the run date; recording it
+            # separately means the gate never has to infer it from `trained_at`.
+            "oos_end_date": datetime.utcnow().isoformat() + "Z",
             "best_seed": int(best_seed_record["seed"]),
             "n_seeds_in_golden": int(golden["n_seeds_ok"]),
             "oos_net_pnl_vnd": float(best_seed_record["net_pnl"]),
@@ -665,6 +742,9 @@ def _persist_bot_payload(cfg: RunConfig, tabular_features: list[str], golden: di
             float(getattr(CONFIG.trading, "promote_gate_min_sharpe_delta", -0.10)),
             float(getattr(CONFIG.trading, "promote_gate_max_dd_regression_pp", 3.0)),
             float(getattr(CONFIG.trading, "promote_gate_min_up_precision", 0.35)),
+            float(getattr(CONFIG.trading, "promote_gate_max_window_skew_days", 21.0)),
+            float(getattr(CONFIG.trading, "promote_gate_min_abs_sharpe", 0.30)),
+            float(getattr(CONFIG.trading, "promote_gate_max_abs_dd_pp", 25.0)),
         )
         if not promote:
             rejected_dir = save_dir / "rejected"

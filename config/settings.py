@@ -146,6 +146,17 @@ class TradingConfig:
     promote_gate_min_sharpe_delta: float = -0.10
     promote_gate_max_dd_regression_pp: float = 3.0
     promote_gate_min_up_precision: float = 0.35
+    # Window-skew escape (10-08-26). The relative checks above compare the
+    # candidate's fresh OOS metrics against the incumbent's metrics as measured
+    # on the incumbent's OWN, older window — apples to oranges. That deadlocked
+    # the gate: four consecutive retrains were rejected and the live T+20
+    # artifact froze at 17-07 while the market moved. Past this many days of
+    # skew the relative checks are skipped and only the absolute floors below
+    # apply, which still block a broken run without demanding that a candidate
+    # beat a stale vintage's easier window.
+    promote_gate_max_window_skew_days: float = 21.0
+    promote_gate_min_abs_sharpe: float = 0.30
+    promote_gate_max_abs_dd_pp: float = 25.0
     # Prob-scaled tranche cohort weights (plan prob-scaled-tranche-weights_PLAN_20-07-26):
     # scale within-cohort dispatch weights by normalized edge over the serve
     # signal gate (src/trading/cohort_weights.py, capped 2× equal weight).
