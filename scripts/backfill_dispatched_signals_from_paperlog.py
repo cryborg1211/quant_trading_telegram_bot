@@ -16,16 +16,21 @@ ground-truth record of what was broadcast. Only ``source='daily'`` rows count;
 ``source='verify'`` rows are user-pulled ``/verify`` replies (not engine
 dispatches) and are excluded.
 
-Reconstruction rule (per ``source='daily'`` paperlog row):
-  â€¢ T5 candidate  â€” ``decision_primary == 2`` (BUY). horizon=5, hold_days=5 (mirrors
-    the live T5-tracking synthetic ``{"mode":"tranche","hold_days":5}`` in
-    main.py â€” NOT tied to any bot strategy artifact).
-  â€¢ T20 candidate â€” the paperlog stores NO ``decision_20d`` column, so it is
-    derived here as ``argmax(p_down_secondary, p_side_secondary, p_up_secondary)`` (NULL-safe:
-    any NULL prob â†’ skip). Only rows where that argmax == 2 (BUY). horizon=20,
-    hold_days=30 (the REAL live production convention â€” the T+20 GOLDEN artifact
-    is backtested with the tranche book's ``--hold-days 30``; see main.py's T20
-    dispatch call site and Decision 3 of the EOD-report plan).
+Reconstruction rule (per ``source='daily'`` paperlog row). On daily rows the
+paperlog's PRIMARY horizon is T+20 and its SECONDARY is T+5 -- this mapping was
+INVERTED here until 10-08-26, so every previously backfilled row carried the
+other horizon's decision (see db_engine's paperlog naming note):
+  â€¢ T20 candidate â€” ``decision_primary == 2`` (BUY), i.e. the stored argmax of
+    the PRIMARY (T+20) model. horizon=20, hold_days=30 (the REAL live production
+    convention â€” the T+20 GOLDEN artifact is backtested with the tranche book's
+    ``--hold-days 30``; see main.py's T20 dispatch call site and Decision 3 of
+    the EOD-report plan).
+  â€¢ T5 candidate  â€” the paperlog stores no argmax for the secondary, so it is
+    derived here as ``argmax(p_down_secondary, p_side_secondary, p_up_secondary)``
+    (NULL-safe: any NULL prob â†’ skip). Only rows where that argmax == 2 (BUY).
+    horizon=5, hold_days=5 (mirrors the live T5-tracking synthetic
+    ``{"mode":"tranche","hold_days":5}`` in main.py â€” NOT tied to any bot
+    strategy artifact).
 
 Decision encoding (shared with the arbitrator/paperlog): argmax over
 ``[DOWN, SIDE, UP]`` â†’ ``0=SELL, 1=HOLD, 2=BUY`` (the argmax index IS the code).
@@ -101,16 +106,18 @@ class BackfillStats:
     scanned: int = 0
     non_daily_skipped: int = 0
     # Per-horizon: candidates found (BUY) / planned to insert / skipped-duplicate /
-    # skipped-no-price. T20 additionally: rows dropped because a 20d prob was NULL.
+    # skipped-no-price. T5 additionally: rows dropped because a SECONDARY prob was
+    # NULL (T+5 is the secondary on daily rows, and its probs can be absent when
+    # the secondary artifact failed to load).
     t5_found: int = 0
     t5_planned: int = 0
     t5_dup: int = 0
     t5_no_price: int = 0
+    t5_null_prob: int = 0
     t20_found: int = 0
     t20_planned: int = 0
     t20_dup: int = 0
     t20_no_price: int = 0
-    t20_null_prob: int = 0
     open_count: int = 0
     closed_count: int = 0
 
@@ -235,25 +242,15 @@ def build_backfill_plan(
         ticker = str(row.ticker).upper().strip()
         log_date = row.log_date
 
-        # --- T5 candidate: stored decision_primary == BUY ---------------------------
-        if row.decision_primary == _BUY:
-            stats.t5_found += 1
-            planned_row, outcome = _plan_one_horizon(
-                ticker, log_date, row.entry_close, _T5_HORIZON, _T5_HOLD_DAYS,
-                existing_keys, today, pl, sessions_cache)
-            if outcome == "planned" and planned_row is not None:
-                stats.t5_planned += 1
-                planned.append(planned_row)
-            elif outcome == "dup":
-                stats.t5_dup += 1
-            else:  # no_price
-                stats.t5_no_price += 1
+        # HORIZON MAPPING (fixed 10-08-26) — on `source='daily'` rows the
+        # PRIMARY horizon is T+20 and the SECONDARY is T+5. This loop had them
+        # swapped: it built horizon=5 rows from `decision_primary` (T+20's
+        # argmax) and horizon=20 rows from the secondary probs (T+5's), so every
+        # backfilled row carried the other horizon's decision. Only the column
+        # NAMES were misleading — see db_engine's paperlog naming note.
 
-        # --- T20 candidate: derived argmax over the 20d probs == BUY -----------
-        decision_20d = decision_from_probs(row.p_down_secondary, row.p_side_secondary, row.p_up_secondary)
-        if decision_20d is None:
-            stats.t20_null_prob += 1
-        elif decision_20d == _BUY:
+        # --- T20 candidate: stored PRIMARY argmax == BUY -----------------------
+        if row.decision_primary == _BUY:
             stats.t20_found += 1
             planned_row, outcome = _plan_one_horizon(
                 ticker, log_date, row.entry_close, _T20_HORIZON, _T20_HOLD_DAYS,
@@ -265,6 +262,24 @@ def build_backfill_plan(
                 stats.t20_dup += 1
             else:  # no_price
                 stats.t20_no_price += 1
+
+        # --- T5 candidate: derived argmax over the SECONDARY probs == BUY ------
+        decision_secondary = decision_from_probs(
+            row.p_down_secondary, row.p_side_secondary, row.p_up_secondary)
+        if decision_secondary is None:
+            stats.t5_null_prob += 1
+        elif decision_secondary == _BUY:
+            stats.t5_found += 1
+            planned_row, outcome = _plan_one_horizon(
+                ticker, log_date, row.entry_close, _T5_HORIZON, _T5_HOLD_DAYS,
+                existing_keys, today, pl, sessions_cache)
+            if outcome == "planned" and planned_row is not None:
+                stats.t5_planned += 1
+                planned.append(planned_row)
+            elif outcome == "dup":
+                stats.t5_dup += 1
+            else:  # no_price
+                stats.t5_no_price += 1
 
     stats.open_count = sum(1 for r in planned if r.status == "OPEN")
     stats.closed_count = sum(1 for r in planned if r.status == "CLOSED")
@@ -320,12 +335,13 @@ def _print_summary(stats: BackfillStats, planned: list[PlannedRow], committed: b
     LOGGER.info("[backfill-dispatch] %s", mode)
     LOGGER.info("  paperlog rows scanned: %d  (non-daily excluded: %d)",
                 stats.scanned, stats.non_daily_skipped)
-    LOGGER.info("  T5  (decision_primary==BUY):  found=%d inserted=%d dup=%d no_price=%d",
-                stats.t5_found, stats.t5_planned, stats.t5_dup, stats.t5_no_price)
-    LOGGER.info("  T20 (argmax_20d==BUY):   found=%d inserted=%d dup=%d no_price=%d "
-                "(null_prob_skipped=%d)",
-                stats.t20_found, stats.t20_planned, stats.t20_dup, stats.t20_no_price,
-                stats.t20_null_prob)
+    LOGGER.info("  T20 (stored PRIMARY argmax==BUY):  found=%d inserted=%d dup=%d "
+                "no_price=%d",
+                stats.t20_found, stats.t20_planned, stats.t20_dup, stats.t20_no_price)
+    LOGGER.info("  T5  (derived SECONDARY argmax==BUY):  found=%d inserted=%d dup=%d "
+                "no_price=%d (null_prob_skipped=%d)",
+                stats.t5_found, stats.t5_planned, stats.t5_dup, stats.t5_no_price,
+                stats.t5_null_prob)
     LOGGER.info("  planned rows: total=%d  OPEN=%d  CLOSED=%d",
                 len(planned), stats.open_count, stats.closed_count)
 
