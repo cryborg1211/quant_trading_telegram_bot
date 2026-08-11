@@ -31,6 +31,31 @@ come from the unofficial iBoard scrape and remain TODAY-ONLY.
 Index-level, so one row per (date, index) — deliberately a separate module and
 parquet from `foreign_flow_crawler`, which is per-ticker.
 
+HISTORICAL COVERAGE — READ THIS BEFORE USING ANY FIELD (measured 2026-08-11)
+───────────────────────────────────────────────────────────────────────────
+The backfill returns zero NULLs across 2016-01-04..2026-08-10, which is
+misleading: SSI sends a literal `0` rather than null for a field it does not
+carry for that era, so "no nulls" says nothing about availability. Fraction of
+VNINDEX sessions with a populated value, by year:
+
+    field              usable from    note
+    advances/declines  2020           exactly 0.000 for 2016-2019
+    total_match_val    2019 (48%)     full from 2020
+    total_deal_val     2021           2020 only 8.7%
+    ceilings/floors    2025           0.67 of 2025, 1.00 of 2026, ~0 before
+
+`floors` deserves the loudest warning. It reads 0.000 for ALL of 2016-2019 and
+2022-2024, then 0.502 in 2025 and 0.878 in 2026. That is not market history —
+2022 was a ~35% VNINDEX drawdown and certainly had limit-down sessions. Inside
+a train/holdout split the flag therefore degenerates into a TIME DUMMY ("is this
+date after mid-2025"), and any precision difference between floor buckets
+measures the regime change between the two periods rather than capitulation.
+See `scripts/analyze_mr_limit_down_context.py` for the run that established this.
+
+So: A/D is a genuine ~6.5-year series and safe to model on from 2020.
+Ceilings/floors carry ~1.5 years and cannot yet answer anything — the same
+thinness that left the breadth-inflection result unconfirmed.
+
 TWO FIELD-COVERAGE FACTS, both live-verified 2026-08-11
 ───────────────────────────────────────────────────────
   * `Advances` / `Declines` / `NoChanges` are populated for VNINDEX ONLY. VN30
