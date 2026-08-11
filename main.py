@@ -702,6 +702,7 @@ def _log_sentiment_entry_paperlog(
     all_sentiments: dict[str, dict],
     source: str,
     primary_horizon_days: int | None = None,
+    liquid_tickers: frozenset[str] | None = None,
 ) -> int:
     """Forward-log the candidate cross-section into `sentiment_entry_paperlog`.
 
@@ -719,6 +720,16 @@ def _log_sentiment_entry_paperlog(
     compared T+5 serve probabilities against a T+20 OOS reference and reported
     no drift. `primary_horizon_days` is recorded so this cannot recur if the
     primary horizon ever changes.
+
+    LIQUIDITY FLAG - `liquid_tickers` is the ADV-top-N tradeable set resolved for
+    this run; each row records membership as `liquid_at_log`. This is what makes
+    the table filterable to the TRADEABLE population. The cross-section logged
+    here includes the monitoring-only fallback branch, which is deliberately NOT
+    liquidity-gated, so an unfiltered performance read off this table is an
+    artifact - of 44 settled BUY rows exactly ONE was in the ADV top-50.
+    Reconstructing liquidity afterwards from today's ADV is not equivalent, since
+    a name's liquidity changes. Pass None when the caller has no universe (e.g.
+    /verify): the flag stays NULL = unknown, which must never be read as False.
 
     Idempotent: the `UNIQUE (log_date, ticker, source)` constraint + INSERT OR
     IGNORE silently suppress same-day duplicates, so re-running a pipeline on
@@ -778,6 +789,8 @@ def _log_sentiment_entry_paperlog(
         sent = all_sentiments.get(ticker) or {}
         sentiment_score = sent.get("sentiment_score")
         final_decision = final_decisions.get(ticker)
+        # None (not False) when the caller supplied no universe - "unknown".
+        liquid_at_log = None if liquid_tickers is None else (ticker in liquid_tickers)
 
         with db._audit_lock:
             db.conn.execute(
@@ -786,14 +799,16 @@ def _log_sentiment_entry_paperlog(
                 (log_date, ticker, source,
                  p_down_primary, p_side_primary, p_up_primary, decision_primary,
                  p_down_secondary, p_side_secondary, p_up_secondary,
-                 primary_horizon_days, final_decision, sentiment_score)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 primary_horizon_days, liquid_at_log, final_decision,
+                 sentiment_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     log_date, ticker, source,
                     p_down_primary, p_side_primary, p_up_primary, decision_primary,
                     p_down_secondary, p_side_secondary, p_up_secondary,
-                    primary_horizon_days, final_decision, sentiment_score,
+                    primary_horizon_days, liquid_at_log, final_decision,
+                    sentiment_score,
                 ],
             )
         inserted += 1
@@ -1192,6 +1207,7 @@ def _paperlog_snapshot_and_backfill(
     final_decisions: dict[str, int],
     all_sentiments: dict[str, Any],
     primary_horizon_days: int | None = None,
+    liquid_tickers: frozenset[str] | None = None,
 ) -> None:
     """Never-raise `source='daily'` paperlog write + matured-outcome backfill.
 
@@ -1211,6 +1227,7 @@ def _paperlog_snapshot_and_backfill(
             all_sentiments=all_sentiments,
             source="daily",
             primary_horizon_days=primary_horizon_days,
+            liquid_tickers=liquid_tickers,
         )
         backfilled = _backfill_paperlog_outcomes(db)
         LOGGER.info(
@@ -1227,6 +1244,7 @@ def _paperlog_no_trade_day(
     final_decisions: dict[str, int],
     all_sentiments: dict[str, Any],
     primary_horizon_days: int | None = None,
+    liquid_tickers: frozenset[str] | None = None,
 ) -> None:
     """Paperlog write for daily_inference exit paths that hold no manager.
 
@@ -1242,6 +1260,7 @@ def _paperlog_no_trade_day(
         _paperlog_snapshot_and_backfill(
             DuckDBEngine(), horizon_predictions, final_decisions, all_sentiments,
             primary_horizon_days=primary_horizon_days,
+            liquid_tickers=liquid_tickers,
         )
     except Exception:  # noqa: BLE001 — observability must never raise
         LOGGER.exception("Paperlog no-trade-day write failed — non-fatal.")
@@ -1356,7 +1375,9 @@ def daily_inference(
     # BYPASSES run_trade_execution — guaranteeing no trades are executed.
     if fallback_mode:
         if not candidate_tickers:
-            _paperlog_no_trade_day(persist, horizon_predictions, final_decisions, all_sentiments)
+            _paperlog_no_trade_day(persist, horizon_predictions, final_decisions,
+                                   all_sentiments, primary_horizon_days=int(horizon),
+                                   liquid_tickers=resolved_universe)
             return (
                 "<b>[⚠️ THỊ TRƯỜNG YẾU]</b>\n<i>Không có mã nào trong vũ trụ "
                 "giao dịch sau bộ lọc thanh khoản/Universe hôm nay.</i>",
@@ -1400,7 +1421,9 @@ def daily_inference(
         # Paperlog starvation fix (19-07-26): this return bypassed the paperlog
         # for 13 straight trading days while the τ-gate kept the pool empty.
         # Weak-market days are exactly the slice the item-1 experiment needs.
-        _paperlog_no_trade_day(persist, horizon_predictions, final_decisions, all_sentiments)
+        _paperlog_no_trade_day(persist, horizon_predictions, final_decisions,
+                               all_sentiments, primary_horizon_days=int(horizon),
+                               liquid_tickers=resolved_universe)
         LOGGER.info(
             "Dual-horizon daily inference completed in %.2fs.",
             time.perf_counter() - total_start,
@@ -1465,6 +1488,7 @@ def daily_inference(
         tau_primary=(thr_5d or {}).get("pnl_threshold_tau"),
         tau_secondary=(thr_secondary or {}).get("pnl_threshold_tau"),
         mr_scores=mr_score_tickers(top_buy_signals) if top_buy_signals else {},
+        liquid_tickers=resolved_universe,
     )
 
     if not dispatched_signals and not (report_html or "").strip():
@@ -1900,6 +1924,7 @@ def run_trade_execution(
     tau_primary: float | None = None,
     tau_secondary: float | None = None,
     mr_scores: dict[str, dict] | None = None,
+    liquid_tickers: frozenset[str] | None = None,
 ) -> tuple[str, list[dict]]:
     """Execute portfolio updates, RL outcome logging, and dispatch Telegram alerts.
 
@@ -1947,6 +1972,7 @@ def run_trade_execution(
                 _paperlog_snapshot_and_backfill(
                     manager.db, stacking_predictions, final_decisions, all_sentiments,
                     primary_horizon_days=int(horizon),
+                    liquid_tickers=liquid_tickers,
                 )
             return "", dispatched_signals
 
@@ -1989,6 +2015,7 @@ def run_trade_execution(
                     _paperlog_snapshot_and_backfill(
                         db, stacking_predictions, final_decisions, all_sentiments,
                         primary_horizon_days=int(horizon),
+                        liquid_tickers=liquid_tickers,
                     )
 
         LOGGER.info("Dispatching Telegram Alerts...")

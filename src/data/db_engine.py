@@ -223,6 +223,14 @@ class DuckDBEngine:
         serve probabilities against a T+20 OOS reference and reported "OK".
         `primary_horizon_days` is stored per row so a future change of primary
         horizon cannot make history ambiguous again.
+
+        `liquid_at_log` (added 10-08-26) records whether the ticker was in the
+        ADV-top-N tradeable universe AT LOG TIME. Without it the table cannot be
+        filtered to the tradeable population, and every performance read off it
+        is an artifact: the paperlog deliberately logs the monitoring-only
+        fallback branch, which is NOT liquidity-gated, so of 44 settled BUY rows
+        exactly ONE was in the ADV top-50. Reconstructing liquidity after the
+        fact from today's ADV is not equivalent — a name's liquidity changes.
         """
         self.conn.execute(
             "CREATE SEQUENCE IF NOT EXISTS seq_sentiment_entry_id START 1"
@@ -241,6 +249,7 @@ class DuckDBEngine:
                 p_side_secondary     DOUBLE,
                 p_up_secondary       DOUBLE,
                 primary_horizon_days INTEGER,
+                liquid_at_log        BOOLEAN,
                 final_decision       INTEGER,
                 sentiment_score      DOUBLE,
                 entry_close          DOUBLE,
@@ -296,18 +305,22 @@ class DuckDBEngine:
                 except Exception:  # noqa: BLE001
                     LOGGER.warning("[DuckDB] rename %s -> %s failed", old, new,
                                    exc_info=True)
-        if "primary_horizon_days" not in existing:
+        for col, decl, note in (
+            ("primary_horizon_days", "INTEGER",
+             "NULL on pre-migration rows = T+20, the only primary the daily "
+             "cron has ever used"),
+            ("liquid_at_log", "BOOLEAN",
+             "NULL on pre-migration rows = unknown; do NOT read NULL as False"),
+        ):
+            if col in existing:
+                continue
             try:
                 self.conn.execute(
-                    "ALTER TABLE sentiment_entry_paperlog "
-                    "ADD COLUMN primary_horizon_days INTEGER"
+                    f"ALTER TABLE sentiment_entry_paperlog ADD COLUMN {col} {decl}"
                 )
-                LOGGER.info("[DuckDB] paperlog gained primary_horizon_days "
-                            "(NULL on pre-migration rows = T+20, the only "
-                            "primary the daily cron has ever used).")
+                LOGGER.info("[DuckDB] paperlog gained %s (%s).", col, note)
             except Exception:  # noqa: BLE001
-                LOGGER.warning("[DuckDB] adding primary_horizon_days failed",
-                               exc_info=True)
+                LOGGER.warning("[DuckDB] adding %s failed", col, exc_info=True)
 
     def log_user_action(
         self,

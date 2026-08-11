@@ -40,6 +40,7 @@ _PAPERLOG_DDL_TABLE = """
         p_side_secondary     DOUBLE,
         p_up_secondary       DOUBLE,
         primary_horizon_days INTEGER,
+        liquid_at_log        BOOLEAN,
         final_decision       INTEGER,
         sentiment_score      DOUBLE,
         entry_close          DOUBLE,
