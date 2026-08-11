@@ -1,4 +1,4 @@
-﻿"""T+5/T+20 confluence signal analysis (2026-07-22, READ-ONLY).
+"""T+5/T+20 confluence signal analysis (2026-07-22, READ-ONLY).
 
 Idea (from the "smarter system" brainstorm): both horizons are already
 scored for every arbitrated candidate and cross-checked by the arbitrator
@@ -61,13 +61,13 @@ def main() -> None:
     print(f"Loaded {len(rows)} settled rows with both horizons present.\n")
 
     buckets: dict[str, list[float]] = {
-        "Confluence UP (5d=UP,20d=UP)": [],
-        "Confluence DOWN (5d=DN,20d=DN)": [],
-        "Divergent (5d=UP,20d=DN)": [],
-        "Divergent (5d=DN,20d=UP)": [],
-        "5d UP, 20d SIDE": [],
-        "5d DOWN, 20d SIDE": [],
-        "5d SIDE, any 20d": [],
+        "Confluence UP (T20=UP,T5=UP)": [],
+        "Confluence DOWN (T20=DN,T5=DN)": [],
+        "Divergent (T20=UP,T5=DN)": [],
+        "Divergent (T20=DN,T5=UP)": [],
+        "T20 UP, T5 SIDE": [],
+        "T20 DOWN, T5 SIDE": [],
+        "T20 SIDE, any T5": [],
     }
     all_5d_up: list[float] = []
     conf_up_only: list[float] = []
@@ -77,35 +77,35 @@ def main() -> None:
         if d5 == 2:
             all_5d_up.append(ret20)
         if d5 == 1:
-            buckets["5d SIDE, any 20d"].append(ret20)
+            buckets["T20 SIDE, any T5"].append(ret20)
         elif d5 == 2 and d20 == 2:
-            buckets["Confluence UP (5d=UP,20d=UP)"].append(ret20)
+            buckets["Confluence UP (T20=UP,T5=UP)"].append(ret20)
             conf_up_only.append(ret20)
         elif d5 == 0 and d20 == 0:
-            buckets["Confluence DOWN (5d=DN,20d=DN)"].append(ret20)
+            buckets["Confluence DOWN (T20=DN,T5=DN)"].append(ret20)
         elif d5 == 2 and d20 == 0:
-            buckets["Divergent (5d=UP,20d=DN)"].append(ret20)
+            buckets["Divergent (T20=UP,T5=DN)"].append(ret20)
         elif d5 == 0 and d20 == 2:
-            buckets["Divergent (5d=DN,20d=UP)"].append(ret20)
+            buckets["Divergent (T20=DN,T5=UP)"].append(ret20)
         elif d5 == 2 and d20 == 1:
-            buckets["5d UP, 20d SIDE"].append(ret20)
+            buckets["T20 UP, T5 SIDE"].append(ret20)
         elif d5 == 0 and d20 == 1:
-            buckets["5d DOWN, 20d SIDE"].append(ret20)
+            buckets["T20 DOWN, T5 SIDE"].append(ret20)
 
     print(f"{'bucket':<32}{'n':>6}{'mean ret20d':>11}{'hit rate':>10}  note")
     for label, rets in buckets.items():
         _bucket_stats(label, rets)
 
-    print(f"\n{'=' * 72}\nTHE DIRECT TEST: does requiring 20d confirmation on top of a 5d=UP\n"
-          f"pick improve outcomes vs 5d=UP alone (any 20d)?\n{'=' * 72}")
-    _bucket_stats("5d=UP, ANY 20d (today's effective pool)", all_5d_up)
-    _bucket_stats("5d=UP AND 20d=UP (confluence-gated)", conf_up_only)
+    print(f"\n{'=' * 72}\nTHE DIRECT TEST: does requiring T5 confirmation on top of a T20=UP\n"
+          f"pick improve outcomes vs T20=UP alone (any T5)?\n{'=' * 72}")
+    _bucket_stats("T20=UP, ANY T5 (the real gate)", all_5d_up)
+    _bucket_stats("T20=UP AND T5=UP (confluence-gated)", conf_up_only)
     comp = []
     for d5, pd20, ps20, pu20, ret20, ret3 in rows:
         d20 = _decision20(pd20, ps20, pu20)
         if d5 == 2 and d20 != 2:
             comp.append(ret20)
-    _bucket_stats("5d=UP but 20d != UP (would be FILTERED OUT)", comp)
+    _bucket_stats("T20=UP but T5 != UP (confluence would DROP these)", comp)
 
     print("\nDone. All buckets use ret_20d (realized 20-session return). "
           "n<15 flagged noisy per this session's reliability floor.")

@@ -1,4 +1,4 @@
-﻿"""Best-effort dispatched_signals backfill from the sentiment paperlog.
+"""Best-effort dispatched_signals backfill from the sentiment paperlog.
 
 Covers the four load-bearing behaviors of the reconstruction core:
   1. Horizon mapping: stored PRIMARY argmax -> T20; derived SECONDARY argmax -> T5.

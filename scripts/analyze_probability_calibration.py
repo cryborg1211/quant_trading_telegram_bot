@@ -1,4 +1,4 @@
-﻿"""Is the model's P(UP) honest? Calibration check on live paperlog data
+"""Is the model's P(UP) honest? Calibration check on live paperlog data
 (09-08-26).
 
 WHY THIS MATTERS MOST FOR A HUMAN-IN-THE-LOOP PRODUCT

@@ -1,4 +1,4 @@
-﻿"""Tests for scripts/analyze_rank_sleeve.py::sleeve_verdict (item-1 frozen criteria)."""
+"""Tests for scripts/analyze_rank_sleeve.py::sleeve_verdict (item-1 frozen criteria)."""
 from __future__ import annotations
 
 import datetime as dt

@@ -1,4 +1,4 @@
-﻿"""Sentiment-entry forward paper-log â€” capture + backfill unit tests.
+"""Sentiment-entry forward paper-log â€” capture + backfill unit tests.
 
 Covers the two new pure-ish helpers in main.py:
     * `_log_sentiment_entry_paperlog` â€” writes the candidate cross-section.

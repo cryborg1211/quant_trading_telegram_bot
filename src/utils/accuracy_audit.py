@@ -1,4 +1,4 @@
-﻿"""Model accuracy auditor â€” confusion-matrix analytics over the paperlog.
+"""Model accuracy auditor â€” confusion-matrix analytics over the paperlog.
 
 READ-SIDE ONLY. This module adds the one thing the existing audit stack does
 not have: it classifies the forward paper-logged predictions in

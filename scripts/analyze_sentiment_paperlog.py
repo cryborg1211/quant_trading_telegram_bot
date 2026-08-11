@@ -1,4 +1,4 @@
-﻿"""Analyse the sentiment-entry forward paper-log (observability only).
+"""Analyse the sentiment-entry forward paper-log (observability only).
 
 Reads the `sentiment_entry_paperlog` table populated by the daily pipeline +
 /verify command (see `_log_sentiment_entry_paperlog` in main.py) and reports

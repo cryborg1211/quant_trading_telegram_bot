@@ -1,4 +1,4 @@
-﻿"""Item-1 pre-registered evaluation: paperlog rank-sleeve counterfactual.
+"""Item-1 pre-registered evaluation: paperlog rank-sleeve counterfactual.
 
 Answers the FROZEN question from
 ``process/general-plans/backlog/attack-narrow-market-preregistration_05-07-26.md``:

@@ -1,4 +1,4 @@
-﻿"""Best-effort reconstruction of historical ``dispatched_signals`` ledger rows.
+"""Best-effort reconstruction of historical ``dispatched_signals`` ledger rows.
 
 The EOD dual-horizon position report (``eod-position-report_PLAN_16-07-26``) reads
 the ``dispatched_signals`` ledger (``src/trading/signal_ledger.py``), but that

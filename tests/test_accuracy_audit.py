@@ -1,4 +1,4 @@
-﻿"""Unit tests for the model-accuracy confusion-matrix auditor.
+"""Unit tests for the model-accuracy confusion-matrix auditor.
 
 Pure read-side logic over mocked ``sentiment_entry_paperlog`` rows â€” no real
 DuckDB, no parquet. Pins the confusion-matrix mapping, the precision/recall
