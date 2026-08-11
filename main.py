@@ -2448,6 +2448,7 @@ def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> No
          `days_back` limits to the last N days — e.g. 1 for previous-day-only);
       1b. refresh the daily macro series (DXY / USD-VND / SP500 → macro_daily.parquet);
       1c. refresh the daily foreign-flow snapshot (khoi ngoai → foreign_flow_daily.parquet);
+      1d. refresh official exchange breadth incl. ceilings/floors (→ market_breadth_daily.parquet);
       2. refresh daily LLM news sentiment;
       3. run the daily inference (T+20 tranche Top-3 broadcast);
       4. alert tranche cohorts whose hold horizon has elapsed (signal ledger);
@@ -2490,6 +2491,21 @@ def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> No
             update_foreign_flow_daily()
         except Exception:  # noqa: BLE001 — foreign-flow collection is best-effort
             LOGGER.exception("[foreign_flow] daily refresh failed — continuing EOD pipeline.")
+
+    # 1d. Official exchange breadth (FastConnect DailyIndex →
+    #     data/market_breadth_daily.parquet). Advances/Declines duplicate what
+    #     src/trading/breadth.py already approximates, but CEILINGS/FLOORS —
+    #     the limit-up and limit-down counts — have no equivalent anywhere in
+    #     the system and are a direct capitulation measure. Same best-effort
+    #     contract as 1b/1c. Re-fetches a short trailing window so late
+    #     exchange corrections land; an unsettled session is dropped on parse,
+    #     so running this before the close cannot poison the series.
+    with timed_step("Market-breadth daily refresh"):
+        try:
+            from src.data.market_breadth_crawler import update_market_breadth_daily
+            update_market_breadth_daily()
+        except Exception:  # noqa: BLE001 — breadth collection is best-effort
+            LOGGER.exception("[breadth] daily refresh failed — continuing EOD pipeline.")
 
     # 2. Daily LLM news sentiment.
     with timed_step("Fetching daily LLM sentiment"):
