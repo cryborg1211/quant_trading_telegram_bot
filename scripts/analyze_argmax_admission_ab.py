@@ -1,5 +1,30 @@
 """Argmax vs absolute-gate admission A/B (2026-08-11, READ-ONLY).
 
+VERDICT: argmax REJECTED — it never fires. Ran 920 OOS days and bought NOTHING.
+Not a wiring bug (the 3-class oracle returns (n,3) and the meta carries classes
+[0 1 2]); the model is structurally bearish to a degree that makes argmax==UP
+almost impossible. Scored 13,212 real name-days:
+
+    argmax==DOWN  99.985%      argmax==SIDE  0.000%      argmax==UP  0.015%
+    p_up   median 0.3946  p99 0.4523  max 0.5151
+    p_down median 0.5957  p99 0.6897  max 0.7187
+
+p_up's 99th percentile sits BELOW p_down's median, so UP essentially cannot win
+the argmax. That also retires the hypothesis this script was built to test: the
+33 argmax-UP paperlog rows that returned +1.19% were a 0.015%-frequency event,
+not the basis for an admission rule.
+
+Two things the run established that matter more than the rejection:
+  * the tau-gate and cross_sectional have nearly IDENTICAL Sharpe (+0.620 vs
+    +0.612) but 8.3x different PnL (644M vs 5.36B) and 7x different MaxDD
+    (-4.44% vs -30.98%). The gate is not adding risk-adjusted value — it is
+    scaling exposure down.
+  * production admits 46 buys in 920 days, one bet every ~20 sessions. The
+    bet-count starvation is now confirmed in backtest, not just the paperlog.
+  * the SIDE class is effectively dead (mean 0.0096, max 0.037, never the
+    argmax) — a label-distribution artifact worth its own look.
+
+
 THE HYPOTHESIS AND WHERE IT CAME FROM
 ─────────────────────────────────────
 Serve admits on `P(UP) >= tau` (tau=0.46). Two independent live-paperlog reads

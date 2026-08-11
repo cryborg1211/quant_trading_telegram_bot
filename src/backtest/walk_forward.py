@@ -238,6 +238,13 @@ class WalkForwardConfig:
     #       (serve p90 fell 0.463 → 0.423 against a frozen tau=0.46). Motivated
     #       by live paperlog evidence that P(UP) is anti-informative across the
     #       gate's range (Platt slope −0.274) while argmax==UP is not.
+    #       TESTED AND REJECTED 11-08-26 (scripts/analyze_argmax_admission_ab.py):
+    #       bought NOTHING across 920 OOS days. The current model is bearish to
+    #       the point that argmax==UP occurs on 0.015% of name-days — p_up's p99
+    #       (0.4523) is below p_down's MEDIAN (0.5957), so UP cannot win the
+    #       argmax. Kept in-tree behind the flag: the rule is sound, the model's
+    #       class balance is what makes it unusable, so it is worth re-testing
+    #       after any retrain that changes the label distribution.
     admission_mode: str = "cross_sectional"
     admission_floor: float = 0.45
     admission_pool_cap: int = 6
