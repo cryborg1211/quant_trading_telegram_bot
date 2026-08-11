@@ -47,14 +47,16 @@ def _oracle3(X: np.ndarray) -> np.ndarray:
 
 
 def _engine(*, admission_mode: str, admission_floor: float = 0.45,
-            admission_pool_cap: int = 6) -> WalkForwardEngine:
+            admission_pool_cap: int = 6, rank_mode: str = "p_up",
+            rank_seed: int = 0, max_positions: int = MAX_POS) -> WalkForwardEngine:
     cfg = WalkForwardConfig(
         seq_len=1, feature_cols=["f_dn", "f_sd", "f_up"],
         rebalance_mode="tranche", tranche_hold_days=HOLD,
-        max_positions=MAX_POS, signal_threshold=0.40,
+        max_positions=max_positions, signal_threshold=0.40,
         liquid_top_n=None, initial_capital=1_000_000_000.0,
         admission_mode=admission_mode, admission_floor=admission_floor,
         admission_pool_cap=admission_pool_cap,
+        rank_mode=rank_mode, rank_seed=rank_seed,
     )
     return WalkForwardEngine(cfg, _oracle3)
 
@@ -166,6 +168,116 @@ def test_default_mode_unchanged_by_the_argmax_plumbing():
     res = _engine(admission_mode="cross_sectional").run(panel)
     # signal_threshold=0.40 → A and B clear it, C does not.
     assert _bought(res) == {"A", "B"}
+
+
+# ── absolute_gate_argmax: what SERVE actually requires ─────────────────────
+
+def test_gate_argmax_requires_both_the_floor_and_the_class():
+    """Serve needs BOTH: `_select_candidates` gates on tau AND dispatches only
+    `final_decision == 2`, which `make_final_decision` only returns on an UP
+    argmax. The backtest validated the floor ALONE, so it admits more."""
+    panel = _panel({
+        "BOTH": (0.20, 0.20, 0.60),   # clears 0.45 AND argmax UP  -> admitted
+        "GATE": (0.50, 0.02, 0.48),   # clears 0.45 but argmax DOWN -> rejected
+        "ARGM": (0.20, 0.40, 0.40),   # argmax... SIDE, below floor -> rejected
+    })
+    res = _engine(admission_mode="absolute_gate_argmax", admission_floor=0.45).run(panel)
+    assert _bought(res) == {"BOTH"}
+
+
+def test_gate_argmax_is_stricter_than_the_gate_alone():
+    # The one name clears tau but its argmax is DOWN. absolute_gate buys it;
+    # the serve-equivalent mode does not. This gap IS the divergence measured
+    # by scripts/analyze_serve_stack_ab.py.
+    panel = _panel({"X": (0.50, 0.02, 0.48)})
+    assert _bought(_engine(admission_mode="absolute_gate",
+                           admission_floor=0.45).run(panel)) == {"X"}
+    assert _bought(_engine(admission_mode="absolute_gate_argmax",
+                           admission_floor=0.45).run(panel)) == set()
+
+
+def test_gate_argmax_with_one_dim_oracle_admits_nothing():
+    panel = _panel({"X": (0.10, 0.20, 0.70)})
+
+    def _oracle1(X: np.ndarray) -> np.ndarray:
+        return X[:, -1, 2].astype(np.float64)
+
+    cfg = WalkForwardConfig(
+        seq_len=1, feature_cols=["f_dn", "f_sd", "f_up"],
+        rebalance_mode="tranche", tranche_hold_days=HOLD,
+        max_positions=MAX_POS, signal_threshold=0.40,
+        liquid_top_n=None, initial_capital=1_000_000_000.0,
+        admission_mode="absolute_gate_argmax", admission_floor=0.45,
+    )
+    assert _bought(WalkForwardEngine(cfg, _oracle1).run(panel)) == set()
+
+
+# ── rank_mode: the backtestable proxy for serve's sentiment-first ordering ──
+
+def test_default_rank_mode_picks_the_highest_p_up():
+    panel = _panel({
+        "HI": (0.05, 0.15, 0.80),
+        "MD": (0.15, 0.25, 0.60),
+        "LO": (0.25, 0.28, 0.47),
+    })
+    res = _engine(admission_mode="absolute_gate", admission_floor=0.45).run(panel)
+    assert _bought(res) == {"HI", "MD"}      # max_positions=2
+
+
+def test_random_rank_mode_is_deterministic_for_a_seed():
+    # Reproducibility matters: an A/B arm that shuffles differently every run
+    # cannot be compared against anything.
+    panel = _panel({
+        "A": (0.05, 0.15, 0.80), "B": (0.10, 0.20, 0.70),
+        "C": (0.15, 0.25, 0.60), "D": (0.20, 0.28, 0.52),
+    })
+    first = _bought(_engine(admission_mode="absolute_gate", admission_floor=0.45,
+                            rank_mode="random", rank_seed=7).run(panel))
+    again = _bought(_engine(admission_mode="absolute_gate", admission_floor=0.45,
+                            rank_mode="random", rank_seed=7).run(panel))
+    assert first == again
+
+
+def test_random_rank_mode_can_pick_something_other_than_the_top_p_up():
+    # If the shuffle never changed the selection the proxy would be vacuous.
+    panel = _panel({
+        "A": (0.05, 0.15, 0.80), "B": (0.10, 0.20, 0.70),
+        "C": (0.15, 0.25, 0.60), "D": (0.20, 0.28, 0.52),
+        "E": (0.22, 0.26, 0.52), "F": (0.24, 0.24, 0.52),
+    })
+    by_p_up = _bought(_engine(admission_mode="absolute_gate", admission_floor=0.45,
+                              rank_mode="p_up").run(panel))
+    shuffled = {
+        frozenset(_bought(_engine(admission_mode="absolute_gate",
+                                  admission_floor=0.45, rank_mode="random",
+                                  rank_seed=s).run(panel)))
+        for s in range(6)
+    }
+    assert any(s != frozenset(by_p_up) for s in shuffled)
+
+
+def test_random_rank_mode_still_respects_the_floor():
+    # Shuffling must reorder the ADMITTED set only — never smuggle in a name
+    # that failed the gate.
+    panel = _panel({"OK": (0.20, 0.20, 0.60), "NO": (0.60, 0.20, 0.20)})
+    for s in range(4):
+        assert "NO" not in _bought(
+            _engine(admission_mode="absolute_gate", admission_floor=0.45,
+                    rank_mode="random", rank_seed=s).run(panel))
+
+
+def test_max_positions_three_takes_fewer_names_than_five():
+    panel = _panel({
+        "A": (0.05, 0.15, 0.80), "B": (0.10, 0.20, 0.70),
+        "C": (0.15, 0.25, 0.60), "D": (0.20, 0.28, 0.52),
+        "E": (0.22, 0.26, 0.52),
+    })
+    three = _bought(_engine(admission_mode="absolute_gate", admission_floor=0.45,
+                            max_positions=3).run(panel))
+    five = _bought(_engine(admission_mode="absolute_gate", admission_floor=0.45,
+                           max_positions=5).run(panel))
+    assert len(three) == 3 and len(five) == 5
+    assert three < five
 
 
 def test_inference_cache_carries_argmax_across_runs():

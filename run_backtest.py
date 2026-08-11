@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 
@@ -89,7 +90,9 @@ def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
                      rank_breadth_trigger: float = 0.40,
                      rank_breadth_floor_level: float = 0.25,
                      rank_breadth_floor: float = 0.5,
-                     tranche_budget_days: int | None = None) -> WalkForwardConfig:
+                     tranche_budget_days: int | None = None,
+                     rank_mode: str = "p_up",
+                     rank_seed: int = 0) -> WalkForwardConfig:
     """Pure WalkForwardConfig builder — extracted from `run_oos` so the
     mode/hold-days plumbing is unit-testable without running the engine.
 
@@ -119,6 +122,8 @@ def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
         rank_breadth_floor_level=rank_breadth_floor_level,
         rank_breadth_floor=rank_breadth_floor,
         tranche_budget_days=tranche_budget_days,
+        rank_mode=rank_mode,
+        rank_seed=rank_seed,
         constraints=PortfolioConstraints(
             max_weight=cfg.max_weight, long_only=True,
             target_leverage=0.95, target_vol=cfg.target_vol),
@@ -144,7 +149,10 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
             rank_breadth_floor_level: float = 0.25,
             rank_breadth_floor: float = 0.5,
             tranche_budget_days: int | None = None,
-            budget_days_series: pd.Series | None = None) -> pd.DataFrame:
+            budget_days_series: pd.Series | None = None,
+            rank_mode: str = "p_up",
+            rank_seed: int = 0,
+            max_positions: int | None = None) -> pd.DataFrame:
     """Walk-forward OOS using the pure-tabular ensemble oracle.
 
     The engine builds (n, 1, F) single-bar tensors internally (seq_len=1) and the
@@ -158,10 +166,14 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
     mode scores DAILY (~900 OOS days), so the first threshold per seed is the
     expensive one (~15 min); grid mode only scores on rebalance days.
     """
-    # `argmax` admission needs the class decision, which the default (n,) P(UP)
-    # oracle cannot express — without this it would admit nothing at all.
-    oracle = make_ensemble_oracle(ensemble,
-                                  three_class=(admission_mode == "argmax"))
+    # Any argmax-based admission needs the class decision, which the default
+    # (n,) P(UP) oracle cannot express — without this it would admit nothing.
+    oracle = make_ensemble_oracle(
+        ensemble, three_class=admission_mode in ("argmax", "absolute_gate_argmax"))
+    # Serve dispatches only the top-3 arbitrated names while the backtest slices
+    # `max_positions` (5). Overridable so the two can be compared directly.
+    if max_positions is not None:
+        cfg = replace(cfg, max_positions=int(max_positions))
     # Lookback buffer ahead of cutoff so OOS day-1 has feature warm-up + cov history.
     buffer = 80                                  # ~20d feature warm-up + 60d cov lookback
     all_dates = sorted(panel["date"].unique().to_list())
@@ -175,7 +187,8 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
                               admission_pool_cap, use_prob_weights,
                               rank_breadth_trigger, rank_breadth_floor_level,
                               rank_breadth_floor,
-                              tranche_budget_days=tranche_budget_days)
+                              tranche_budget_days=tranche_budget_days,
+                              rank_mode=rank_mode, rank_seed=rank_seed)
     eng = WalkForwardEngine(wf_cfg, oracle)
     # Soft HMM regime scaling: P(Bull) multiplies the daily target weights.
     result = eng.run(sub, corporate_actions=corporate_actions, p_bull_series=p_bull_series,

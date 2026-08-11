@@ -245,9 +245,21 @@ class WalkForwardConfig:
     #       argmax. Kept in-tree behind the flag: the rule is sound, the model's
     #       class balance is what makes it unusable, so it is worth re-testing
     #       after any retrain that changes the label distribution.
+    #   "absolute_gate_argmax": the tau floor AND the arbitrator's class
+    #       condition (argmax==UP). This is what SERVE actually requires —
+    #       `make_final_decision` only returns BUY on an UP argmax and
+    #       `_select_candidates` dispatches only `final_decision == 2` — so the
+    #       floor alone, which is all the backtest ever validated, admits more
+    #       than production does.
     admission_mode: str = "cross_sectional"
     admission_floor: float = 0.45
     admission_pool_cap: int = 6
+    # Ranking within the admitted set. "p_up" is what every validated result was
+    # earned with; "random" is the backtestable proxy for serve's sentiment-first
+    # ordering (sentiment has no point-in-time history, so it cannot be modelled
+    # directly). Default preserves every existing result byte-for-byte.
+    rank_mode: str = "p_up"
+    rank_seed: int = 0
     rank_breadth_window: int = 20
     rank_breadth_trigger: float = 0.40
     rank_breadth_floor_level: float = 0.25
@@ -945,8 +957,34 @@ class WalkForwardEngine:
         if len(tickers) == 0:
             return n_orders, n_fills, n_rej
 
-        order_idx = np.argsort(p_up)[::-1]
-        if cfg.admission_mode == "absolute_gate":
+        # Ranking rule. `p_up` (default) is what every validated result was
+        # earned with. `random` is a deterministic per-day shuffle used as the
+        # backtestable PROXY for serve's actual rule: `main._select_candidates`
+        # sorts the arbitrated pool by SENTIMENT score descending with p_up only
+        # as a tiebreak, and sentiment cannot be backtested (no point-in-time
+        # history — that is why the paperlog exists). If random ranks as well as
+        # p_up, serve's re-ordering is harmless; if p_up is materially better,
+        # serve is discarding the very edge the backtest measured.
+        if cfg.rank_mode == "random":
+            rng = np.random.default_rng(cfg.rank_seed + D.toordinal())
+            order_idx = rng.permutation(len(p_up))
+        else:
+            order_idx = np.argsort(p_up)[::-1]
+        if cfg.admission_mode == "absolute_gate_argmax":
+            # Serve's REAL admission: the tau floor AND the arbitrator's class
+            # condition. `make_final_decision` returns BUY only when the primary
+            # horizon's argmax is UP, and `_select_candidates` dispatches only
+            # `final_decision == 2` — so the floor alone (what the backtest
+            # validated) is not what production requires.
+            _argmax = getattr(self, "_argmax_up_today", {}) or {}
+            survivors = [tickers[j] for j in order_idx
+                         if p_up[j] >= cfg.admission_floor
+                         and _argmax.get(tickers[j], False)][:cfg.admission_pool_cap]
+            if not survivors:
+                self._zero_candidate_days += 1
+                return n_orders, n_fills, n_rej
+            picks = survivors[:cfg.max_positions]
+        elif cfg.admission_mode == "absolute_gate":
             # Serve-mirror admission: ABSOLUTE floor first (inclusive `>=`,
             # matching serve's `meta_gate`), cap the survivor pool at
             # `admission_pool_cap` (serve's `_ARBITRATOR_POOL`), THEN take the
