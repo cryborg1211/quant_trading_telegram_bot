@@ -158,7 +158,10 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
     mode scores DAILY (~900 OOS days), so the first threshold per seed is the
     expensive one (~15 min); grid mode only scores on rebalance days.
     """
-    oracle = make_ensemble_oracle(ensemble)
+    # `argmax` admission needs the class decision, which the default (n,) P(UP)
+    # oracle cannot express — without this it would admit nothing at all.
+    oracle = make_ensemble_oracle(ensemble,
+                                  three_class=(admission_mode == "argmax"))
     # Lookback buffer ahead of cutoff so OOS day-1 has feature warm-up + cov history.
     buffer = 80                                  # ~20d feature warm-up + 60d cov lookback
     all_dates = sorted(panel["date"].unique().to_list())
@@ -184,6 +187,14 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
     # A/B grid) via pandas metadata — keeps the bare-DataFrame return contract
     # that the threshold sweep in `main()` depends on unchanged.
     eq.attrs["zero_candidate_days"] = int(result.zero_candidate_days)
+    # Bet count — the constraint the DSR assessment identified as binding (too
+    # FEW independent bets, not bad ones), so admission A/Bs need it alongside
+    # Sharpe/DD rather than inferring it from the equity curve.
+    try:
+        _fills = result.fills or []
+        eq.attrs["n_buys"] = sum(1 for f in _fills if f.get("side") == "buy")
+    except Exception:  # noqa: BLE001 — a diagnostic must never fail a run
+        eq.attrs["n_buys"] = 0
     return eq
 
 

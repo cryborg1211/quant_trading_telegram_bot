@@ -675,22 +675,34 @@ class TabularEnsemble:
 # ─────────────────────────────────────────────────────────────────────────────
 def make_ensemble_oracle(
     ensemble: TabularEnsemble, tab_indices: Sequence[int] | None = None,
+    three_class: bool = False,
 ) -> Callable:
     """
     Adapt a fitted TabularEnsemble to the Phase-8 oracle contract:
 
-        oracle(X: (n, L, F))  ->  (n,) P(UP)
+        oracle(X: (n, L, F))  ->  (n,) P(UP)          [three_class=False]
+        oracle(X: (n, L, F))  ->  (n, 3) [DOWN,SIDE,UP]  [three_class=True]
 
     The engine builds 3-D tensors per inference call.  The ensemble consumes
     only the LAST timestep's tabular features — with WalkForwardConfig.seq_len=1
     the slice is trivial.  `tab_indices` selects a subset of the F columns at
     the last bar (None ⇒ all).
+
+    `three_class` is opt-in and OFF by default so every existing caller keeps
+    the (n,) contract. It exists for `admission_mode="argmax"`, which admits on
+    the class decision and therefore cannot work from P(UP) alone —
+    `WalkForwardEngine._inference` leaves its argmax map empty for a 1-D oracle
+    rather than inventing a decision from a threshold. The engine already reads
+    `probs[:, 2]` when handed an (n,3) matrix, so the wider return is
+    transparent to everything downstream.
     """
     idx = None if tab_indices is None else list(tab_indices)
 
     def oracle(X: np.ndarray) -> np.ndarray:
         last = X[:, -1, :]
         Xtab = last if idx is None else last[:, idx]
+        if three_class:
+            return ensemble.predict_proba_3class(Xtab)
         return ensemble.predict_proba(Xtab)
 
     return oracle

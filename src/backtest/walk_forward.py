@@ -232,6 +232,12 @@ class WalkForwardConfig:
     #       days the market still has relatively-better names, AND
     #       cross_sectional's chronic over-admission regardless of how thin
     #       the whole tape is.
+    #   "argmax": admit every name whose 3-class ARGMAX is UP, ranked by p_up
+    #       within that set. No absolute threshold anywhere, so it cannot be
+    #       starved by output-distribution drift the way absolute_gate was
+    #       (serve p90 fell 0.463 → 0.423 against a frozen tau=0.46). Motivated
+    #       by live paperlog evidence that P(UP) is anti-informative across the
+    #       gate's range (Platt slope −0.274) while argmax==UP is not.
     admission_mode: str = "cross_sectional"
     admission_floor: float = 0.45
     admission_pool_cap: int = 6
@@ -569,10 +575,26 @@ class WalkForwardEngine:
         When an `inference_cache` was supplied to `run()`, the (threshold-
         independent) result for `D` is memoized so a threshold sweep over the
         same frozen oracle pays the GBM scoring cost exactly once per day.
+
+        Also records `self._argmax_up_today`: {ticker: bool} for whether UP was
+        the ARGMAX class, not merely above some P(UP) level. The two are very
+        different admission rules — live paperlog evidence (11-08-26) has P(UP)
+        anti-correlated with outcomes across the gate's operating range (Platt
+        slope −0.274) while argmax==UP picks beat the baseline by ~3.6pp — so
+        `admission_mode="argmax"` needs the class decision, which p_up alone
+        cannot express.
         """
         cache = getattr(self, "_inference_cache", None)
         if cache is not None and D in cache:
-            p_up_c, tickers_c = cache[D]
+            cached = cache[D]
+            # 3-tuple since the argmax A/B; tolerate a legacy 2-tuple cache so a
+            # caller holding an older dict cannot crash the run.
+            if len(cached) == 3:
+                p_up_c, tickers_c, argmax_c = cached
+            else:
+                p_up_c, tickers_c = cached
+                argmax_c = {}
+            self._argmax_up_today = dict(argmax_c)
             # Defensive copies: downstream (_apply_liquidity_filter / _allocate)
             # treats these as read-only, but copying guarantees a future mutation
             # can never poison the shared cache.
@@ -594,16 +616,29 @@ class WalkForwardEngine:
             tickers.append(tk)
 
         if not X_list:
+            self._argmax_up_today = {}
             if cache is not None:
-                cache[D] = (np.array([]), [])
+                cache[D] = (np.array([]), [], {})
             return np.array([]), []
 
         X = np.stack(X_list).astype(np.float32)        # (n, seq, F)
         probs = self.oracle(X)
         probs = np.asarray(probs)
         p_up = probs[:, 2] if probs.ndim == 2 else probs.ravel()
+        # UP is the argmax over [DOWN, SIDE, UP]. Ties resolve AGAINST admission
+        # (strict >) so a flat 3-way split never counts as a BUY call.
+        if probs.ndim == 2 and probs.shape[1] >= 3:
+            argmax_up = {
+                tk: bool(probs[i, 2] > probs[i, 0] and probs[i, 2] > probs[i, 1])
+                for i, tk in enumerate(tickers)
+            }
+        else:
+            # A 1-D oracle exposes no class structure; leave argmax unavailable
+            # rather than inventing it from a threshold.
+            argmax_up = {}
+        self._argmax_up_today = argmax_up
         if cache is not None:
-            cache[D] = (p_up, tickers)
+            cache[D] = (p_up, tickers, argmax_up)
         return p_up, tickers
 
     # ── 2b. Liquidity gate (top-N ADV filter) ──────────────────────────────
@@ -913,6 +948,25 @@ class WalkForwardEngine:
             # zero-candidate-day fall-to-cash economics.
             survivors = [tickers[j] for j in order_idx
                          if p_up[j] >= cfg.admission_floor][:cfg.admission_pool_cap]
+            if not survivors:
+                self._zero_candidate_days += 1
+                return n_orders, n_fills, n_rej
+            picks = survivors[:cfg.max_positions]
+        elif cfg.admission_mode == "argmax":
+            # Admit on the CLASS DECISION (UP is the argmax), not on a P(UP)
+            # level. Motivation (11-08-26 paperlog): across the range the
+            # absolute gate operates in, P(UP) is anti-informative — the
+            # [0.2,0.3) bin realised a 45.9% hit rate vs 29.3% for [0.4,0.5),
+            # Platt slope −0.274 — while argmax==UP rows beat the baseline
+            # (+1.19% vs −2.43%). Argmax is also immune to the gate-starvation
+            # failure mode, since it compares the three classes against each
+            # other rather than against a frozen absolute threshold that the
+            # output distribution can drift below.
+            # Still ranked by p_up within the admitted set, so the cohort takes
+            # the strongest of the qualifying names.
+            _argmax = getattr(self, "_argmax_up_today", {}) or {}
+            survivors = [tickers[j] for j in order_idx
+                         if _argmax.get(tickers[j], False)][:cfg.admission_pool_cap]
             if not survivors:
                 self._zero_candidate_days += 1
                 return n_orders, n_fills, n_rej
