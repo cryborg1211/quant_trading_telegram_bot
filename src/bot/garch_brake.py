@@ -221,6 +221,7 @@ def live_exposure_legs() -> dict:
     garch_scalar = 1.0
     drift_scalar = 1.0
     breadth_scalar = 1.0
+    drift_raw: float | None = None
 
     need_panel = (getattr(CONFIG.trading, "drift_brake_enabled", False)
                   or getattr(CONFIG.trading, "breadth_brake_enabled", False)
@@ -243,9 +244,22 @@ def live_exposure_legs() -> dict:
             market_ret = build_market_proxy_returns(panel)
             if market_ret is not None and len(market_ret) > 0:
                 drift_scalar = _drift_scalar(market_ret)
+                # Raw trailing cumulative return, recorded for the same reason
+                # `breadth_raw` is: a leg that fails open returns 1.0, and so
+                # does a leg that ran and found nothing to brake. Without the
+                # underlying reading the two are INDISTINGUISHABLE — which is
+                # how two of three legs sat dead for hours with no alert.
+                _w = int(getattr(CONFIG.trading, "drift_brake_window", 10))
+                _tail = [float(r) for r in market_ret][-_w:]
+                if _tail:
+                    _cum = 1.0
+                    for _r in _tail:
+                        _cum *= (1.0 + _r)
+                    drift_raw = _cum - 1.0
         except Exception:  # noqa: BLE001 — fail-open
             LOGGER.warning("[drift-brake] computation failed — full exposure", exc_info=True)
             drift_scalar = 1.0
+            drift_raw = None
 
     if getattr(CONFIG.trading, "breadth_brake_enabled", False):
         try:
@@ -274,18 +288,39 @@ def live_exposure_legs() -> dict:
     legs = {"garch": garch_scalar, "drift": drift_scalar, "breadth": breadth_scalar}
     combined = min(legs.values())
     binding = min(legs, key=legs.get)
+    _b_raw = _breadth_raw(panel)
     LOGGER.info(
-        "[meta-controller] legs garch=%.3f drift=%.3f breadth=%.3f → "
-        "combined=×%.3f (binding=%s)",
-        garch_scalar, drift_scalar, breadth_scalar, combined,
-        binding if combined < 1.0 else "none",
+        "[meta-controller] legs garch=%.3f drift=%.3f breadth=%.3f "
+        "(raw drift=%s breadth=%s) → combined=×%.3f (binding=%s)",
+        garch_scalar, drift_scalar, breadth_scalar,
+        "n/a" if drift_raw is None else f"{drift_raw:+.4f}",
+        "n/a" if _b_raw is None else f"{_b_raw:.4f}",
+        combined, binding if combined < 1.0 else "none",
     )
+    # A leg that is ENABLED but produced no raw reading did not run — it failed
+    # open to 1.0 and would otherwise look identical to "nothing to brake". This
+    # is the alert that was missing when two of three legs sat dead for hours.
+    for _name, _enabled_key, _raw in (
+        ("drift", "drift_brake_enabled", drift_raw),
+        ("breadth", "breadth_brake_enabled", _b_raw),
+    ):
+        if getattr(CONFIG.trading, _enabled_key, False) and _raw is None:
+            LOGGER.error(
+                "[meta-controller] %s leg is ENABLED but produced no reading — "
+                "it FAILED OPEN to 1.0, so exposure is unbraked by that leg. "
+                "This is silent by design (fail-open); investigate the panel/"
+                "model source rather than trusting the ×1.0.", _name,
+            )
     return {
         "combined": combined,
         "garch": garch_scalar,
         "drift": drift_scalar,
         "breadth": breadth_scalar,
+        # RAW readings, not just the scalars. A leg that failed open and a leg
+        # that ran and found nothing to brake BOTH return 1.0; only the raw
+        # value distinguishes them. None here means "this leg did not run".
         "breadth_raw": _breadth_raw(panel),
+        "drift_raw": drift_raw,
         "binding": binding if combined < 1.0 else None,
     }
 

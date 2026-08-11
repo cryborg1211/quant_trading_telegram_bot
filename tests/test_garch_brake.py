@@ -229,6 +229,63 @@ class TestBreadthBrake:
                                side_effect=RuntimeError("boom")):
                 assert garch_brake.live_exposure_scalar() == pytest.approx(0.6)
 
+    def test_raw_readings_distinguish_ran_from_failed_open(self, monkeypatch, _enabled):
+        """A leg that failed open and a leg with nothing to brake BOTH read 1.0.
+
+        Only the raw reading tells them apart, and two of three legs sat dead
+        for hours precisely because nothing did. `drift_raw` / `breadth_raw` are
+        None when a leg did not run and a number when it did.
+        """
+        monkeypatch.setattr(CONFIG.trading, "drift_brake_enabled", True, raising=False)
+        monkeypatch.setattr(CONFIG.trading, "breadth_brake_enabled", True, raising=False)
+        # A rising market: the drift leg RUNS and correctly brakes nothing.
+        fake_hmm = types.SimpleNamespace(
+            build_market_proxy_returns=lambda panel: [0.004] * 12)
+
+        class _M:
+            def p_bull_latest(self, obs):
+                return 0.9
+
+        with patch.dict(sys.modules, {
+            "src.backtest.pipeline": self._fake_pipeline(),
+            "src.models.macro_risk_hmm": fake_hmm,
+        }):
+            with patch.object(garch_brake, "_load_model", return_value=_M()), \
+                 patch.object(garch_brake, "_build_live_obs", return_value=_fake_obs()), \
+                 patch.object(garch_brake, "_breadth_leg_scalar", return_value=1.0), \
+                 patch.object(garch_brake, "_breadth_raw", return_value=0.62):
+                legs = garch_brake.live_exposure_legs()
+
+        assert legs["drift"] == pytest.approx(1.0)
+        # RAN: +0.4% x 10 sessions compounded, so ~+4%, comfortably above the
+        # -3% trigger. Present == proof the leg executed.
+        assert legs["drift_raw"] is not None
+        assert legs["drift_raw"] > 0.0
+        assert legs["breadth_raw"] == pytest.approx(0.62)
+
+    def test_drift_raw_is_none_when_the_leg_fails(self, monkeypatch, _enabled):
+        monkeypatch.setattr(CONFIG.trading, "drift_brake_enabled", True, raising=False)
+        fake_hmm = types.SimpleNamespace(
+            build_market_proxy_returns=lambda panel: (_ for _ in ()).throw(
+                RuntimeError("panel gone")))
+
+        class _M:
+            def p_bull_latest(self, obs):
+                return 0.9
+
+        with patch.dict(sys.modules, {
+            "src.backtest.pipeline": self._fake_pipeline(),
+            "src.models.macro_risk_hmm": fake_hmm,
+        }):
+            with patch.object(garch_brake, "_load_model", return_value=_M()), \
+                 patch.object(garch_brake, "_build_live_obs", return_value=_fake_obs()):
+                legs = garch_brake.live_exposure_legs()
+
+        # Failed open to 1.0 — same scalar a healthy leg would report...
+        assert legs["drift"] == pytest.approx(1.0)
+        # ...but the missing raw reading is what exposes it.
+        assert legs["drift_raw"] is None
+
     def test_all_three_legs_stack_takes_the_min(self, monkeypatch, _enabled):
         monkeypatch.setattr(CONFIG.trading, "drift_brake_enabled", True, raising=False)
         monkeypatch.setattr(CONFIG.trading, "breadth_brake_enabled", True, raising=False)
