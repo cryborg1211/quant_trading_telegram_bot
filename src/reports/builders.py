@@ -661,16 +661,30 @@ def _position_open_line(r: dict) -> str:
     ``pct`` merged in, plus the row's own ``ticker`` / ``horizon`` /
     ``dispatch_date`` / ``sessions_remaining``.
     """
-    hz = _HORIZON_LABEL.get(r.get("horizon"), "?")
     pct = float(r.get("pct") or 0.0)
     verb = "lãi" if pct >= 0 else "lỗ"
     disp = r.get("dispatch_date")
     disp_str = disp.strftime("%d/%m/%Y") if hasattr(disp, "strftime") else str(disp)
-    rem = int(r.get("sessions_remaining") or 0)
     # Corporate-action gap: the pct is ALREADY auto-adjusted/trusted; APPEND a
-    # transparent adjustment annotation (never replace the number). Keeps the
-    # "(còn N ngày kết thúc dự đoán)" suffix.
+    # transparent adjustment annotation (never replace the number).
     clause = f"{verb} {abs(pct):.1f}%{_gap_adjustment_suffix(r)}"
+
+    # `horizons` is set by `_merge_dual_horizon` when the T+5 tracking row and
+    # the T+20 row of the SAME dispatch were collapsed. Naming both windows on
+    # one line is the honest presentation: they are one decision, and while both
+    # are open they carry the identical percentage, so two lines duplicated the
+    # number and made T+5 look like a signal in its own right.
+    horizons = r.get("horizons") or []
+    if len(horizons) > 1:
+        windows = " · ".join(
+            f"{_HORIZON_LABEL.get(h, '?')} còn {rem} ngày" for h, rem in horizons)
+        return (
+            f"Dự báo ngày {disp_str}: mã {html.escape(str(r['ticker']))} "
+            f"hiện đang {clause} ({windows})"
+        )
+
+    hz = _HORIZON_LABEL.get(r.get("horizon"), "?")
+    rem = int(r.get("sessions_remaining") or 0)
     return (
         f"Dự báo ngày {disp_str}: Mô hình {hz} mã {html.escape(str(r['ticker']))} "
         f"hiện đang {clause} (còn {rem} ngày kết thúc dự đoán)"
@@ -690,6 +704,52 @@ def _position_closed_line(r: dict) -> str:
         f"Mô hình {hz} — mã {ticker}: "
         f"đã dự báo {verdict} và {verb} {abs(pct):.1f}%{_gap_adjustment_suffix(r)}"
     )
+
+
+def _merge_dual_horizon(rows: list[dict]) -> list[dict]:
+    """Collapse the T+5 and T+20 rows of ONE dispatch into a single row.
+
+    A dispatch is recorded TWICE — `run_trade_execution` calls
+    `signal_ledger.record_dispatch` once at the primary horizon (T+20, hold 30)
+    and again as a T+5 tracking row for the same tickers and date. They are one
+    decision observed at two horizons, not two signals.
+
+    While both are OPEN they also carry the SAME number: `evaluate_signal_pnl`
+    reads the same entry price and the same current price, so the pair renders
+    two identical percentages. That duplication is what made the EOD report read
+    as if T+5 were a standalone signal — which the confluence work says it is
+    not (T+20=UP returned +1.19pct against a -2.43pct baseline, while T+5=UP with
+    T+20=DOWN returned -1.57pct).
+
+    Merged rows gain `horizons`: [(horizon, sessions_remaining), ...] ascending,
+    so the line can name both windows. Rows that have no partner pass through
+    unchanged. Grouping key is (ticker, dispatch_date); ordering of first
+    appearance is preserved.
+    """
+    grouped: dict[tuple, dict] = {}
+    for r in rows:
+        key = (str(r.get("ticker")), r.get("dispatch_date"))
+        hz = (r.get("horizon"), int(r.get("sessions_remaining") or 0))
+        if key not in grouped:
+            merged = dict(r)
+            merged["horizons"] = [hz]
+            grouped[key] = merged
+            continue
+        g = grouped[key]
+        g["horizons"].append(hz)
+        # Keep the LONGEST remaining window as the row's own, so the merged line
+        # sorts by when the whole dispatch finally closes rather than by its
+        # first leg.
+        if hz[1] > int(g.get("sessions_remaining") or 0):
+            g["sessions_remaining"] = hz[1]
+            g["horizon"] = hz[0]
+            g["hold_days"] = r.get("hold_days")
+    for g in grouped.values():
+        g["horizons"] = sorted(
+            {h for h in g["horizons"] if h[0] is not None},
+            key=lambda h: (h[0] or 0),
+        )
+    return list(grouped.values())
 
 
 def build_position_report(
@@ -717,7 +777,7 @@ def build_position_report(
         appended when truncated. Output is always < Telegram's 4096-char limit.
     """
     open_ok = sorted(
-        [r for r in open_rows if not r.get("error")],
+        _merge_dual_horizon([r for r in open_rows if not r.get("error")]),
         key=lambda r: int(r.get("sessions_remaining") or 0),
     )
     closed_ok = [r for r in closed_rows if not r.get("error")]

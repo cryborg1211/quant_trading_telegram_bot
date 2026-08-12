@@ -102,6 +102,73 @@ class TestVetoMode:
         assert _eligible_entries([], {}, {}) == ([], [])
 
 
+class TestDualHorizonMerge:
+    """One dispatch is recorded TWICE — primary (T+20, hold 30) plus a T+5
+    tracking row for the same ticker and date. While both are OPEN they carry
+    the SAME percentage (same entry price, same current price), so the EOD
+    report printed the number twice and made T+5 read as a standalone signal.
+    """
+
+    @staticmethod
+    def _rows(d):
+        return [
+            {"ticker": "HPG", "dispatch_date": d, "horizon": 20, "hold_days": 30,
+             "pct": 2.4, "sessions_remaining": 26},
+            {"ticker": "HPG", "dispatch_date": d, "horizon": 5, "hold_days": 5,
+             "pct": 2.4, "sessions_remaining": 1},
+        ]
+
+    def test_pair_collapses_to_one_row(self):
+        from datetime import date as _d
+
+        from src.reports.builders import _merge_dual_horizon
+        merged = _merge_dual_horizon(self._rows(_d(2026, 8, 10)))
+        assert len(merged) == 1
+        assert merged[0]["horizons"] == [(5, 1), (20, 26)]
+
+    def test_merged_row_keeps_the_longest_remaining_window(self):
+        # Sorting is by sessions_remaining, so the merged row must represent
+        # when the WHOLE dispatch closes, not its first leg.
+        from datetime import date as _d
+
+        from src.reports.builders import _merge_dual_horizon
+        merged = _merge_dual_horizon(self._rows(_d(2026, 8, 10)))
+        assert merged[0]["sessions_remaining"] == 26
+
+    def test_unpaired_row_passes_through(self):
+        from datetime import date as _d
+
+        from src.reports.builders import _merge_dual_horizon
+        rows = [{"ticker": "SSI", "dispatch_date": _d(2026, 8, 10), "horizon": 20,
+                 "hold_days": 30, "pct": 0.8, "sessions_remaining": 26}]
+        merged = _merge_dual_horizon(rows)
+        assert len(merged) == 1 and merged[0]["horizons"] == [(20, 26)]
+
+    def test_different_dispatch_dates_do_not_merge(self):
+        from datetime import date as _d
+
+        from src.reports.builders import _merge_dual_horizon
+        rows = [
+            {"ticker": "HPG", "dispatch_date": _d(2026, 8, 10), "horizon": 20,
+             "hold_days": 30, "pct": 1.0, "sessions_remaining": 26},
+            {"ticker": "HPG", "dispatch_date": _d(2026, 8, 5), "horizon": 20,
+             "hold_days": 30, "pct": 3.0, "sessions_remaining": 21},
+        ]
+        assert len(_merge_dual_horizon(rows)) == 2
+
+    def test_report_prints_one_line_naming_both_windows(self):
+        from datetime import date as _d
+
+        from src.reports.builders import build_position_report
+        out = build_position_report(self._rows(_d(2026, 8, 10)), [],
+                                    _d(2026, 8, 12), 7)
+        body = [ln for ln in out.splitlines() if "HPG" in ln]
+        assert len(body) == 1, out
+        assert "T5 còn 1 ngày" in body[0] and "T20 còn 26 ngày" in body[0]
+        # The percentage appears ONCE, not twice.
+        assert body[0].count("2.4%") == 1
+
+
 class TestConfigWiring:
     def test_default_mode_is_veto(self):
         assert str(CONFIG.trading.arbitrator_entry_mode).lower() == "veto"

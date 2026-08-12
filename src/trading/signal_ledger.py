@@ -157,18 +157,30 @@ def record_dispatch(
     return len(rows)
 
 
-def list_open(db_path: str | None = None, today: date | None = None) -> list[dict]:
-    """Every OPEN signal with its elapsed trading-session count.
+def list_open(db_path: str | None = None, today: date | None = None,
+              include_paper: bool = False) -> list[dict]:
+    """Every REAL OPEN signal with its elapsed trading-session count.
 
     Sessions are counted on the fresh parquet calendar (NOT calendar days),
     mirroring the backtest engine's day indexing. Sorted oldest-first.
+
+    `is_paper` rows are EXCLUDED by default. They are reconstructions of what
+    the model once suggested (see
+    scripts/backfill_dispatched_signals_from_paperlog.py), not positions — and
+    every caller of this function is operator-facing: the EOD position report,
+    the `/exits` command, the dashboard GIU tab, and (via `check_exits_due`) the
+    tranche EXIT ALERTS. Including them shipped a 118-line report of holdings
+    the user never had, and would have gone on to fire SELL alerts for them.
+    Pass `include_paper=True` only for research reads.
     """
+    paper_pred = "" if include_paper else "AND COALESCE(is_paper, FALSE) = FALSE"
     try:
         with _connect(db_path) as conn:
             ensure_table(conn)
             open_rows = conn.execute(
                 f"SELECT ticker, dispatch_date, horizon, hold_days, weight "
-                f"FROM {TABLE} WHERE status = 'OPEN' ORDER BY dispatch_date, ticker"
+                f"FROM {TABLE} WHERE status = 'OPEN' {paper_pred} "
+                f"ORDER BY dispatch_date, ticker"
             ).fetchall()
     except Exception:  # noqa: BLE001
         LOGGER.exception("[SignalLedger] list_open read failed.")
@@ -397,9 +409,14 @@ def evaluate_signal_pnl(
 
 
 def list_closed_since(
-    lookback_days: int, today: date | None = None, db_path: str | None = None
+    lookback_days: int, today: date | None = None, db_path: str | None = None,
+    include_paper: bool = False,
 ) -> list[dict]:
-    """Every signal CLOSED within the trailing ``lookback_days``-day window.
+    """Every REAL signal CLOSED within the trailing ``lookback_days``-day window.
+
+    `is_paper` rows are EXCLUDED by default, for the same reason as in
+    ``list_open``: the EOD position report is operator-facing and reconstructed
+    suggestions are not closed positions.
 
     Window is inclusive on both ends: ``(today - lookback_days) <= closed_date
     <= today``. Widened from the original exact-``today`` filter so recently
@@ -413,12 +430,13 @@ def list_closed_since(
     if today is None:
         today = datetime.now().date()
     start = today - timedelta(days=lookback_days)
+    paper_pred = "" if include_paper else "AND COALESCE(is_paper, FALSE) = FALSE"
     try:
         with _connect(db_path) as conn:
             ensure_table(conn)
             rows = conn.execute(
                 f"SELECT ticker, dispatch_date, horizon, hold_days, weight "
-                f"FROM {TABLE} WHERE status = 'CLOSED' "
+                f"FROM {TABLE} WHERE status = 'CLOSED' {paper_pred} "
                 "AND closed_date >= ? AND closed_date <= ? "
                 "ORDER BY dispatch_date, ticker",
                 [start, today],

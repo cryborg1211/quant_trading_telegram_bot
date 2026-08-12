@@ -9,6 +9,8 @@ branch stays unfiltered), backed by `signal_ledger.open_tickers()` and
 """
 from __future__ import annotations
 
+from datetime import date
+
 import duckdb
 import pytest
 
@@ -99,6 +101,63 @@ def test_open_tickers_excludes_paper_rows(tmp_path):
             "('VHM', DATE '2026-07-15', 5, 5, 0.0, 'OPEN', TRUE)"
         )
     assert signal_ledger.open_tickers(db_path=db) == {"BSR"}
+
+
+def test_list_open_excludes_paper_rows_by_default(tmp_path):
+    """Operator-facing reads must never show reconstructed rows.
+
+    THE INCIDENT (12-08-26): the 197-row paperlog backfill was excluded from
+    `open_tickers` (the dedup guard) but NOT from `list_open`, which feeds the
+    EOD position report, `/exits`, the dashboard GIU tab, and — via
+    `check_exits_due` — the tranche SELL alerts. The user received a 118-line
+    report of holdings they never had, and SELL alerts for them were next.
+    """
+    db = str(tmp_path / "ledger.duckdb")
+    with duckdb.connect(db) as conn:
+        signal_ledger.ensure_table(conn)
+        conn.execute(
+            f"INSERT INTO {signal_ledger.TABLE} "
+            "(ticker, dispatch_date, horizon, hold_days, weight, status, is_paper) "
+            "VALUES "
+            "('BSR', DATE '2026-08-10', 5, 5, 0.05, 'OPEN', FALSE), "
+            "('DAT', DATE '2026-08-05', 5, 5, 0.0,  'OPEN', TRUE), "
+            "('DCL', DATE '2026-08-05', 5, 5, 0.0,  'OPEN', TRUE)"
+        )
+    assert [r["ticker"] for r in signal_ledger.list_open(db_path=db)] == ["BSR"]
+    assert len(signal_ledger.list_open(db_path=db, include_paper=True)) == 3
+
+
+def test_check_exits_due_never_fires_on_a_paper_row(tmp_path):
+    # A matured paper row would otherwise send "SELL X" for a position that
+    # never existed. hold_days=1 with a 2026-01-02 dispatch is long matured.
+    db = str(tmp_path / "ledger.duckdb")
+    with duckdb.connect(db) as conn:
+        signal_ledger.ensure_table(conn)
+        conn.execute(
+            f"INSERT INTO {signal_ledger.TABLE} "
+            "(ticker, dispatch_date, horizon, hold_days, weight, status, is_paper) "
+            "VALUES ('GHOST', DATE '2026-01-02', 5, 1, 0.0, 'OPEN', TRUE)"
+        )
+    assert signal_ledger.check_exits_due(db_path=db) == []
+
+
+def test_list_closed_since_excludes_paper_rows_by_default(tmp_path):
+    db = str(tmp_path / "ledger.duckdb")
+    with duckdb.connect(db) as conn:
+        signal_ledger.ensure_table(conn)
+        conn.execute(
+            f"INSERT INTO {signal_ledger.TABLE} "
+            "(ticker, dispatch_date, horizon, hold_days, weight, status, "
+            " closed_date, is_paper) VALUES "
+            "('BSR', DATE '2026-08-01', 5, 5, 0.05, 'CLOSED', DATE '2026-08-08', FALSE), "
+            "('DAT', DATE '2026-08-01', 5, 5, 0.0,  'CLOSED', DATE '2026-08-08', TRUE)"
+        )
+    today = date(2026, 8, 10)
+    real = signal_ledger.list_closed_since(7, today=today, db_path=db)
+    both = signal_ledger.list_closed_since(7, today=today, db_path=db,
+                                           include_paper=True)
+    assert [r["ticker"] for r in real] == ["BSR"]
+    assert len(both) == 2
 
 
 def test_open_tickers_counts_legacy_null_is_paper_as_real(tmp_path):
