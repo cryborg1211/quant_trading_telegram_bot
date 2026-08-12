@@ -70,6 +70,38 @@ ONE seed, and eyeballing a winner from 18 arms is precisely the threshold-mining
 DSR exists to punish. The defensible reading is only: **0.46 is on the wrong side
 of the peak.**
 
+### 1c-bis. The production sweep disagrees with 1c on levels — and on the ranking
+
+A 2-arm smoke test of the real production path (`run_backtest.py --serve-parity
+--sweep-thresholds 0.44,0.43 --no-save`, 4 seeds each) landed **nowhere near** the
+1c table:
+
+| thr | mean Sharpe | per-seed Sharpe | mean NetPnL | DD range |
+|---|---|---|---|---|
+| 0.44 | +0.411 | 0.21 / 0.43 / 0.50 / 0.51 | +1.22B | −12.57…−13.85% |
+| **0.43** | **+0.469** | 0.41 / 0.49 / 0.44 / 0.53 | **+1.56B** | −12.54…−15.16% |
+
+Two things to take from this, in order of importance:
+
+1. **The 0.43-vs-0.44 ranking FLIPS.** 1c says 0.44 (0.693) beats 0.43 (0.633);
+   the production sweep says 0.43 (0.469) beats 0.44 (0.411).
+2. **Seed variance swamps the threshold effect.** At thr=0.44 alone, Sharpe spans
+   **0.21 → 0.51** (range 0.30) — roughly **5× the 0.058 mean gap** between the two
+   thresholds. Four seeds cannot rank 0.43 against 0.44. Anything the Saturday
+   retrain picks inside 0.41–0.44 is a coin flip within noise.
+
+**Why they disagree — they are not measuring the same model.**
+`analyze_gate_level_sweep.py` loads the **frozen GOLDEN ensemble** off
+`v3_ensemble_20d.joblib` (the stale 2026-07-17 artifact) and varies only the gate.
+`run_backtest.py` **retrains 4 seeds** and averages. So 1c is the gate response of
+one specific soon-to-be-replaced model; the sweep is the gate response averaged
+over fresh ones. Budget is not the difference — neither sets
+`tranche_budget_days`, so both run the nav/30 calendar budget.
+
+**Never quote 1c's absolute Sharpe or DD as a production expectation.** Its
+directional finding (0.46 sits past the peak) survives — it is the only claim both
+harnesses support.
+
 ### 1d. Two things that looked like divergences but are not
 
 - **`admission_mode` was never a variable.** `absolute_gate` and
@@ -98,6 +130,20 @@ This is the first retrain that:
 If it promotes, gate starvation (serve p90 0.423 vs τ 0.46) and the threshold
 conflation resolve together. **Check the log and `metadata.sweep_conditions` of
 the new artifact.**
+
+**Judge it on the right thing.** Per 1c-bis, the 4-seed Sharpe spread at a *single*
+threshold (0.21→0.51) is ~5× the gap between adjacent thresholds, so **which** level
+inside 0.41–0.44 wins is noise. The result that matters is only whether the picked
+level is **below 0.45** — i.e. off the starved side of the curve — and whether the
+gate lets it promote at all. Do not read the winning `up_threshold` as a tuned
+optimum, and do not re-run the sweep hoping for a "better" level: that is the
+threshold-mining the DSR penalty exists to catch, and the sweep is already the
+`n_trials` count feeding it.
+
+Runtime note, so nothing looks broken: the **first** threshold in a sweep costs
+~30 min and every one after costs ~90 s. Per-seed inference caches are populated on
+the first threshold and reused (`run_backtest.py:481-486`) — P(UP) is
+threshold-independent, so the GBM scoring is paid once per seed, not per arm.
 
 ---
 
@@ -154,16 +200,23 @@ Not backtestable — sentiment has no point-in-time history. **Deferred by user
 decision until the paperlog has enough settled rows.** No evidence it caused the
 July losses (their weights are fully explained by `1/(hold_days × n_picks)`).
 
-### 4.2 `/verify` uses the old report builder
+### 4.2 `/verify` prints a T+5-dominant verdict with nothing qualifying it
 
-`_build_verify_report` has no `warning_lines`, no score line, and prints
+`_build_verify_report` has no `warning_lines` and no score line, and prints
 `Kết luận tổng hợp: {verdict}` where the verdict is **T+5-dominant**
 (`verify_single_ticker` passes `SHORT_HORIZON` as primary, and
 `make_final_decision` is asymmetric — `pred_5d == 2` → BUY regardless). T+5=UP
 with T+20=DOWN measured **−1.57%** vs T+20=UP's **+1.19%**.
 
-**Awaiting user decision:** use the operator card for `/verify`, or just inject
-`warning_lines` into the existing builder.
+**RESOLVED — deliberately left as-is.** The warning block was built (`2632845`,
+11 tests) and then **reverted at the operator's request** (`258ba41`) because it
+made the card ugly. Reverted whole, not just the render, so no dead plumbing
+remains.
+
+Accepted rationale: `/verify` is a **lookup tool, not a dispatch path** — nothing
+is bought because a card rendered. The same three disqualifiers are still shown
+where they gate money, on the dispatch card (`_build_signal_card`). Do not
+re-add this to `/verify` without asking; it was removed on purpose, not missed.
 
 ### 4.3 `ceilings` / `floors` need ~3 more years
 
