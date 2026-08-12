@@ -576,11 +576,31 @@ def _build_verify_report(
     stacking_20d: list[float],
     live_exec_price: float | None,
     mr_state: dict | None = None,
+    tau_5d: float | None = None,
+    tau_20d: float | None = None,
+    room_exhausted: bool | None = None,
+    market_regime: int | None = None,
 ) -> str:
     """Build the HTML verification report for /verify.
 
     Every dynamic field is `html.escape`d. Structural tags (<b>, <code>, <i>)
     are constants. Output is safe to send with parse_mode=HTML.
+
+    WHY THIS CARRIES A WARNING BLOCK (12-08-26)
+    ───────────────────────────────────────────
+    `/verify`'s verdict is T+5-DOMINANT: `verify_single_ticker` passes
+    SHORT_HORIZON as the primary, and `make_final_decision` is asymmetric —
+    `pred_5d == 2` returns BUY regardless of the other horizon. So this report
+    could print `Kết luận tổng hợp: MUA` on the exact configuration measured at
+    **-1.57%** mean 20d (T+5=UP with T+20=DOWN, n=8) against T+20=UP's
+    **+1.19%** — the documented July side-door — with nothing on the card
+    saying so. The dispatch card gained that warning in the 10-08 redesign;
+    `/verify` uses this separate builder and did not.
+
+    Only the three research-backed disqualifiers from
+    `src/reports/signal_score.warning_lines` are shown. All four new args are
+    optional and the block is omitted entirely when nothing fires, so a clean
+    ticker's card is unchanged.
     """
     # 5d distribution
     p_down, p_side, p_up = stacking_5d[0], stacking_5d[1], stacking_5d[2]
@@ -607,10 +627,33 @@ def _build_verify_report(
     # Source URLs (already populated from ground-truth tracker in arbitrator)
     source_urls = (sentiment.get("source_urls", []) or [])[:3]
 
+    # Disqualifier block — same three research-backed warnings the dispatch card
+    # shows. Placed directly under the header so it cannot be missed above the
+    # verdict it qualifies.
+    from src.reports.signal_score import build_facts, warning_lines  # noqa: PLC0415
+
+    _warns = warning_lines(
+        build_facts(
+            p_up_20d=stacking_20d[2] if len(stacking_20d) >= 3 else None,
+            p_up_5d=p_up,
+            tau_20d=tau_20d,
+            tau_5d=tau_5d,
+            room_exhausted=room_exhausted,
+            market_regime=market_regime,
+        ),
+        market_regime=market_regime,
+    )
+    warn_block = ""
+    if _warns:
+        warn_block = ("⚠️ <b>CẢNH BÁO</b>\n"
+                      + "\n".join(f"• {html.escape(w)}" for w in _warns)
+                      + "\n\n")
+
     return (
         f"\U0001f50d <b>[KIỂM ĐỊNH] {html.escape(ticker)}</b>\n"
         f"\U0001f4c5 <b>Ngày:</b> {datetime.now().strftime('%d/%m/%Y')}\n"
         f"══════════════════════════════\n\n"
+        f"{warn_block}"
         f"\U0001f4b5 <b>Giá hiện tại:</b> {html.escape(price_str)}\n\n"
         f"\U0001f4ca <b>Đánh giá Xu hướng ({SHORT_HORIZON_DAYS} ngày tới)</b>\n"
         f"• Cửa Tăng: <b>{p_up * 100:.1f}%</b> | Đi Ngang: {p_side * 100:.1f}% "

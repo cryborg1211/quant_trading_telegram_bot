@@ -2361,8 +2361,12 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
     # predictions dict below is keyed by ticker, so we slice the RESULT instead.
 
     # --- Step 2: Stacking GBDT inference (T+5 short primary + 20d cross-check) ---
+    # Thresholds are CAPTURED (previously discarded) so the report can show the
+    # T+5-only warning: that combination measured -1.57% mean 20d against
+    # T+20=UP's +1.19%, and it is the documented July side-door. Without the taus
+    # there is no way to say which gate a name actually cleared.
     try:
-        stacking_5d, _, _, _, _ = predict_v3_horizon(latest_df, SHORT_HORIZON)
+        stacking_5d, _thr_short, _, _, _ = predict_v3_horizon(latest_df, SHORT_HORIZON)
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("[/verify] T+%d inference failed for %s.", SHORT_HORIZON, ticker)
         return (
@@ -2371,8 +2375,9 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
         )
     # 20d is the secondary cross-check — optional; degrade gracefully if its
     # artifact is missing/mismatched so /verify still shows the 5d view.
+    _thr_long: dict = {}
     try:
-        stacking_20d, _, _, _, _ = predict_v3_horizon(latest_df, 20)
+        stacking_20d, _thr_long, _, _, _ = predict_v3_horizon(latest_df, 20)
     except (FileNotFoundError, RuntimeError) as exc:
         LOGGER.warning("[/verify] T+20 cross-check unavailable for %s (%s) — T+%d only.",
                        ticker, exc.__class__.__name__, SHORT_HORIZON)
@@ -2441,6 +2446,14 @@ def verify_single_ticker(ticker: str, window_rows: int = 120) -> str:
         stacking_20d=list(stacking_20d.get(ticker, [0.33, 0.34, 0.33])),
         live_exec_price=live_exec_prices.get(ticker),
         mr_state=mr_state,
+        # /verify's slots genuinely hold what they are named — its PRIMARY is
+        # SHORT_HORIZON — so tau_5d comes from the short artifact and tau_20d
+        # from the long one. (Unlike daily_inference, where "5d" is the primary
+        # and means T+20.)
+        tau_5d=(_thr_short or {}).get("pnl_threshold_tau"),
+        tau_20d=(_thr_long or {}).get("pnl_threshold_tau"),
+        room_exhausted=_room_exhausted(ticker),
+        market_regime=_LATEST_REGIME_BY_TICKER.get(ticker),
     )
 
 
