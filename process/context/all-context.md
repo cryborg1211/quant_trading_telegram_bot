@@ -139,6 +139,7 @@ stock_price_v3/
     data/
       crawlers.py         -- OHLCV data ingestion (FastConnect prefetch + throttled vnstock fallback)
       fastconnect_ohlcv.py -- SSI FastConnect concurrent OHLCV prefetch (PRIMARY EOD source, 10-08-26)
+      market_breadth_crawler.py -- official exchange breadth via FastConnect DailyIndex (A/D + ceilings/floors + block deals, 12-08-26)
       db_engine.py        -- DuckDB engine management
       price_lookup.py     -- Fresh-parquet price lookups
       tensor_builder.py   -- Feature tensor construction
@@ -203,7 +204,14 @@ stock_price_v3/
     analyze_impulse_attack.py -- Fast-attack/momentum-ignition sub-model research (REJECTED -- OOF precision misses both bars)
     analyze_mr_context_features.py -- MR volume-exhaustion + sector-relative oversold research (PROMISING, UNCONFIRMED -- clears 0.60 OOF, holdout too thin)
     analyze_dsr_calibration.py -- DSR/PBO calibration diagnostic (read-only -- failure is ROBUST, not inflated trials or small-sample noise)
-    retrain_all.ps1       -- Full 3-model retrain (MR+T20+T5); scheduled weekly via Windows Task Scheduler
+    analyze_serve_stack_ab.py -- serve-vs-backtest divergence A/B (argmax gate = off switch; ranking/cohort vacuous)
+    analyze_defensive_layers_ab.py -- the 4 production defensive layers measured (all cost Sharpe, 8/8 cells)
+    analyze_gate_level_sweep.py -- gate 0.41..0.46 x mode x layers (modes identical; 0.43-0.44 beats serve's 0.46)
+    analyze_mr_limit_down_context.py -- limit-down knife-catch timing (UNTESTABLE: floors is a ~1.5-year series)
+    analyze_argmax_admission_ab.py -- argmax admission A/B (REJECTED: 0 buys in 920 days)
+    backfill_market_breadth.py -- DailyIndex breadth backfill (2016-01-04..now, 7200 rows)
+    retrain_all.ps1       -- Full 3-model retrain (MR+T20+T5); scheduled weekly via Windows Task Scheduler.
+                             Runs `--serve-parity` since 12-08-26 (gate-offset 0 + 4 defensive layers, 6-level grid)
     ab_rank_breadth.ps1   -- rank_breadth admission A/B runner (REJECTED)
   deploy/
     quant-v6-bot.service  -- Systemd unit for run_bot.py
@@ -393,10 +401,41 @@ OOSref p10=0.321 median=0.408 p90=0.463      p90 shift -0.040
 
 Serve-side extra gates that the backtest never modelled compound the low dispatch count — arbitrator argmax+sentiment (killed 69% of τ-clearing rows), sector cap, open-cohort dedup, admission hysteresis: the validated strategy and the deployed strategy are not the same strategy.
 
+**⚠️ SERVE ↔ BACKTEST DIVERGENCE — the validated numbers did not describe the deployed system (2026-08-11/12).** Eleven differences were found between the rule the OOS figures were earned with and the rule production runs. Measured with `scripts/analyze_serve_stack_ab.py`, `analyze_defensive_layers_ab.py`, `analyze_gate_level_sweep.py`.
+
+**The threshold conflation (the root cause).** The GOLDEN artifact stores `up_threshold` (0.46) and `signal_threshold` (0.41). Inside `run_backtest.py`, `up_threshold` feeds ONLY the UP-precision / confusion-matrix metrics — the engine trades on `signal_threshold`, historically pinned 5pp below via `sig_thr = thr - 0.05`. **Serve gates on `up_threshold`** (`predict_v3_horizon`'s `meta_gate` reads `bot.up_threshold`), so the number production admits on was never the number the sweep optimised. Not a 5pp slip — a category error.
+
+**`admission_mode` was never a real variable.** `absolute_gate` and `cross_sectional` produce byte-identical results at every gate level, because `admission_pool_cap` (6) ≥ `max_positions` (5) so the pool cap never binds. Earlier framings of "0.41 cross_sectional vs 0.46 absolute_gate" were really just "0.41 vs 0.46".
+
+**Every defensive layer costs Sharpe — 8 of 8 cells, both thresholds:**
+
+| threshold | layers | NetPnL | Sharpe | MaxDD | buys |
+|---|---|---|---|---|---|
+| 0.41 (validated) | none | +5.19B | +0.600 | −31.00% | 4555 |
+| 0.41 | brake | +4.18B | +0.557 | −29.17% | 4555 |
+| 0.41 | filters | +2.08B | +0.412 | −21.86% | 1248 |
+| 0.41 | all four | +1.79B | +0.393 | −22.48% | 1248 |
+| 0.46 (serve) | none | +644M | **+0.620** | −4.44% | 46 |
+| 0.46 | brake | +444M | +0.480 | −4.19% | 46 |
+| 0.46 | filters | +97.6M | +0.355 | −0.91% | 5 |
+| **0.46 all four = SERVE** | | **+87.6M** | **+0.340** | −0.87% | **5** |
+
+The deployed stack retains **1.7%** of the validated PnL and **0.11%** of the bets — five trades in 920 days. The best Sharpe of all eight is 0.46 with NO layers, so **the τ-gate is the only defensive layer that pays for itself**; the four added later (each after a real loss, none ever measured) all trade Sharpe for drawdown roughly one-for-one.
+
+**Gate-level sweep 0.41–0.46 (`analyze_gate_level_sweep.py`).** With all four layers on: 0.43 → Sharpe 0.633, DD −10.75% (inside the ~−13% band), 532 buys, +2.05B; 0.44 → 0.693, −7.64%, 151 buys. Serve's 0.46 is almost certainly on the wrong side of the peak. **Do NOT pick a level off that chart** — the Sharpe curve is non-monotonic (0.44 peak, 0.45 collapse, 0.46 bounce), the dips sit on 21–273-trade samples, it is one seed, and eyeballing a winner from 18 arms is exactly the threshold-mining DSR exists to punish.
+
+**FIX SHIPPED, awaiting the Saturday retrain:** `run_backtest.py --serve-parity` (`--gate-offset 0` + the four layers) makes the sweep optimise the threshold under production conditions, so the stored `up_threshold` becomes the value actually optimised. Wired into `scripts/retrain_all.ps1` with a 6-level grid `0.46..0.41` (deliberately no wider than the 5 it replaces — DSR penalises trial count). Artifacts now carry `metadata.sweep_conditions` recording gate offset, admission mode, layer flags, regime sizing and max_positions; its absence in every earlier artifact is how this went unnoticed for months.
+
+**Also fixed at the entry gate (`4081965`):** `CONFIG.trading.arbitrator_entry_mode = "veto"` (new default). The old behaviour required `make_final_decision` to return BUY, which needs the primary horizon's ARGMAX to be UP — measured over 920 days that takes the validated config from 46 buys to **ZERO** (p_up p99 0.4523 < p_down median 0.5957, so UP cannot win the argmax). It was an off switch, not a filter, and it forced every real dispatch through the event-rescue path.
+
+**STILL NOT MODELLED — the event-rescue path.** `main.build_event_overrides`: a name the τ-gate REJECTED (`0.42 ≤ P(UP) < 0.45`) is force-dispatched at **5% NAV** (`_EVENT_CAP`, ~7× the tranche per-name weight) when Gemini sentiment ≥ 0.60, and the `if _ov:` branch **skips regime sizing, the PENALTY multiplier and the whole 3-leg exposure brake**. It admits below the model's own threshold, in the P(UP) band measured as anti-informative (Platt slope −0.274). Not backtestable — sentiment has no point-in-time history. Deferred until the paperlog has enough settled rows.
+
+**Ranking and cohort size are vacuous, not divergences.** Serve sorts the arbitrated pool by SENTIMENT with p_up as a tiebreak and slices top-3 vs the backtest's top-5. Random-ranking arms across 3 seeds and a top-3 arm came back byte-identical to the baseline: under the τ-gate the admitted set never exceeds 3 names (46 buys over ~46 gate-open days ≈ 1/day), so there is nothing to reorder or truncate. This changes if the gate is ever loosened.
+
 ## Scan Metadata
 
 - Generated: 2026-06-09
-- Last content update: 2026-08-10
+- Last content update: 2026-08-12
 - HEAD: main (fba7459)
 - Mode: fresh scaffold + study
 - Package manager: pip (requirements.txt, Python 3.11)

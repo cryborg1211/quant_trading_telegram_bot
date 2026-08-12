@@ -1,5 +1,32 @@
 """What do the four production defensive layers actually cost or save?
 
+RESULT (2026-08-12, 920 OOS days, single seed): EVERY layer costs Sharpe, at
+BOTH thresholds. 8 of 8 cells point the same way.
+
+  threshold                        layers        NetPnL   Sharpe    MaxDD  buys
+  0.41 cross_sectional VALIDATED   none         +5.19B   +0.600  -31.00%  4555
+  0.41                             brake        +4.18B   +0.557  -29.17%  4555
+  0.41                             filters      +2.08B   +0.412  -21.86%  1248
+  0.41                             all four     +1.79B   +0.393  -22.48%  1248
+  0.46 absolute_gate   SERVE       none         +644M    +0.620   -4.44%    46
+  0.46                             brake        +444M    +0.480   -4.19%    46
+  0.46                             filters      +97.6M   +0.355   -0.91%     5
+  0.46 all four      = SERVE TODAY +87.6M       +0.340   -0.87%             5
+
+Two things fall out.
+
+1. The DEPLOYED stack retains 1.7pct of the validated PnL (87.6M of 5.19B) and
+   0.11pct of the bets (5 of 4555). Five trades in 920 days.
+2. The best Sharpe of all eight is 0.46 + NO layers (+0.620), so the tau gate is
+   the only defensive layer that pays for itself. The four added later - each
+   one a response to a real loss, none ever measured - all subtract Sharpe while
+   buying DD roughly one-for-one.
+
+Caveat: single seed (the GOLDEN used four). Sharpe deltas of 0.04-0.28 on one
+seed are indicative, not conclusive; the consistent direction across all eight
+cells is the part worth trusting.
+
+
 THE GAP THIS CLOSES
 ───────────────────
 Sector cap, open-cohort dedup, admission hysteresis and the drift/breadth

@@ -387,7 +387,12 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
          use_prob_weights: bool = False,
          rank_breadth_trigger: float = 0.40,
          rank_breadth_floor_level: float = 0.25,
-         rank_breadth_floor: float = 0.5) -> None:
+         rank_breadth_floor: float = 0.5,
+         gate_offset: float = -0.05,
+         serve_sector_cap: int = 0,
+         serve_cohort_dedup: bool = False,
+         serve_hysteresis_days: int = 0,
+         serve_exposure_brake: bool = False) -> None:
     configure_logging()
     t_start = time.perf_counter()
     sweep_thresholds = list(sweep_thresholds or DEFAULT_SWEEP_THRESHOLDS)
@@ -482,9 +487,26 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
 
     sweep_results: list[dict] = []
     for thr in sweep_thresholds:
-        sig_thr = thr - 0.05                            # engine gate 5pp below model threshold
+        # THE THRESHOLD CONFLATION (documented 12-08-26). `up_threshold` (thr) is
+        # what SERVE gates on (`predict_v3_horizon`'s meta_gate reads
+        # `bot.up_threshold`), but inside the backtest it only ever fed the
+        # UP-precision / confusion-matrix metrics — the ENGINE traded on
+        # `signal_threshold`, historically pinned 5pp BELOW it. So the number
+        # serve admits on was never the number the sweep optimised.
+        #
+        # `gate_offset=0.0` makes the swept value the engine's actual trading
+        # gate, which is the only way the stored `up_threshold` can be the
+        # optimised quantity. Default keeps the legacy -0.05 so old runs stay
+        # reproducible.
+        sig_thr = thr + gate_offset
         cfg.signal_threshold = sig_thr                  # WalkForwardConfig pulls from here
-        with phase(f"Sweep | mode={mode}  up_threshold={thr:.2f}  signal_threshold={sig_thr:.2f}"):
+        # In absolute_gate mode the engine reads `admission_floor`, not
+        # `signal_threshold` — keep them equal so the swept level actually moves
+        # the gate whichever mode is in play.
+        floor_thr = sig_thr if admission_mode.startswith("absolute_gate") else admission_floor
+        with phase(f"Sweep | mode={mode}  up_threshold={thr:.2f}  "
+                   f"engine_gate={sig_thr:.2f}  layers="
+                   f"{'on' if (serve_sector_cap or serve_cohort_dedup or serve_hysteresis_days or serve_exposure_brake) else 'off'}"):
             per_seed: list[dict] = []
             monthly_cols_thr: dict[str, pd.Series] = {}
             for seed, ensemble in trained:
@@ -497,13 +519,17 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
                                  use_regime_sizing=use_regime_sizing,
                                  use_nav_tier_cap=use_nav_tier_cap,
                                  admission_mode=admission_mode,
-                                 admission_floor=admission_floor,
+                                 admission_floor=floor_thr,
                                  admission_pool_cap=admission_pool_cap,
                                  use_prob_weights=use_prob_weights,
                                  breadth_series=breadth_series,
                                  rank_breadth_trigger=rank_breadth_trigger,
                                  rank_breadth_floor_level=rank_breadth_floor_level,
-                                 rank_breadth_floor=rank_breadth_floor)
+                                 rank_breadth_floor=rank_breadth_floor,
+                                 serve_sector_cap=serve_sector_cap,
+                                 serve_cohort_dedup=serve_cohort_dedup,
+                                 serve_hysteresis_days=serve_hysteresis_days,
+                                 serve_exposure_brake=serve_exposure_brake)
                     m = equity_metrics(eq, cfg.initial_capital)
                     # Inline UP-precision @thr (no log spam)
                     if len(Xte_all) > 0:
@@ -568,7 +594,18 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
     if save_bot_payload:
         _persist_bot_payload(cfg, tabular_features, golden, best_seed_record,
                              macro_hmm, sweep_results, mode=mode, hold_days=hold_days,
-                             pt_sigma=pt_sigma, sl_sigma=sl_sigma)
+                             pt_sigma=pt_sigma, sl_sigma=sl_sigma,
+                             sweep_conditions={
+                                 "gate_offset": float(gate_offset),
+                                 "engine_gate": float(golden["signal_threshold"]),
+                                 "admission_mode": str(admission_mode),
+                                 "serve_sector_cap": int(serve_sector_cap),
+                                 "serve_cohort_dedup": bool(serve_cohort_dedup),
+                                 "serve_hysteresis_days": int(serve_hysteresis_days),
+                                 "serve_exposure_brake": bool(serve_exposure_brake),
+                                 "use_regime_sizing": bool(use_regime_sizing),
+                                 "max_positions": int(cfg.max_positions),
+                             })
 
     # ── 7. Phase 4 DSR + PBO on the GOLDEN's per-seed equity curves ──────────
     # Multiplicity for DSR = TOTAL configs swept (thresholds × seeds).
@@ -705,7 +742,8 @@ def _persist_bot_payload(cfg: RunConfig, tabular_features: list[str], golden: di
                          best_seed_record: dict, macro_hmm, sweep_results: list[dict],
                          mode: str = "tranche", hold_days: int = 30,
                          pt_sigma: float | None = None,
-                         sl_sigma: float | None = None) -> None:
+                         sl_sigma: float | None = None,
+                         sweep_conditions: dict | None = None) -> None:
     """Single self-contained joblib the bot loads (src/bot/bot_inference.py):
     ensemble + feature-column order + decision thresholds + HMM overlay + provenance.
     Horizon-aware filename so dual-horizon bots can run side by side."""
@@ -761,6 +799,14 @@ def _persist_bot_payload(cfg: RunConfig, tabular_features: list[str], golden: di
             "feature_recipe_version": effective_recipe_version(cfg.use_macro_features),   # structural recipe stamp (tripwire)
             "categorical_features": list(getattr(best_seed_record["ensemble"], "categorical_features", [])),
             "liquid_top_n": int(cfg.liquid_top_n) if cfg.liquid_top_n else None,
+            # WHAT THE SWEEP ACTUALLY RAN. Absent from every artifact before
+            # 12-08-26, which is how a threshold conflation went unnoticed for
+            # months: `up_threshold` is what SERVE gates on, but the engine
+            # traded on `signal_threshold` (= up_threshold + gate_offset), and
+            # none of serve's four defensive layers were present. Recording the
+            # conditions here means a future reader can tell whether a stored
+            # metric describes the deployed system or something looser.
+            "sweep_conditions": dict(sweep_conditions or {}),
             "sweep_results": [
                 {k: v for k, v in r.items() if k not in ("per_seed", "monthly_cols")}
                 for r in sweep_results
@@ -1060,6 +1106,31 @@ def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
     p.add_argument("--admission-floor", type=float, default=0.45,
                    help="absolute P(UP) floor for --admission-mode absolute_gate "
                         "(inclusive >=, mirrors serve's up_threshold; default 0.45)")
+    p.add_argument("--gate-offset", type=float, default=-0.05,
+                   help="engine trading gate = up_threshold + this. The legacy "
+                        "-0.05 means the swept up_threshold was NEVER the "
+                        "engine's gate — it only fed the UP-precision metric, "
+                        "while serve admits on it. Pass 0 to make the swept "
+                        "value the real gate (default -0.05, legacy)")
+    p.add_argument("--serve-sector-cap", type=int, default=0,
+                   help="max admitted names per sector, mirroring serve's "
+                        "arbitrator_sector_cap (0 = off)")
+    p.add_argument("--serve-cohort-dedup", action="store_true",
+                   help="exclude names already held in an open tranche "
+                        "(mirrors serve's open-cohort dedup)")
+    p.add_argument("--serve-hysteresis-days", type=int, default=0,
+                   help="consecutive raw-qualifying days before admissible "
+                        "(mirrors serve's hysteresis_min_qualify_days; 0 = off)")
+    p.add_argument("--serve-exposure-brake", action="store_true",
+                   help="apply serve's drift+breadth exposure legs to the "
+                        "tranche budget")
+    p.add_argument("--serve-parity", action="store_true",
+                   help="shorthand for --gate-offset 0 --serve-sector-cap 2 "
+                        "--serve-cohort-dedup --serve-hysteresis-days 2 "
+                        "--serve-exposure-brake: sweep the threshold with the "
+                        "production defensive stack PRESENT, so the stored "
+                        "up_threshold is optimised under the conditions serve "
+                        "actually runs")
     p.add_argument("--admission-pool-cap", type=int, default=6,
                    help="survivor-pool cap before the top-N slice under absolute_gate "
                         "(mirrors serve's _ARBITRATOR_POOL; default 6)")
@@ -1103,22 +1174,39 @@ def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
     }
     sweep = ([float(x) for x in a.sweep_thresholds.split(",")]
              if a.sweep_thresholds else None)
+    # --serve-parity is a shorthand; it must not silently override an explicit
+    # narrower flag the caller also passed, so it only fills in the defaults.
+    if a.serve_parity:
+        if a.gate_offset == -0.05:
+            a.gate_offset = 0.0
+        if a.serve_sector_cap == 0:
+            a.serve_sector_cap = 2
+        if a.serve_hysteresis_days == 0:
+            a.serve_hysteresis_days = 2
+        a.serve_cohort_dedup = True
+        a.serve_exposure_brake = True
     return (a.checkpoint, overrides, sweep, (not a.no_save), a.export_only,
             a.mode, a.hold_days, a.tranche_pt, a.tranche_sl, a.regime_sizing,
             a.nav_tier_cap, a.admission_mode, a.admission_floor,
             a.admission_pool_cap, a.prob_weights, a.rank_breadth_trigger,
-            a.rank_breadth_floor_level, a.rank_breadth_floor)
+            a.rank_breadth_floor_level, a.rank_breadth_floor,
+            a.gate_offset, a.serve_sector_cap, a.serve_cohort_dedup,
+            a.serve_hysteresis_days, a.serve_exposure_brake)
 
 
 if __name__ == "__main__":
     (_ckpt, _overrides, _sweep, _save, _export,
      _mode, _hold, _pt, _sl, _regime, _tier_cap,
      _adm_mode, _adm_floor, _adm_cap, _prob_w,
-     _rb_trigger, _rb_floor_level, _rb_floor) = _cli()
+     _rb_trigger, _rb_floor_level, _rb_floor,
+     _gate_off, _sec_cap, _dedup, _hyst, _brake) = _cli()
     main(_ckpt, eval_overrides=_overrides, sweep_thresholds=_sweep,
          save_bot_payload=_save, export_only=_export, mode=_mode, hold_days=_hold,
          pt_sigma=_pt, sl_sigma=_sl, use_regime_sizing=_regime,
          use_nav_tier_cap=_tier_cap, admission_mode=_adm_mode,
          admission_floor=_adm_floor, admission_pool_cap=_adm_cap,
          use_prob_weights=_prob_w, rank_breadth_trigger=_rb_trigger,
-         rank_breadth_floor_level=_rb_floor_level, rank_breadth_floor=_rb_floor)
+         rank_breadth_floor_level=_rb_floor_level, rank_breadth_floor=_rb_floor,
+         gate_offset=_gate_off, serve_sector_cap=_sec_cap,
+         serve_cohort_dedup=_dedup, serve_hysteresis_days=_hyst,
+         serve_exposure_brake=_brake)

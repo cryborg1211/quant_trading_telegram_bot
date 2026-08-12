@@ -16,11 +16,30 @@ function Step($name, $argLine) {
     Add-Content $log "===== $name DONE : $(Get-Date -Format o) ====="
 }
 
+# SERVE-PARITY SWEEP (12-08-26). `--serve-parity` makes the sweep optimise the
+# threshold under the conditions serve ACTUALLY runs:
+#   * --gate-offset 0     the swept up_threshold IS the engine's trading gate.
+#                         Previously the engine traded 5pp below it, so the value
+#                         serve admits on was never the value that was optimised.
+#   * the four production defensive layers PRESENT (sector cap 2, open-cohort
+#     dedup, hysteresis 2, drift+breadth exposure brake). None was in the
+#     backtest before, and measuring them found every one costs Sharpe while
+#     buying drawdown — so the threshold must be chosen with them switched on,
+#     not tuned bare and then deployed behind them.
+#
+# Grid is 0.46..0.41 in 0.01 steps: SIX levels, deliberately no more than the
+# five it replaces, because DSR penalises trial count and a wider grid makes any
+# winner cheaper than it looks. The 12-08 sweep showed the useful region sits
+# below serve's 0.46, which is why the grid is centred there rather than
+# reaching up to 0.50.
+$sweep = "0.46,0.45,0.44,0.43,0.42,0.41"
+$btArgs = "--mode tranche --hold-days 30 --serve-parity --sweep-thresholds $sweep"
+
 Step "MR-LGBM retrain" "src/models/train_mr_lgbm.py"
 Step "T+20 train checkpoint" "train_models.py --tb-horizon 20"
-Step "T+20 backtest + save" "run_backtest.py --mode tranche --hold-days 30"
+Step "T+20 backtest + save" "run_backtest.py $btArgs"
 Step "T+5 train checkpoint" "train_models.py --tb-horizon 5"
-Step "T+5 backtest + save" "run_backtest.py --mode tranche --hold-days 30"
+Step "T+5 backtest + save" "run_backtest.py $btArgs"
 
 Add-Content $log "`nALL RETRAINS COMPLETE : $(Get-Date -Format o)"
 Write-Host "ALL RETRAINS COMPLETE"
