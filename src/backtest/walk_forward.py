@@ -260,6 +260,40 @@ class WalkForwardConfig:
     # directly). Default preserves every existing result byte-for-byte.
     rank_mode: str = "p_up"
     rank_seed: int = 0
+
+    # ── SERVE-PARITY DEFENSIVE LAYERS (all opt-in, all default OFF) ──────────
+    # Each of these runs in production and NONE was in the backtest that
+    # produced the validated numbers. Every one was added after a real loss,
+    # one at a time, without measurement — so nobody knows whether they protect
+    # the edge or destroy it. Encoded here so that can finally be answered;
+    # defaults keep every existing result byte-for-byte.
+    #
+    # Sector cap: at most N admitted names per sector (serve:
+    # CONFIG.trading.arbitrator_sector_cap = 2). 0 disables. Uses the SAME
+    # src/trading/sector_map.py the serve path uses, so the two cannot drift.
+    serve_sector_cap: int = 0
+    # Open-cohort dedup: exclude names already held in an open tranche (serve:
+    # signal_ledger.open_tickers). The July BSR incident — re-dispatched 4
+    # consecutive days into a falling knife — is what motivated it.
+    serve_cohort_dedup: bool = False
+    # Admission hysteresis: require N CONSECUTIVE raw-qualifying days before a
+    # name is admissible (serve: hysteresis_min_qualify_days = 2). 0 disables.
+    # The streak is tracked on the RAW qualifying set, independent of the other
+    # two filters, mirroring serve's candidate_hysteresis.
+    serve_hysteresis_days: int = 0
+    # 3-leg exposure brake (serve: src/bot/garch_brake.live_exposure_scalar).
+    # drift and breadth legs are computed here from the panel with the SAME
+    # piecewise ramps as serve; the GARCH leg is approximated by the engine's
+    # existing `p_bull_series`, which already multiplies the budget, so it is
+    # NOT re-applied here (that would double-count it).
+    serve_exposure_brake: bool = False
+    drift_brake_window: int = 10
+    drift_brake_trigger: float = -0.03
+    drift_brake_full: float = -0.06
+    drift_brake_floor: float = 0.5
+    breadth_brake_trigger: float = 0.40
+    breadth_brake_floor_level: float = 0.25
+    breadth_brake_floor: float = 0.5
     rank_breadth_window: int = 20
     rank_breadth_trigger: float = 0.40
     rank_breadth_floor_level: float = 0.25
@@ -450,6 +484,17 @@ class WalkForwardEngine:
                 for d, v in budget_days_series.dropna().items()
             }
 
+        # Serve-parity layers. `_qualify_streak` mirrors serve's
+        # candidate_hysteresis table: consecutive RAW-qualifying days per
+        # ticker, tracked independently of the sector cap and dedup so a name
+        # blocked by those does not lose its streak (the serve semantics).
+        self._qualify_streak: dict[str, int] = {}
+        # date → trailing cumulative market return, for the drift brake leg.
+        self._drift_cum: dict[date, float] = {}
+        if self.config.serve_exposure_brake:
+            self._drift_cum = self._build_drift_series(
+                window=self.config.drift_brake_window)
+
         self.cash = self.config.initial_capital
         self._prev_nav = self.config.initial_capital
         self._zero_candidate_days = 0
@@ -575,6 +620,130 @@ class WalkForwardEngine:
         if self.config.liquid_top_n is not None and self.config.liquid_top_n > 0:
             LOGGER.info("Liquidity gate ACTIVE | top-%d by trailing-%dd ADV (within-date rank)",
                         int(self.config.liquid_top_n), self.config.adv_window)
+
+    def _build_drift_series(self, window: int = 10) -> dict[date, float]:
+        """date → trailing cumulative equal-weight market return (drift leg).
+
+        Mirrors the input to serve's `garch_brake._drift_scalar`: the
+        market-proxy return over the trailing window. Built from
+        `self.ticker_frames` (already normalised by `_prepare`) rather than the
+        raw panel, because `run()` accepts either a polars OR a pandas frame and
+        this must not care which.
+
+        Strictly backward-looking: the value for D uses returns up to D-1's
+        close only, since D's admission decision is made before D trades.
+        """
+        try:
+            per_day: dict[date, list[float]] = {}
+            for g in self.ticker_frames.values():
+                closes = g["close"].to_numpy(dtype=float)
+                dates = list(g["date"])
+                for i in range(1, len(closes)):
+                    prev = closes[i - 1]
+                    if prev > 0:
+                        per_day.setdefault(dates[i], []).append(closes[i] / prev - 1.0)
+        except Exception:  # noqa: BLE001 — the brake must never break a run
+            LOGGER.warning("[serve-parity] drift series build failed — leg disabled.",
+                           exc_info=True)
+            return {}
+
+        ordered = sorted(per_day)
+        rets = [sum(per_day[d]) / len(per_day[d]) for d in ordered]
+        out: dict[date, float] = {}
+        for i, d in enumerate(ordered):
+            if i == 0:
+                out[d] = 0.0          # no history yet → nothing to brake
+                continue
+            cum = 1.0
+            for r in rets[max(0, i - window):i]:
+                cum *= (1.0 + r)
+            out[d] = cum - 1.0
+        return out
+
+    def _apply_serve_layers(self, admitted: list[str],
+                            raw_qualified: list[str]) -> list[str]:
+        """Serve's three admission filters, in serve's order. Order-preserving.
+
+        Each is a no-op unless its config knob is set, so the default path is
+        byte-identical to every result produced before these existed.
+
+        `raw_qualified` is the PRE-filter qualifying set. The hysteresis streak
+        is counted on it rather than on `admitted`, mirroring serve: a name held
+        out by dedup or the sector cap must not lose the streak it would
+        otherwise have built.
+        """
+        cfg = self.config
+
+        # 1. Hysteresis — N consecutive raw-qualifying days before admissible.
+        if cfg.serve_hysteresis_days > 0:
+            qualified = set(raw_qualified)
+            for tk in qualified:
+                self._qualify_streak[tk] = self._qualify_streak.get(tk, 0) + 1
+            for tk in list(self._qualify_streak):
+                if tk not in qualified:
+                    self._qualify_streak[tk] = 0
+            admitted = [t for t in admitted
+                        if self._qualify_streak.get(t, 0) >= cfg.serve_hysteresis_days]
+
+        # 2. Open-cohort dedup — skip names already held in a live tranche.
+        if cfg.serve_cohort_dedup:
+            held = {tk for tr in self._tranches for tk in tr["positions"]}
+            admitted = [t for t in admitted if t not in held]
+
+        # 3. Sector cap — at most N per sector, keeping the best-ranked.
+        if cfg.serve_sector_cap > 0:
+            from src.trading.sector_map import sector_of  # noqa: PLC0415
+
+            seen: dict[str, int] = {}
+            capped: list[str] = []
+            for t in admitted:
+                sec = sector_of(t)
+                # OTHER is uncapped, exactly as in serve's apply_sector_cap —
+                # it is the unmapped bucket, not a real sector.
+                if sec == "OTHER":
+                    capped.append(t)
+                    continue
+                if seen.get(sec, 0) >= cfg.serve_sector_cap:
+                    continue
+                seen[sec] = seen.get(sec, 0) + 1
+                capped.append(t)
+            admitted = capped
+
+        return admitted
+
+    def _serve_exposure_scalar(self, D: date) -> float:
+        """drift × breadth legs of serve's 3-leg brake, as a single multiplier.
+
+        The GARCH leg is deliberately NOT included: the engine already
+        multiplies the budget by `p_bull`, which is the same macro-regime
+        posterior the serve GARCH leg reads, and applying it twice would
+        double-count. Each leg fails open to 1.0 independently, matching
+        `garch_brake.live_exposure_legs`.
+        """
+        cfg = self.config
+        if not cfg.serve_exposure_brake:
+            return 1.0
+
+        def _ramp(x: float, trigger: float, full: float, floor: float) -> float:
+            """Piecewise-linear 1.0 → floor between `trigger` and `full`."""
+            if full == trigger:
+                return 1.0
+            if (x - trigger) / (full - trigger) <= 0.0:
+                return 1.0
+            frac = (trigger - x) / (trigger - full)
+            return max(floor, 1.0 - min(1.0, frac) * (1.0 - floor))
+
+        drift_s = 1.0
+        cum = self._drift_cum.get(D)
+        if cum is not None:
+            drift_s = _ramp(float(cum), cfg.drift_brake_trigger,
+                            cfg.drift_brake_full, cfg.drift_brake_floor)
+        breadth_s = 1.0
+        b = self._breadth.get(D)
+        if b is not None:
+            breadth_s = _ramp(float(b), cfg.breadth_brake_trigger,
+                              cfg.breadth_brake_floor_level, cfg.breadth_brake_floor)
+        return min(drift_s, breadth_s)
 
     # ── 1. Morning routine ─────────────────────────────────────────────────
     def _morning_routine(self, D: date) -> None:
@@ -983,7 +1152,7 @@ class WalkForwardEngine:
             if not survivors:
                 self._zero_candidate_days += 1
                 return n_orders, n_fills, n_rej
-            picks = survivors[:cfg.max_positions]
+            admitted, cohort_n = survivors, cfg.max_positions
         elif cfg.admission_mode == "absolute_gate":
             # Serve-mirror admission: ABSOLUTE floor first (inclusive `>=`,
             # matching serve's `meta_gate`), cap the survivor pool at
@@ -996,7 +1165,7 @@ class WalkForwardEngine:
             if not survivors:
                 self._zero_candidate_days += 1
                 return n_orders, n_fills, n_rej
-            picks = survivors[:cfg.max_positions]
+            admitted, cohort_n = survivors, cfg.max_positions
         elif cfg.admission_mode == "argmax":
             # Admit on the CLASS DECISION (UP is the argmax), not on a P(UP)
             # level. Motivation (11-08-26 paperlog): across the range the
@@ -1015,7 +1184,7 @@ class WalkForwardEngine:
             if not survivors:
                 self._zero_candidate_days += 1
                 return n_orders, n_fills, n_rej
-            picks = survivors[:cfg.max_positions]
+            admitted, cohort_n = survivors, cfg.max_positions
         elif cfg.admission_mode == "rank_breadth":
             # NO absolute P(UP) floor at all — always take the best-ranked
             # names available. Only the COUNT (K) responds to market breadth,
@@ -1029,12 +1198,29 @@ class WalkForwardEngine:
             if k <= 0:
                 self._zero_candidate_days += 1
                 return n_orders, n_fills, n_rej
-            picks = [tickers[j] for j in order_idx][:k]
+            admitted, cohort_n = [tickers[j] for j in order_idx], k
         else:
             # "cross_sectional" — UNCHANGED default: top-N above the relative
             # `signal_threshold` floor (byte-for-byte the pre-A/B admission).
-            picks = [tickers[j] for j in order_idx
-                     if p_up[j] >= cfg.signal_threshold][:cfg.max_positions]
+            admitted = [tickers[j] for j in order_idx
+                        if p_up[j] >= cfg.signal_threshold]
+            cohort_n = cfg.max_positions
+
+        # ── SERVE-PARITY DEFENSIVE LAYERS ────────────────────────────────────
+        # Applied to the ranked ADMITTED list BEFORE the cohort slice, so a name
+        # a filter removes frees its slot for the next-best — the same ordering
+        # `main._select_candidates` uses. All no-ops unless explicitly enabled,
+        # so every prior result is byte-for-byte unchanged.
+        #
+        # `raw_qualified` is the pre-filter set the hysteresis streak is tracked
+        # on: serve counts consecutive RAW-qualifying days independently of the
+        # dedup/sector filters, so a name blocked by those keeps its streak.
+        floor = (cfg.admission_floor
+                 if cfg.admission_mode.startswith("absolute_gate")
+                 else cfg.signal_threshold)
+        raw_qualified = [tickers[j] for j in order_idx if p_up[j] >= floor]
+        picks = self._apply_serve_layers(admitted, raw_qualified)[:cohort_n]
+
         if not picks:
             return n_orders, n_fills, n_rej
 
@@ -1047,6 +1233,9 @@ class WalkForwardEngine:
         # over the flat `cfg.tranche_budget_days` constant when supplied.
         budget_days = self._budget_days.get(D) or cfg.tranche_budget_days or cfg.tranche_hold_days
         budget = (nav / budget_days) * p_bull
+        # Serve's drift+breadth exposure legs (GARCH is already in `p_bull`).
+        # 1.0 unless serve_exposure_brake is on, so the default is unchanged.
+        budget *= self._serve_exposure_scalar(D)
         if cfg.use_nav_tier_cap:
             # Discrete portfolio cap (risk_tier.py): clamp NEW deployment so
             # total invested (nav − cash) stays under the tier ceiling. Uses

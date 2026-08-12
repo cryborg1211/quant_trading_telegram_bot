@@ -92,7 +92,11 @@ def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
                      rank_breadth_floor: float = 0.5,
                      tranche_budget_days: int | None = None,
                      rank_mode: str = "p_up",
-                     rank_seed: int = 0) -> WalkForwardConfig:
+                     rank_seed: int = 0,
+                     serve_sector_cap: int = 0,
+                     serve_cohort_dedup: bool = False,
+                     serve_hysteresis_days: int = 0,
+                     serve_exposure_brake: bool = False) -> WalkForwardConfig:
     """Pure WalkForwardConfig builder — extracted from `run_oos` so the
     mode/hold-days plumbing is unit-testable without running the engine.
 
@@ -124,6 +128,10 @@ def _build_wf_config(tabular_features: list[str], cutoff: date, cfg: RunConfig,
         tranche_budget_days=tranche_budget_days,
         rank_mode=rank_mode,
         rank_seed=rank_seed,
+        serve_sector_cap=serve_sector_cap,
+        serve_cohort_dedup=serve_cohort_dedup,
+        serve_hysteresis_days=serve_hysteresis_days,
+        serve_exposure_brake=serve_exposure_brake,
         constraints=PortfolioConstraints(
             max_weight=cfg.max_weight, long_only=True,
             target_leverage=0.95, target_vol=cfg.target_vol),
@@ -152,7 +160,11 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
             budget_days_series: pd.Series | None = None,
             rank_mode: str = "p_up",
             rank_seed: int = 0,
-            max_positions: int | None = None) -> pd.DataFrame:
+            max_positions: int | None = None,
+            serve_sector_cap: int = 0,
+            serve_cohort_dedup: bool = False,
+            serve_hysteresis_days: int = 0,
+            serve_exposure_brake: bool = False) -> pd.DataFrame:
     """Walk-forward OOS using the pure-tabular ensemble oracle.
 
     The engine builds (n, 1, F) single-bar tensors internally (seq_len=1) and the
@@ -188,7 +200,11 @@ def run_oos(panel, tabular_features: list[str], ensemble: TabularEnsemble,
                               rank_breadth_trigger, rank_breadth_floor_level,
                               rank_breadth_floor,
                               tranche_budget_days=tranche_budget_days,
-                              rank_mode=rank_mode, rank_seed=rank_seed)
+                              rank_mode=rank_mode, rank_seed=rank_seed,
+                              serve_sector_cap=serve_sector_cap,
+                              serve_cohort_dedup=serve_cohort_dedup,
+                              serve_hysteresis_days=serve_hysteresis_days,
+                              serve_exposure_brake=serve_exposure_brake)
     eng = WalkForwardEngine(wf_cfg, oracle)
     # Soft HMM regime scaling: P(Bull) multiplies the daily target weights.
     result = eng.run(sub, corporate_actions=corporate_actions, p_bull_series=p_bull_series,
