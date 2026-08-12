@@ -836,11 +836,12 @@ def _promote_decision(
                      f"{max_abs_dd_pp:.1f}%, UP-prec >= {min_up_precision:.2f})")
 
     skew = _vintage_days_apart(new_meta, old_meta)
-    skew_txt = "unknown" if skew is None else f"{skew}d"
+    window_txt = ("on a different window (skew unknown)" if skew is None
+                  else f"on a window {skew}d shorter")
     return True, (f"passed — Sharpe {old_sharpe:.3f}→{new_sharpe:.3f}, "
                   f"DD {new_dd:.2%} (absolute ceiling {max_abs_dd_pp:.1f}%; "
-                  f"incumbent's {old_dd:.2%} was measured on a window {skew_txt} "
-                  f"shorter and is NOT comparable), UP-prec={new_prec:.3f}. "
+                  f"incumbent's {old_dd:.2%} was measured {window_txt} "
+                  f"and is NOT comparable), UP-prec={new_prec:.3f}. "
                   f"{basis_txt}")
 
 
