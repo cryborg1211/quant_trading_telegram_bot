@@ -262,6 +262,28 @@ class TradingConfig:
     hysteresis_enabled: bool = True
     hysteresis_min_qualify_days: int = 2
     hysteresis_max_gap_days: int = 4
+    # Arbitrator role at the ENTRY gate (11-08-26). "gate" was the original
+    # behaviour: a tau-clearing candidate is dispatched ONLY if
+    # `make_final_decision` returned BUY, which requires the primary horizon's
+    # ARGMAX to be UP. Measured over the full 920-day OOS window
+    # (scripts/analyze_serve_stack_ab.py), that condition takes the validated
+    # config from 46 buys to ZERO — p_up's 99th percentile (0.4523) sits below
+    # p_down's MEDIAN (0.5957), so UP essentially cannot win the argmax on this
+    # model. It is an off switch, not a filter.
+    #
+    # "veto" (default) restores parity with what the backtest actually
+    # validated: admit every tau-clearing candidate, but let the arbitrator
+    # BLOCK one on strongly bearish news. The sentiment veto is kept because it
+    # is cheap and rarely fires; the argmax requirement is dropped because it
+    # never lets anything through.
+    #
+    # Only affects the ENTRY gate. `make_final_decision` is unchanged and still
+    # governs EXIT/advice paths (/suggest_sell, portfolio guard, /verify), where
+    # the model's class opinion is the right question.
+    arbitrator_entry_mode: str = "veto"      # "veto" | "gate"
+    # Sentiment at or below this blocks a tau-clearing candidate in "veto" mode.
+    # Mirrors EVENT_BEAR_SENTIMENT / make_final_decision's SAFETY OVERRIDE.
+    arbitrator_entry_bear_veto: float = -0.50
 
 
 @dataclass

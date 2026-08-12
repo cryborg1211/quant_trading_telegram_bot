@@ -1201,6 +1201,62 @@ def _rescue_loop(
     return extended, event_overrides
 
 
+# Decision encoding shared with the arbitrator: 0=SELL/EXIT, 1=HOLD, 2=BUY.
+_BUY_DECISION = 2
+
+
+def _eligible_entries(
+    candidate_tickers: list[str],
+    final_decisions: dict[str, int],
+    all_sentiments: dict[str, dict],
+    mode: str = "veto",
+    bear_veto: float | None = None,
+) -> tuple[list[str], list[str]]:
+    """Which tau-clearing candidates are eligible to dispatch → (eligible, vetoed).
+
+    PURE. Returns candidates in their INPUT order — the caller sorts and slices
+    the top 3 afterwards, so reordering here would silently change which names
+    ship.
+
+    mode="gate" is the original rule: dispatch only names where
+    `make_final_decision` returned BUY, which requires the primary horizon's
+    ARGMAX to be UP. Measured over 920 OOS days
+    (scripts/analyze_serve_stack_ab.py), adding that condition to the validated
+    config takes it from 46 buys to ZERO — p_up's 99th percentile (0.4523) sits
+    below p_down's MEDIAN (0.5957), so UP cannot win the argmax on this model.
+    It is an off switch, not a filter, and it forced every real dispatch through
+    the far-less-validated event-rescue path.
+
+    mode="veto" (default) restores parity with what the backtest validated:
+    every candidate is eligible and the arbitrator only BLOCKS on strongly
+    bearish news. An UNRECOGNISED mode falls back to "veto" so a typo in
+    settings.json cannot silently re-enable the off switch.
+
+    A MISSING sentiment score never vetoes: the arbitrator returns none whenever
+    the news scrape or the Gemini call fails, and that is not a bearish signal —
+    treating it as one would reinstate the empty book this mode exists to fix.
+    """
+    if str(mode).lower() == "gate":
+        return [t for t in candidate_tickers
+                if final_decisions.get(t) == _BUY_DECISION], []
+
+    thr = float(bear_veto if bear_veto is not None
+                else getattr(CONFIG.trading, "arbitrator_entry_bear_veto", -0.50))
+    eligible: list[str] = []
+    vetoed: list[str] = []
+    for t in candidate_tickers:
+        score = (all_sentiments.get(t) or {}).get("sentiment_score")
+        if score is not None:
+            try:
+                if float(score) <= thr:
+                    vetoed.append(t)
+                    continue
+            except (TypeError, ValueError):
+                pass          # unparseable score → treat as unknown, not bearish
+        eligible.append(t)
+    return eligible, vetoed
+
+
 def _paperlog_snapshot_and_backfill(
     db: Any,
     horizon_predictions: dict[str, dict[str, list[float]]],
@@ -1430,15 +1486,30 @@ def daily_inference(
         )
         return report_html, []
 
-    # --- Top-6 → Top-3 Sentiment Filter ---
+    # --- Top-6 → Top-3 entry gate ---
     # Scope strictly to candidate_tickers (the 6 evaluated by arbitrator+LLM).
-    # Sort primarily by sentiment_score DESC, secondarily by 5d quant probability DESC.
-    # Only candidates that passed arbitration (decision == 2) are eligible for dispatch.
-    _BUY_DECISION = 2
-    evaluated_buys = [
-        t for t in candidate_tickers
-        if final_decisions.get(t) == _BUY_DECISION
-    ]
+    #
+    # ARBITRATOR ROLE (11-08-26 — see CONFIG.trading.arbitrator_entry_mode).
+    # "gate" was the original rule: dispatch only names where
+    # `make_final_decision` returned BUY, which requires the primary horizon's
+    # ARGMAX to be UP. Measured over 920 OOS days
+    # (scripts/analyze_serve_stack_ab.py), adding that condition to the
+    # validated config takes it from 46 buys to ZERO — p_up's p99 (0.4523) is
+    # below p_down's MEDIAN (0.5957), so UP cannot win the argmax on this model.
+    # An off switch, not a filter, and it forced every real dispatch through the
+    # far-less-validated event-rescue path.
+    #
+    # "veto" restores parity with the backtest: every tau-clearing candidate is
+    # eligible, and the arbitrator only BLOCKS on strongly bearish news. The
+    # sentiment veto is retained (cheap, rarely fires); the argmax requirement
+    # is not.
+    _entry_mode = str(getattr(CONFIG.trading, "arbitrator_entry_mode", "veto")).lower()
+    evaluated_buys, _vetoed = _eligible_entries(
+        candidate_tickers, final_decisions, all_sentiments, _entry_mode)
+    if _vetoed:
+        LOGGER.warning("[Brain] Bear-veto blocked %s.", _vetoed)
+    LOGGER.info("[Brain] Entry gate mode=%s — %s of %s candidates eligible.",
+                _entry_mode, len(evaluated_buys), len(candidate_tickers))
     top_buy_signals = sorted(
         evaluated_buys,
         key=lambda t: (
@@ -1506,6 +1577,20 @@ def daily_inference(
         reasons = {}
         for t in monitor:
             d = final_decisions.get(t)
+            # In "veto" mode the arbitrator's own class verdict is NOT what
+            # blocked the name (it no longer gates entry), so attributing the
+            # rejection to it would be a false explanation. Only a bear veto or
+            # the upstream probability/liquidity filters can stop a name here.
+            if _entry_mode != "gate":
+                _ss = (all_sentiments.get(t) or {}).get("sentiment_score")
+                _bear_thr = float(getattr(CONFIG.trading,
+                                          "arbitrator_entry_bear_veto", -0.50))
+                reasons[t] = (
+                    f"Tin tức rất xấu (điểm {float(_ss):+.2f}) — chặn MUA."
+                    if _ss is not None and float(_ss) <= _bear_thr
+                    else "Chưa đủ điều kiện MUA sau bộ lọc xác suất + thanh khoản."
+                )
+                continue
             reasons[t] = (
                 f"Trọng tài AI từ chối MUA — nghiêng về {_DEC_VI[d]} sau khi "
                 "đối chiếu tin tức."
