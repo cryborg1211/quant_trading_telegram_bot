@@ -651,6 +651,58 @@ def _vintage_days_apart(new_meta: dict, old_meta: dict) -> int | None:
     return abs((da - db).days)
 
 
+# Which `sweep_conditions` entries make two stored Sharpes comparable.
+#
+# `engine_gate` is deliberately EXCLUDED: with gate_offset 0 it equals the
+# optimised `up_threshold`, i.e. the model's own choice, not a measurement
+# condition. Including it would mark every run incomparable to every other and
+# permanently disable the relative check.
+#
+# `admission_mode` is EXCLUDED because it was measured VACUOUS — absolute_gate
+# and cross_sectional are byte-identical at every gate level, since
+# admission_pool_cap (6) >= max_positions (5) so the pool cap never binds.
+# Treating it as material would wedge the gate on a difference that cannot
+# change a single trade.
+_SWEEP_BASIS_KEYS = (
+    "gate_offset",              # engine trades at up_threshold + this
+    "serve_sector_cap",         # the four defensive layers, each measured to
+    "serve_cohort_dedup",       # cost Sharpe (8 of 8 cells, ~0.2 total)
+    "serve_hysteresis_days",
+    "serve_exposure_brake",
+    "use_regime_sizing",        # A/B 14-06: Sharpe +0.73 -> +0.88
+    "max_positions",            # concentration
+)
+
+
+def _sweep_basis(meta: dict | None) -> dict | None:
+    """The measurement conditions behind a stored metric, or None if unknown.
+
+    None means "no `sweep_conditions` stamp", which is every artifact built
+    before 12-08-26 — and those were all swept at gate_offset -0.05 with none of
+    the four layers, so unknown here is really known-different, not merely
+    missing.
+    """
+    sc = (meta or {}).get("sweep_conditions")
+    if not sc:
+        return None
+    return {k: sc.get(k) for k in _SWEEP_BASIS_KEYS}
+
+
+# Marker inside the promote reason that the relative Sharpe check did not run.
+# The caller escalates the log line to WARNING on it: a promotion that passed on
+# absolute floors alone should be visible, not buried in an INFO line.
+_BASIS_SKIP_MARKER = "RELATIVE SHARPE CHECK SKIPPED"
+
+
+def _basis_diff_text(old_basis: dict, new_basis: dict) -> str:
+    """Only the keys that actually differ — the reason string must name the cause."""
+    return ", ".join(
+        f"{k} {old_basis.get(k)!r}->{new_basis.get(k)!r}"
+        for k in _SWEEP_BASIS_KEYS
+        if old_basis.get(k) != new_basis.get(k)
+    ) or "no key differs"
+
+
 def _promote_decision(
     new_meta: dict,
     old_meta: dict | None,
@@ -695,6 +747,38 @@ def _promote_decision(
     `min_abs_sharpe` is a floor beneath that, for the no-incumbent-comparison
     case. UP-precision remains an absolute floor.
 
+    …AND WHY SHARPE'S RELATIVE CHECK NOW NEEDS A SHARED BASIS (fixed 12-08-26)
+    ─────────────────────────────────────────────────────────────────────────
+    The MaxDD fix above cured one apples-to-oranges comparison and left another
+    in place. Sharpe is comparable across two OOS *windows*, but not across two
+    different *strategies*, and `--serve-parity` changed the strategy the sweep
+    measures: gate_offset 0 instead of -0.05, plus the four production defensive
+    layers switched on. Those layers were measured to cost roughly 0.2 Sharpe
+    (8 of 8 cells) — more than double the -0.10 delta this gate allows.
+
+    So the live incumbent's 0.645, earned bare, would reject every parity-swept
+    candidate on arrival:
+
+        required   0.645 - 0.10 = 0.545
+        candidate  ~0.53 best-seed under parity   -> rejected, by 0.015
+
+    The tell was already in the artifacts and unread: incumbents carry
+    `sweep_conditions=None`, candidates carry a full stamp — the very field added
+    to catch exactly this.
+
+    Fix: the relative check runs ONLY when both sides share a `_sweep_basis`.
+    Otherwise the absolute floors (`min_abs_sharpe`, `max_abs_dd_pp`,
+    `min_up_precision`) carry the decision alone, and the reason string says so.
+    This is deliberately a ONE-TIME widening: once a parity-stamped artifact is
+    live, every later retrain compares parity-to-parity and the relative check is
+    active again. Exactly one promotion passes on absolute floors only.
+
+    Two UNSTAMPED artifacts count as the SAME basis, not as unknown — both
+    predate the stamp, so both were swept bare, so they are comparable to each
+    other. Only a mixed pair or two differing stamps skips the check. That is
+    what keeps the genuine 08-08 T+5 regression (0.590 → 0.489, both unstamped)
+    a reject.
+
     `max_dd_regression_pp` and `max_window_skew_days` are kept in the signature
     so existing config/callers keep working; the skew is reported in the reason
     string for diagnosis but no longer changes the decision.
@@ -726,16 +810,38 @@ def _promote_decision(
 
     old_sharpe = float(old_meta.get("oos_sharpe", float("-inf")))
     old_dd = abs(float(old_meta.get("oos_max_dd", 0.0)))
-    if new_sharpe < old_sharpe + min_sharpe_delta:
-        return False, (f"Sharpe regression: new={new_sharpe:.3f} old={old_sharpe:.3f} "
-                       f"(min allowed delta={min_sharpe_delta:+.3f})")
+
+    new_basis, old_basis = _sweep_basis(new_meta), _sweep_basis(old_meta)
+    # `None == None` is intentionally SAME: two unstamped artifacts are both
+    # pre-12-08, hence both swept bare, hence comparable to each other. Only a
+    # MIXED pair (one stamped, one not) or two differing stamps is incomparable.
+    same_basis = new_basis == old_basis
+
+    if same_basis:
+        if new_sharpe < old_sharpe + min_sharpe_delta:
+            return False, (f"Sharpe regression: new={new_sharpe:.3f} "
+                           f"old={old_sharpe:.3f} (min allowed delta="
+                           f"{min_sharpe_delta:+.3f}; same sweep basis)")
+        basis_txt = "same sweep basis — Sharpe compared relatively"
+    else:
+        which = ("incumbent has no sweep_conditions stamp"
+                 if old_basis is None else
+                 "candidate has no sweep_conditions stamp"
+                 if new_basis is None else
+                 f"basis differs: {_basis_diff_text(old_basis, new_basis)}")
+        basis_txt = (f"{_BASIS_SKIP_MARKER} ({which}) — incumbent's "
+                     f"{old_sharpe:.3f} was earned under different sweep "
+                     f"conditions and is NOT comparable; absolute floors only "
+                     f"(Sharpe >= {min_abs_sharpe:.2f}, DD <= "
+                     f"{max_abs_dd_pp:.1f}%, UP-prec >= {min_up_precision:.2f})")
 
     skew = _vintage_days_apart(new_meta, old_meta)
     skew_txt = "unknown" if skew is None else f"{skew}d"
     return True, (f"passed — Sharpe {old_sharpe:.3f}→{new_sharpe:.3f}, "
                   f"DD {new_dd:.2%} (absolute ceiling {max_abs_dd_pp:.1f}%; "
                   f"incumbent's {old_dd:.2%} was measured on a window {skew_txt} "
-                  f"shorter and is NOT comparable), UP-prec={new_prec:.3f}")
+                  f"shorter and is NOT comparable), UP-prec={new_prec:.3f}. "
+                  f"{basis_txt}")
 
 
 def _persist_bot_payload(cfg: RunConfig, tabular_features: list[str], golden: dict,
@@ -844,7 +950,12 @@ def _persist_bot_payload(cfg: RunConfig, tabular_features: list[str], golden: di
                 cfg.tb_horizon, reason, rejected_path,
             )
             return
-        LOGGER.info("Promote-gate: %s", reason)
+        # A promotion that skipped the relative Sharpe check rests on absolute
+        # floors alone, so it must not read like a routine pass.
+        if _BASIS_SKIP_MARKER in reason:
+            LOGGER.warning("Promote-gate PROMOTED on absolute floors only: %s", reason)
+        else:
+            LOGGER.info("Promote-gate: %s", reason)
 
     # Back up the EXISTING artifact before overwriting.  models/saved/ is
     # git-untracked, unversioned, and un-backed-up, so a bad/partial run would

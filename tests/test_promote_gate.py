@@ -145,6 +145,160 @@ def test_malformed_incumbent_still_promotes_a_healthy_candidate():
 
 
 # ---------------------------------------------------------------------------
+# Sharpe needs a SHARED SWEEP BASIS to be comparable (12-08-26)
+#
+# The MaxDD fix above cured one apples-to-oranges comparison and left another.
+# Sharpe compares across two OOS *windows* but not across two *strategies*, and
+# `--serve-parity` changed the strategy the sweep measures (gate_offset 0 instead
+# of -0.05, plus the four defensive layers, together worth ~0.2 Sharpe — double
+# the -0.10 delta the gate allows).
+# ---------------------------------------------------------------------------
+
+_PARITY_BASIS = {
+    "gate_offset": 0.0, "engine_gate": 0.43, "admission_mode": "cross_sectional",
+    "serve_sector_cap": 2, "serve_cohort_dedup": True,
+    "serve_hysteresis_days": 2, "serve_exposure_brake": True,
+    "use_regime_sizing": False, "max_positions": 5,
+}
+
+
+def test_saturdays_real_candidate_would_have_been_rejected_before_the_fix():
+    """Replay of the live numbers, and the reason the fix was needed.
+
+    Incumbent T+20 on disk: oos_sharpe 0.645 (best seed), earned BARE. The
+    12-08 parity smoke test's best seed was ~0.53. 0.645 - 0.10 = 0.545, so the
+    candidate misses by 0.015 — a reject caused entirely by the measurement basis
+    changing, not by the model getting worse.
+    """
+    new = {"oos_sharpe": 0.53, "oos_max_dd": -0.1516,
+           "golden_mean_up_precision": 0.4545,
+           "trained_at": "2026-08-15T09:00:00Z",
+           "sweep_conditions": dict(_PARITY_BASIS)}
+    old = {"oos_sharpe": 0.645, "oos_max_dd": -0.1260,
+           "golden_mean_up_precision": 0.5698,
+           "trained_at": "2026-07-17T08:47:10Z"}          # no stamp — swept bare
+
+    # What the pre-fix gate did: a bare relative comparison.
+    assert new["oos_sharpe"] < old["oos_sharpe"] - 0.10
+
+    promote, reason = _promote_decision(new, old, -0.10, 3.0, 0.35)
+    assert promote, reason
+    assert "RELATIVE SHARPE CHECK SKIPPED" in reason
+    assert "incumbent has no sweep_conditions stamp" in reason
+
+
+def test_both_unstamped_are_the_same_basis_so_regression_still_rejects():
+    """Two pre-stamp artifacts were both swept bare — comparable to each other.
+
+    This is what keeps the genuine 08-08 T+5 regression a reject. If unstamped
+    were treated as "unknown", the fix would have silently disabled the relative
+    check for every legacy pair.
+    """
+    new = {"oos_sharpe": 0.489, "oos_max_dd": -0.1943,
+           "golden_mean_up_precision": 0.550}
+    old = {"oos_sharpe": 0.590, "oos_max_dd": -0.1344,
+           "golden_mean_up_precision": 0.4585}
+    promote, reason = _promote_decision(new, old, -0.10, 3.0, 0.35)
+    assert not promote
+    assert "Sharpe regression" in reason
+    assert "same sweep basis" in reason
+
+
+def test_matching_stamps_restore_the_relative_check():
+    """The widening is ONE-TIME: parity-vs-parity compares normally again."""
+    new = {"oos_sharpe": 0.30, "oos_max_dd": -0.12,
+           "golden_mean_up_precision": 0.45,
+           "sweep_conditions": dict(_PARITY_BASIS)}
+    old = {"oos_sharpe": 0.53, "oos_max_dd": -0.15,
+           "golden_mean_up_precision": 0.45,
+           "sweep_conditions": dict(_PARITY_BASIS)}
+    promote, reason = _promote_decision(new, old, -0.10, 3.0, 0.35)
+    assert not promote
+    assert "Sharpe regression" in reason
+
+
+def test_engine_gate_differing_does_not_break_comparability():
+    """`engine_gate` is the OPTIMISED OUTPUT, not a measurement condition.
+
+    Two parity runs that picked different thresholds must stay comparable —
+    otherwise every run is incomparable to every other and the relative check is
+    permanently off.
+    """
+    old_sc = dict(_PARITY_BASIS, engine_gate=0.43)
+    new_sc = dict(_PARITY_BASIS, engine_gate=0.41)
+    new = {"oos_sharpe": 0.30, "oos_max_dd": -0.12,
+           "golden_mean_up_precision": 0.45, "sweep_conditions": new_sc}
+    old = {"oos_sharpe": 0.53, "oos_max_dd": -0.15,
+           "golden_mean_up_precision": 0.45, "sweep_conditions": old_sc}
+    promote, reason = _promote_decision(new, old, -0.10, 3.0, 0.35)
+    assert not promote, "engine_gate must not be treated as a basis difference"
+    assert "Sharpe regression" in reason
+
+
+def test_admission_mode_differing_does_not_break_comparability():
+    """`admission_mode` was measured VACUOUS — byte-identical at every gate level.
+
+    absolute_gate and cross_sectional cannot change a single trade, because
+    admission_pool_cap (6) >= max_positions (5) so the pool cap never binds.
+    Treating it as material would wedge the gate on a non-difference.
+    """
+    old_sc = dict(_PARITY_BASIS, admission_mode="cross_sectional")
+    new_sc = dict(_PARITY_BASIS, admission_mode="absolute_gate")
+    new = {"oos_sharpe": 0.30, "oos_max_dd": -0.12,
+           "golden_mean_up_precision": 0.45, "sweep_conditions": new_sc}
+    old = {"oos_sharpe": 0.53, "oos_max_dd": -0.15,
+           "golden_mean_up_precision": 0.45, "sweep_conditions": old_sc}
+    promote, reason = _promote_decision(new, old, -0.10, 3.0, 0.35)
+    assert not promote
+    assert "Sharpe regression" in reason
+
+
+def test_a_real_layer_difference_does_skip_the_check():
+    old_sc = dict(_PARITY_BASIS, serve_exposure_brake=False, gate_offset=-0.05)
+    new = {"oos_sharpe": 0.30, "oos_max_dd": -0.12,
+           "golden_mean_up_precision": 0.45,
+           "sweep_conditions": dict(_PARITY_BASIS)}
+    old = {"oos_sharpe": 0.60, "oos_max_dd": -0.15,
+           "golden_mean_up_precision": 0.45, "sweep_conditions": old_sc}
+    promote, reason = _promote_decision(new, old, -0.10, 3.0, 0.35)
+    assert promote, reason
+    assert "basis differs" in reason
+    assert "gate_offset" in reason and "serve_exposure_brake" in reason
+
+
+def test_skipping_the_relative_check_does_not_disable_the_absolute_floors():
+    """The one-time widening must not become an open door."""
+    base = {"golden_mean_up_precision": 0.45,
+            "sweep_conditions": dict(_PARITY_BASIS)}
+    old = {"oos_sharpe": 0.645, "oos_max_dd": -0.1260,
+           "golden_mean_up_precision": 0.5698}                 # unstamped
+    for meta, frag in (
+        ({**base, "oos_sharpe": 0.05, "oos_max_dd": -0.12}, "absolute Sharpe floor"),
+        ({**base, "oos_sharpe": 0.80, "oos_max_dd": -0.40}, "absolute MaxDD ceiling"),
+        ({**base, "oos_sharpe": 0.80, "oos_max_dd": -0.12,
+          "golden_mean_up_precision": 0.20}, "precision"),
+    ):
+        promote, reason = _promote_decision(meta, old, -0.10, 3.0, 0.35)
+        assert not promote, reason
+        assert frag in reason
+
+
+def test_an_empty_stamp_reads_as_unstamped():
+    """`_persist_bot_payload` writes `dict(sweep_conditions or {})`.
+
+    A caller that omits the stamp therefore stores `{}`, not a missing key — that
+    must mean the same thing as absent, or legacy pairs would look mismatched.
+    """
+    new = {"oos_sharpe": 0.489, "oos_max_dd": -0.19,
+           "golden_mean_up_precision": 0.55, "sweep_conditions": {}}
+    old = {"oos_sharpe": 0.590, "oos_max_dd": -0.13,
+           "golden_mean_up_precision": 0.46}
+    promote, reason = _promote_decision(new, old, -0.10, 3.0, 0.35)
+    assert not promote
+    assert "same sweep basis" in reason
+
+
+# ---------------------------------------------------------------------------
 # _persist_bot_payload integration — isolated filesystem (tmp_path, chdir)
 # ---------------------------------------------------------------------------
 
