@@ -181,17 +181,15 @@ class TradingConfig:
     # Default OFF — flips ON only after the backtest A/B acceptance gate
     # (Sharpe up, MaxDD not >1pp worse, PBO not worse) passes.
     prob_weighted_cohorts_enabled: bool = False
-    # Intraday attack scanner (monitoring-only): a repeating in-bot job that
-    # rescores the model on PROVISIONAL intraday bars during HOSE trading hours
-    # and sends a compact "top movers" card when something notable moves before
-    # the 15:30 EOD crawl. Writes NOTHING to parquet/DuckDB/paperlog, invokes NO
-    # arbitrator/Gemini — pure alert-only. Defaults OFF (this is a brand-new
-    # always-on background job with a new runtime dependency, so unlike the other
-    # kill-switches here it ships disabled; flip it on manually after restart).
-    # Kill-switch: set "intraday_scanner_enabled": true in settings.json + restart.
-    intraday_scanner_enabled: bool = False
-    intraday_scan_interval_min: int = 15   # cadence in minutes; clamped to [10, 30] at job registration
-    intraday_alert_delta_pp: float = 0.02  # |ΔP(UP)| >= this (in probability, 0.02 = 2pp) alerts a top-3 name
+    # NOTE (13-08-26): `intraday_scanner_enabled` / `intraday_scan_interval_min`
+    # / `intraday_alert_delta_pp` were REMOVED here and from settings.json when
+    # the scanner's repeating job was unwired from the bot (operator decision).
+    # The dataclass default was False but settings.json overrode it to TRUE, so
+    # the movement-alert job WAS live on every bot run — removing the keys is what
+    # actually stops it, not the default. `src/trading/intraday_scanner.py` and
+    # its tests are kept: the provisional-bar splicing is the reusable piece for
+    # an intraday foreign-flow experiment (flow's correlation with price is
+    # same-day only, so mid-session is the only place it could be tradeable).
     # Serve candidate universe mode. "adv_top_n" (DEFAULT ON) resolves the live
     # candidate pool dynamically via src/trading/serve_universe.liquid_universe
     # (top serve_liquid_top_n names by trailing serve_adv_window-day $-ADV) —

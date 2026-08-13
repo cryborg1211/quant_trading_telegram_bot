@@ -48,9 +48,6 @@
     "serve_universe_mode": "adv_top_n",
     "serve_liquid_top_n": 50,
     "serve_adv_window": 20,
-    "intraday_scanner_enabled": true,
-    "intraday_scan_interval_min": 60,
-    "intraday_alert_delta_pp": 0.02,
     "portfolio_guard_enabled": true,
     "portfolio_guard_trailing_pct": 0.08,
     "portfolio_guard_llm_enabled": true
