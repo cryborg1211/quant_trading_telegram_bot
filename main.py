@@ -1054,10 +1054,20 @@ def _select_candidates(
     vn30_universe: frozenset[str],
     max_candidates: int,
     persist: bool = True,
+    tau: float | None = None,
 ) -> tuple[list[str], set[str], bool, dict[str, str]]:
     """VN30 gate + meta-gate filter + top-N sort + fallback mode.
 
     Returns (candidate_tickers, universe_tickers, fallback_mode, fallback_reasons).
+
+    `tau` — the LIVE meta-gate threshold (`thr_5d["pnl_threshold_tau"]`, i.e. the
+    artifact's `up_threshold`). Used only for the fallback branch's explanation
+    text. It was a hardcoded `0.45` until 13-08-26, which told operators the wrong
+    story the moment the gate moved: after the 13-08 retrain dropped tau to 0.43,
+    VHM cleared the gate at 43.4% and was held back by HYSTERESIS, yet the card
+    said "Cửa tăng chỉ 43% (dưới ngưỡng an toàn 45%)" — naming a threshold that no
+    longer existed and blaming a gate the name had actually passed. None falls back
+    to the old literal rather than inventing a number.
     """
     _ARBITRATOR_POOL = _ARBITRATOR_POOL_SIZE   # module-level since 13-08-26
 
@@ -1098,10 +1108,16 @@ def _select_candidates(
     # dedup/sector-cap below) before a name is admissible at all. Read is
     # always safe; the streak WRITE is persist-gated (mirrors the paperlog's
     # persist=False contract — a dashboard preview must never mutate state).
+    # Names the gate ADMITTED but hysteresis parked. Kept in scope so the fallback
+    # branch can say so instead of claiming they failed the gate.
+    _hysteresis_held: dict[str, tuple[int, int]] = {}
     if CONFIG.trading.hysteresis_enabled and _survivors:
         _streaks = candidate_hysteresis.read_streaks(_survivors)
         _min_days = int(CONFIG.trading.hysteresis_min_qualify_days)
         _held_back = [t for t in _survivors if _streaks.get(t, 0) + 1 < _min_days]
+        _hysteresis_held = {
+            t: (int(_streaks.get(t, 0)) + 1, _min_days) for t in _held_back
+        }
         if _held_back:
             LOGGER.info(
                 "[Hysteresis] %s candidate(s) held back (need %s consecutive "
@@ -1154,7 +1170,7 @@ def _select_candidates(
     fallback_reasons: dict[str, str] = {}
     if not candidate_tickers:
         fallback_mode = True
-        _tau5 = 0.45
+        _tau5 = float(tau) if tau is not None else 0.45
         _ranked = [
             t for t, _p in sorted(
                 predictions.items(),
@@ -1166,7 +1182,17 @@ def _select_candidates(
         _floor_pct = _tau5 * 100.0
         for t in candidate_tickers:
             _pu = predictions[t][2] * 100.0
-            if _pu < _floor_pct:
+            if t in _hysteresis_held:
+                # ADMITTED by the gate, parked for a streak. Saying "below the
+                # threshold" here would contradict what the system did.
+                _have, _need = _hysteresis_held[t]
+                fallback_reasons[t] = (
+                    f"Cửa tăng {_pu:.0f}% ĐÃ QUA cổng {_floor_pct:.0f}%, nhưng "
+                    f"mới đủ điều kiện {_have}/{_need} ngày liên tiếp — chờ thêm "
+                    f"{_need - _have} phiên xác nhận trước khi vào lệnh "
+                    f"(chống tín hiệu nhảy vào/ra)."
+                )
+            elif _pu < _floor_pct:
                 fallback_reasons[t] = (
                     f"Cửa tăng chỉ {_pu:.0f}% (dưới ngưỡng an toàn "
                     f"{_floor_pct:.0f}%) — không bõ công đánh đổi với rủi ro "
@@ -1450,6 +1476,7 @@ def daily_inference(
     candidate_tickers, universe_tickers, fallback_mode, fallback_reasons = _select_candidates(
         stacking_predictions_5d, meta_gate_5d, resolved_universe, max_candidates,
         persist=persist,
+        tau=float(thr_5d.get("pnl_threshold_tau")) if thr_5d.get("pnl_threshold_tau") else None,
     )
 
     horizon_predictions = {"5d": stacking_predictions_5d, "20d": stacking_predictions_20d}
