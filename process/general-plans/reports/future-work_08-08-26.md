@@ -20,7 +20,44 @@ Rejected (do not re-attempt without a materially different angle):
 - Confluence (T+5 ∧ T+20 agreement) — but this run **did** surface a real, actionable finding: T+20's gate does essentially all the quality-filtering work; T+5-only conviction is statistical noise. If T+5 side-door dispatches are ever reconsidered, require the T+20 gate too.
 - Prob-scaled cohort weights, rank_breadth admission, vol-scaled burst divisor (all A/B'd, all lost to their simpler baselines)
 - Fast-attack/impulse momentum-ignition sub-model (OOF precision 0.520, misses both the 0.60 target and MR-LGBM's own bar)
-- **Foreign flow, as a linear predictor** (this session) — real EDA, real statistical power (n>500K), correlation ~0.001-0.002 everywhere tested. Closed.
+- **Foreign flow, as a FORWARD predictor** — still rejected, but the 08-08 reasoning was wrong and is corrected below. Re-tested 13-08 (`scripts/analyze_foreign_flow_correlation.py`).
+
+**Correction, 13-08-26 — "correlation ~0.001 everywhere" was false.** The 08-08 EDA
+(`scripts/eda_flow_features.py`) reported Pearson only, and measured **only forward
+returns** — it had no lag-0 arm at all. Two consequences:
+
+- It could not distinguish "no signal" from "broken join". It happened to be the
+  former, but that was luck, not evidence.
+- **Pearson was the wrong statistic.** Foreign net flow is violently fat-tailed
+  (one +14.2e9 VND day against a median of 0), which collapses Pearson. On the
+  ADV top-50 slice at lag 0: **Pearson +0.050 vs Spearman +0.256** — a 5x gap.
+
+Re-measured with the instrument fixed (flow normalised by trailing traded value,
+Spearman alongside Pearson, per-ticker as well as pooled, lag −5..+5):
+
+```
+LEAD-LAG, ADV top-50, Spearman, 1-day returns
+  k=-2  +0.0359      k=+1  +0.0082
+  k=-1  -0.0165      k=+2  -0.0023
+  k=+0  +0.2557 <--  k=+5  +0.0141
+```
+
+Per-ticker on liquid names, lag 0: **median r +0.1835, 92.4% of 92 tickers
+positive** (p25 +0.106, p75 +0.255). Forward: fwd_5 median +0.0072 (55% positive),
+fwd_20 median −0.0076 (46% positive).
+
+**The correlation is real and large, and it is entirely CONTEMPORANEOUS.** A sharp
+spike at exactly k=0 with flat shoulders is price impact, not information: foreign
+net buying is part of the day's buying pressure, and by the close it is already in
+the price. Nothing survives to t+1. The REJECT stands; the reason is now
+defensible.
+
+**The one direction this opens** — intraday flow. If cumulative foreign flow were
+observable at, say, 11:30, part of the same-day impact would still be ahead. But
+the crawler is EOD post-close and the table holds one row per (ticker, date), so
+**that data does not exist yet**; this is a data-collection hypothesis, not a
+runnable test. It would also need the unofficial live iBoard endpoint, not
+FastConnect's `DailyStockPrice`.
 
 Shipped and working:
 - Burst-budget divisor (`tranche_budget_days=10`, opt-in) — ~3x PnL over the calendar-budget baseline at DD still inside the production comfort band.
