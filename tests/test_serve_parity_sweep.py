@@ -38,6 +38,7 @@ def _cli(*argv: str):
 # what to do, so the next person adding a return value fixes the offsets instead
 # of debugging nonsense assertions.
 _GATE_OFF, _SEC_CAP, _DEDUP, _HYST, _BRAKE, _DD_BUDGET = -6, -5, -4, -3, -2, -1
+_REGIME = 9          # positional, from the FRONT — see `_cli`'s return order
 _CLI_TUPLE_LEN = 24
 
 
@@ -80,6 +81,31 @@ class TestServeParityShorthand:
         out = _cli("--serve-exposure-brake", "--serve-cohort-dedup")
         assert out[_BRAKE] is True and out[_DEDUP] is True
         assert out[_GATE_OFF] == pytest.approx(-0.05)   # untouched
+
+
+class TestServeParityIncludesRegimeSizing:
+    """Regime sizing IS a production condition, so parity must include it.
+
+    Caught 13-08-26 by diffing the freshly promoted artifact's `sweep_conditions`
+    against live CONFIG: `use_regime_sizing` was False in the sweep and True in
+    serve (settings.json `regime_sizing_enabled`). Both sides import the same
+    policy from src/trading/regime_policy.py, so the only gap was the shorthand
+    not setting the flag — which let `--serve-parity` claim production parity
+    while omitting a production condition.
+    """
+
+    def test_serve_parity_turns_regime_sizing_on(self):
+        assert _cli("--serve-parity")[_REGIME] is True
+
+    def test_default_leaves_regime_sizing_off(self):
+        # Bare runs must stay comparable with every pre-13-08 sweep.
+        assert _cli()[_REGIME] is False
+
+    def test_regime_sizing_alone_does_not_imply_the_rest_of_parity(self):
+        out = _cli("--regime-sizing")
+        assert out[_REGIME] is True
+        assert out[_GATE_OFF] == pytest.approx(-0.05)   # still the legacy offset
+        assert out[_BRAKE] is False
 
 
 class TestGoldenDrawdownBudgetCli:

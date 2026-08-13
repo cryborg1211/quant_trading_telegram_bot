@@ -1313,10 +1313,14 @@ def _cli() -> tuple:   # 24 positional values — enumerating them was already w
     p.add_argument("--serve-parity", action="store_true",
                    help="shorthand for --gate-offset 0 --serve-sector-cap 2 "
                         "--serve-cohort-dedup --serve-hysteresis-days 2 "
-                        "--serve-exposure-brake: sweep the threshold with the "
-                        "production defensive stack PRESENT, so the stored "
-                        "up_threshold is optimised under the conditions serve "
-                        "actually runs")
+                        "--serve-exposure-brake --regime-sizing: sweep the "
+                        "threshold with the production defensive stack PRESENT, "
+                        "so the stored up_threshold is optimised under the "
+                        "conditions serve actually runs. STILL NOT MODELLED: "
+                        "serve slices its final dispatch list to 3 names "
+                        "(main.py:1520) while the engine runs max_positions=5, "
+                        "and the event-rescue path (5% NAV, skips the brake) has "
+                        "no point-in-time sentiment history to replay")
     p.add_argument("--admission-pool-cap", type=int, default=6,
                    help="survivor-pool cap before the top-N slice under absolute_gate "
                         "(mirrors serve's _ARBITRATOR_POOL; default 6)")
@@ -1378,6 +1382,14 @@ def _cli() -> tuple:   # 24 positional values — enumerating them was already w
             a.serve_hysteresis_days = 2
         a.serve_cohort_dedup = True
         a.serve_exposure_brake = True
+        # REGIME SIZING (added 13-08-26). Serve has it ON
+        # (settings.json regime_sizing_enabled=true) and both sides import the
+        # SAME policy from src/trading/regime_policy.py, so leaving it out of the
+        # shorthand made `--serve-parity` claim production parity while omitting a
+        # production condition. Caught by comparing the 13-08 artifact's
+        # sweep_conditions against live CONFIG: use_regime_sizing False vs True.
+        # Not silently overridden if the caller passed --regime-sizing already.
+        a.regime_sizing = True
     # DD budget: CLI wins, else CONFIG, and an explicit 0 means "no budget".
     if a.golden_max_mean_dd_pp is None:
         from config.settings import CONFIG  # noqa: PLC0415 — CLI-first script
