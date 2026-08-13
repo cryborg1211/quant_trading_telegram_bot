@@ -138,7 +138,7 @@ the BEST precision of all six. What 0.46 costs is deployment: +907M against
 DSR diagnostic predicted (the failure is ROBUST, not borderline). Paper-only
 stands.
 
-### 1c-quater. UNGUARDED: GOLDEN selection has no drawdown constraint
+### 1c-quater. GOLDEN selection had no drawdown constraint — FIXED (`41390d6`)
 
 `run_backtest.py` picks GOLDEN as **max mean OOS Net PnL**, with no DD term. On
 this run that chose 0.43 at mean DD **−13.88%**, already outside the ~−13% comfort
@@ -152,9 +152,28 @@ gate that wins a coin flip, and PnL and DD rise together — so the objective
 
 The promote-gate cannot catch this: `max_abs_dd_pp` is **25%**, deliberately loose
 so it only blocks runaways (tightening it to the band would re-create the
-deadlock it was just repaired from). The fix belongs in SELECTION, not promotion —
-max mean NetPnL **subject to** a mean-DD budget. Not implemented; it changes what
-the unattended Saturday run optimises, so it needs an explicit decision.
+deadlock it was just repaired from). So the constraint went into SELECTION:
+`_select_golden` = max mean NetPnL **subject to**
+`CONFIG.trading.golden_max_mean_dd_pp` (**14.0**; CLI `--golden-max-mean-dd-pp`,
+`0` restores plain max-PnL).
+
+**14.0 caps the tail without changing today's answer** — it admits 0.43 (−13.88%)
+and blocks 0.42/0.41. Verified live on the real sweep rows, all four paths:
+
+```
+live budget      -> 0.43  (unchanged, as intended)
+budget removed   -> 0.43  (same here by luck, not by construction)
+binding case     -> 0.44 instead of 0.42, WARNING names both arms
+no arm fits (5%) -> 0.46, the shallowest, WARNING
+```
+
+Design points worth not re-deciding: budgeted on **mean** DD across seeds (the
+artifact stores the best seed's −12.54%, but the mean −13.88% is the expected
+case); sign-agnostic; **no arm fitting returns the shallowest arm rather than
+aborting**, because a retrain must still produce a candidate; and
+`--golden-max-mean-dd-pp 0` maps to `None` in `_cli` since a literal `0.0`
+reaching `_select_golden` would read as "0% drawdown allowed" and exclude
+everything.
 
 ### 1d. Two things that looked like divergences but are not
 
@@ -194,8 +213,9 @@ numbers came off the existing checkpoint), and MR-LGBM/T+5 run their own passes.
 all across 0.41–0.46, so **which** level wins is noise and the winning
 `up_threshold` is NOT a tuned optimum. Check instead:
 - did it **promote** (see below — the pre-12-08 gate would have rejected it), and
-- is the picked level's **mean DD** inside the ~−13% band (1c-quater: the selection
-  rule has no DD constraint and 0.43 already sits at −13.88%).
+- did the log print **`GOLDEN drawdown budget BINDING`**? That means PnL wanted a
+  deeper-drawdown arm and the 14pp budget (1c-quater) held it back — expected
+  behaviour, but worth seeing, because it says the risk/return frontier moved.
 
 Do not re-run the sweep hoping for a "better" level: that is the threshold-mining
 the DSR penalty exists to catch, and the sweep is already the `n_trials` count
