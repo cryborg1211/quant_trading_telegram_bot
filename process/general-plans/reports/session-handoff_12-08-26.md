@@ -98,9 +98,63 @@ one specific soon-to-be-replaced model; the sweep is the gate response averaged
 over fresh ones. Budget is not the difference — neither sets
 `tranche_budget_days`, so both run the nav/30 calendar budget.
 
-**Never quote 1c's absolute Sharpe or DD as a production expectation.** Its
-directional finding (0.46 sits past the peak) survives — it is the only claim both
-harnesses support.
+**Never quote 1c's absolute Sharpe or DD as a production expectation.**
+
+### 1c-ter. The full 6-level parity sweep — 1c's SHAPE is gone too
+
+Superseding 1c-bis: the complete grid ran (`--serve-parity --sweep-thresholds
+0.46,0.45,0.44,0.43,0.42,0.41 --no-save`, 4 seeds each, 922 OOS days,
+`logs/parity_sweep_full_20260812_154135.log`, 42.6 min):
+
+| up_thr | mean NetPnL | mean Sharpe | mean DD | total predUP | mean UPprec |
+|---|---|---|---|---|---|
+| 0.46 (serve) | +907M | +0.427 | **−9.66%** | 139,561 | 0.4674 |
+| 0.45 | +1.218B | +0.470 | −12.20% | 207,649 | 0.4616 |
+| 0.44 | +1.252B | +0.419 | −13.17% | 295,511 | 0.4568 |
+| **0.43 ← GOLDEN** | **+1.583B** | +0.475 | **−13.88%** | 399,754 | 0.4543 |
+| 0.42 | +1.554B | +0.454 | −14.83% | 511,392 | 0.4513 |
+| 0.41 | +1.453B | +0.425 | −16.20% | 620,486 | 0.4477 |
+
+**THE THRESHOLD DOES NOT AFFECT SHARPE.** The whole curve spans 0.419–0.475 —
+range **0.056** — and zigzags (0.46 up, 0.44 down, 0.43 up, 0.41 down). A single
+threshold's 4-seed spread is **0.30**. The entire six-level curve fits inside one
+level's noise. Every earlier statement that ranked these levels by Sharpe,
+including 1c's "0.44 peak / 0.45 collapse / 0.46 bounce", was reading noise.
+
+**What IS ordered, cleanly and monotonically, is DD and precision.** DD worsens
+−9.66% → −16.20% as the gate loosens; UP-precision falls 0.4674 → 0.4477. Neither
+zigzags. So the real trade is **PnL against drawdown**, and Sharpe is flat
+precisely *because* PnL and DD rise together.
+
+That also retires 1c's one surviving claim. **"0.46 sits past the peak" is now
+unsupported** — there is no Sharpe peak, and 0.46 posts the BEST DD (−9.66%) and
+the BEST precision of all six. What 0.46 costs is deployment: +907M against
++1.583B, i.e. **57% of the PnL**. Its live problem is gate starvation (serve p90
+0.423 < 0.46), which is drift against a frozen artifact, not a bad level.
+
+**Still UNFIT under parity.** GOLDEN teardown, best seed 45: Sharpe +0.535, DD
+−12.54%, +18.26% over 922 days — **DSR p=0.1743 (FAIL <0.95), PBO 85.0% (FAIL
+>10%)**. Serve-parity does not rescue the statistical gates, exactly as the 24-07
+DSR diagnostic predicted (the failure is ROBUST, not borderline). Paper-only
+stands.
+
+### 1c-quater. UNGUARDED: GOLDEN selection has no drawdown constraint
+
+`run_backtest.py` picks GOLDEN as **max mean OOS Net PnL**, with no DD term. On
+this run that chose 0.43 at mean DD **−13.88%**, already outside the ~−13% comfort
+band used everywhere else in this repo. And 0.42 was **1.8% behind on PnL**
+(+1.554B vs +1.583B) — inside noise — at mean DD −14.83%.
+
+Because Sharpe carries no signal here, selecting on PnL is selecting the loosest
+gate that wins a coin flip, and PnL and DD rise together — so the objective
+**systematically pushes toward maximum drawdown**. A different seed draw picks
+0.42 or 0.41 (−16.20%).
+
+The promote-gate cannot catch this: `max_abs_dd_pp` is **25%**, deliberately loose
+so it only blocks runaways (tightening it to the band would re-create the
+deadlock it was just repaired from). The fix belongs in SELECTION, not promotion —
+max mean NetPnL **subject to** a mean-DD budget. Not implemented; it changes what
+the unattended Saturday run optimises, so it needs an explicit decision.
 
 ### 1d. Two things that looked like divergences but are not
 
@@ -131,14 +185,33 @@ If it promotes, gate starvation (serve p90 0.423 vs τ 0.46) and the threshold
 conflation resolve together. **Check the log and `metadata.sweep_conditions` of
 the new artifact.**
 
-**Judge it on the right thing.** Per 1c-bis, the 4-seed Sharpe spread at a *single*
-threshold (0.21→0.51) is ~5× the gap between adjacent thresholds, so **which** level
-inside 0.41–0.44 wins is noise. The result that matters is only whether the picked
-level is **below 0.45** — i.e. off the starved side of the curve — and whether the
-gate lets it promote at all. Do not read the winning `up_threshold` as a tuned
-optimum, and do not re-run the sweep hoping for a "better" level: that is the
-threshold-mining the DSR penalty exists to catch, and the sweep is already the
-`n_trials` count feeding it.
+**Most of this is now KNOWN, not awaited** — the identical run was done dry on
+12-08 (1c-ter). Expect `up_threshold=0.43`, mean DD −13.88%, DSR/PBO still failing.
+Two things remain genuinely unknown: the retrain refits the models first (these
+numbers came off the existing checkpoint), and MR-LGBM/T+5 run their own passes.
+
+**Judge it on the right thing.** Per 1c-ter the threshold does not move Sharpe at
+all across 0.41–0.46, so **which** level wins is noise and the winning
+`up_threshold` is NOT a tuned optimum. Check instead:
+- did it **promote** (see below — the pre-12-08 gate would have rejected it), and
+- is the picked level's **mean DD** inside the ~−13% band (1c-quater: the selection
+  rule has no DD constraint and 0.43 already sits at −13.88%).
+
+Do not re-run the sweep hoping for a "better" level: that is the threshold-mining
+the DSR penalty exists to catch, and the sweep is already the `n_trials` count
+feeding it.
+
+**The promote-gate needed repairing for this run to land at all.** Replayed against
+the real dry-sweep numbers (`scripts/replay_promote_gate_from_sweep_log.py`):
+
+```
+GOLDEN thr 0.43   best seed 45   Sharpe +0.540
+OLD gate: REJECT   (needs >= +0.545, has +0.540 — short by 0.005)
+NEW gate: PROMOTE  (relative check skipped, incumbent unstamped)
+```
+
+Confirmed on two independent runs (the 2-arm smoke missed by 0.015, the full grid
+by 0.005). Without `11adbad` Saturday was a fifth consecutive rejection.
 
 Runtime note, so nothing looks broken: the **first** threshold in a sweep costs
 ~30 min and every one after costs ~90 s. Per-seed inference caches are populated on
