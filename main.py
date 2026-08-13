@@ -94,6 +94,35 @@ MARKET_CLOSE = dt_time(15, 0)
 
 _VN_PRICE_SCALE_THRESHOLD = 1_000.0  # VN stocks quoted in thousands; raw < 1000 → multiply by 1000
 
+# How many NEW names a single dispatch may open. Raised 3 → 5 on 13-08-26 to match
+# the engine's validated `max_positions=5`; it was a bare `[:3]` literal before.
+#
+# THIS IS NOT A LEVERAGE CHANGE. The tranche cohort weight is
+# `min(1/(hold_days × n_picks), 0.20)` (see `_tranche_signal_fields`), so the daily
+# budget NAV/hold_days is SPLIT across whatever picks exist: 3 picks → 1.111% each,
+# 5 picks → 0.667% each, and 3.33% NAV/day deployed either way. Going to 5 spreads
+# the same money over more names, which lowers single-name concentration.
+#
+# Why it matters now: top-3-vs-top-5 was measured VACUOUS earlier, because under
+# τ=0.46 the admitted set never reached 3 names anyway. That finding carried the
+# condition "this changes if the gate is ever loosened" — and the 13-08 retrain
+# loosened it (τ 0.46 → 0.43 took scores clearing the gate from 1.1% to 5.5%), so
+# the slice can now actually bind.
+#
+# No extra Gemini cost: arbitration runs on the pool BEFORE this slice.
+_MAX_NEW_POSITIONS_PER_DAY = 5
+
+# Survivor-pool size sent to the arbitrator. Was a local constant inside
+# `_select_candidates`; promoted to module level 13-08-26 so the invariant below
+# lives next to the value it constrains instead of two screens apart.
+_ARBITRATOR_POOL_SIZE = 6
+
+# Mirrors the engine's `admission_pool_cap` (6) ≥ `max_positions` (5): the pool
+# must be able to supply a full dispatch, or the slice silently starves and the
+# measured "admission_mode is vacuous" result stops holding.
+assert _ARBITRATOR_POOL_SIZE >= _MAX_NEW_POSITIONS_PER_DAY, (
+    "arbitrator pool must be able to fill a full dispatch")
+
 
 def _get_live_exec_prices(latest_df: Any, tickers: list[str]) -> dict[str, float]:
     """
@@ -1030,7 +1059,7 @@ def _select_candidates(
 
     Returns (candidate_tickers, universe_tickers, fallback_mode, fallback_reasons).
     """
-    _ARBITRATOR_POOL = 6
+    _ARBITRATOR_POOL = _ARBITRATOR_POOL_SIZE   # module-level since 13-08-26
 
     liquid_tickers: set[str] = {
         str(t) for t in predictions if str(t).upper() in vn30_universe
@@ -1517,7 +1546,7 @@ def daily_inference(
             float(stacking_predictions_5d.get(t, [0, 0, 0])[2]),          # secondary ↓ desc
         ),
         reverse=True,
-    )[:3]
+    )[:_MAX_NEW_POSITIONS_PER_DAY]
 
     # Log full ranking for auditability
     _rank_str = " | ".join(
@@ -1532,8 +1561,10 @@ def daily_inference(
             reverse=True,
         )
     )
-    LOGGER.info("[Brain] Sentiment-ranked pool (Top6): %s", _rank_str)
-    LOGGER.info("[Brain] Top-3 Buy Signals after sentiment filter: %s", top_buy_signals)
+    LOGGER.info("[Brain] Sentiment-ranked pool (Top%d): %s",
+                _ARBITRATOR_POOL_SIZE, _rank_str)
+    LOGGER.info("[Brain] Top-%d Buy Signals after sentiment filter: %s",
+                _MAX_NEW_POSITIONS_PER_DAY, top_buy_signals)
 
     top_buy_signals, event_overrides = _rescue_loop(
         fallback_mode,
