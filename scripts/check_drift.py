@@ -31,14 +31,66 @@ import polars as pl  # noqa: E402
 REF_PUP = {"p10": 0.321, "median": 0.408, "p90": 0.463}
 # Train-period true-UP base rate (T+20 labels, same teardown).
 REF_UP_BASE_RATE = 0.415
-# The T+20 GOLDEN gate. The strategy admits on an ABSOLUTE threshold, so the
-# statistic that decides whether it ever fires is the UPPER TAIL, not the
-# median — a distribution can hold its centre while its p90 sinks below tau,
-# which shuts the gate with no median drift to warn about. Observed 10-08-26:
-# median shift only -0.015 ("OK") while p90 fell 0.463 -> 0.423, i.e. below tau.
-REF_TAU_T20 = 0.46
+# Fallback ONLY. The strategy admits on an ABSOLUTE threshold, so the statistic
+# that decides whether it ever fires is the UPPER TAIL, not the median — a
+# distribution can hold its centre while its p90 sinks below tau, which shuts the
+# gate with no median drift to warn about. Observed 10-08-26: median shift only
+# -0.015 ("OK") while p90 fell 0.463 -> 0.423, i.e. below tau.
+_FALLBACK_TAU_T20 = 0.46
 DB = REPO / "data" / "quant_v6_core.duckdb"
 DATA = REPO / "data"
+
+
+def live_tau_t20() -> tuple[float, str]:
+    """Read the T+20 gate from the LIVE artifact. Never pin it.
+
+    This was a hardcoded `REF_TAU_T20 = 0.46` until 13-08-26, and it silently went
+    wrong the moment an artifact was promoted: the 13-08 retrain moved the gate to
+    0.43, and the monitor kept reporting "GATE STARVED ... below tau=0.46" against
+    a threshold that no longer existed.
+
+    The distinction that was missed: `REF_PUP` genuinely IS a frozen reference —
+    you compare today's serve scores against the distribution the model was
+    validated on, and you re-pin it after a retrain. `tau` is NOT a reference. It
+    is the operative gate, it lives in the artifact, and pinning it makes the
+    monitor describe a system that is not deployed.
+    """
+    try:
+        import joblib  # noqa: PLC0415
+
+        b = joblib.load(DATA.parent / "models" / "saved" / "v3_ensemble_20d.joblib")
+        tau = float(b["up_threshold"])
+        stamped = (b.get("metadata") or {}).get("trained_at") or "?"
+        return tau, f"live artifact (trained_at={stamped})"
+    except Exception as exc:  # noqa: BLE001 — a monitor must not die on a bad read
+        return _FALLBACK_TAU_T20, f"FALLBACK {_FALLBACK_TAU_T20:.2f} (artifact unreadable: {exc})"
+
+
+def _warn_if_scores_predate_artifact(days: int) -> None:
+    """Flag the window where a fresh gate is being judged by the old model's scores.
+
+    The paperlog is written by the daily cron using whatever artifact was live that
+    day. Right after a promotion the whole window predates the new model, so both
+    the p90 and the %-above-tau describe the OUTGOING model. Without this note the
+    output reads as a current verdict on the new gate.
+    """
+    try:
+        import joblib  # noqa: PLC0415
+        from datetime import datetime as _dt  # noqa: PLC0415
+
+        b = joblib.load(DATA.parent / "models" / "saved" / "v3_ensemble_20d.joblib")
+        raw = str(b.get("trained_at") or (b.get("metadata") or {}).get("trained_at") or "")
+        if not raw:
+            return
+        trained = _dt.fromisoformat(raw.replace("Z", "+00:00")).date()
+        age_days = (date.today() - trained).days
+        if age_days < days:
+            print(f"  ⚠️  ARTIFACT IS {age_days}d OLD but this window is {days}d — "
+                  f"the paperlog rows above were scored by the PREVIOUS model, so "
+                  f"the tail-vs-gate verdict describes the OUTGOING gate, not the "
+                  f"new one. Re-run after ~{days - age_days} more daily crons.")
+    except Exception:  # noqa: BLE001 — advisory only
+        return
 
 
 def prediction_drift(days: int) -> None:
@@ -76,12 +128,13 @@ def prediction_drift(days: int) -> None:
 
     # Tail-vs-gate check. This is the one that actually predicts whether the
     # strategy can trade at all, and it is independent of the median.
+    tau, tau_src = live_tau_t20()
     tail_shift = p90 - REF_PUP["p90"]
-    pct_above = float((p >= REF_TAU_T20).mean()) * 100.0
+    pct_above = float((p >= tau).mean()) * 100.0
     print(f"  p90 shift {tail_shift:+.3f}  |  {pct_above:.1f}% of scores reach "
-          f"tau={REF_TAU_T20:.2f}")
-    if p90 < REF_TAU_T20:
-        print(f"  🔴 GATE STARVED: p90={p90:.3f} is BELOW tau={REF_TAU_T20:.2f} — "
+          f"tau={tau:.2f}  [{tau_src}]")
+    if p90 < tau:
+        print(f"  🔴 GATE STARVED: p90={p90:.3f} is BELOW tau={tau:.2f} — "
               f"the top decile of the model's own output no longer clears its "
               f"gate, so the book stays empty regardless of signal quality. "
               f"Recalibrate tau on the TRADEABLE universe, or widen the "
@@ -89,6 +142,12 @@ def prediction_drift(days: int) -> None:
     elif pct_above < 2.0:
         print(f"  ⚠️  gate rarely reachable ({pct_above:.1f}% of scores) — "
               f"expect very few dispatches; too few bets to evaluate.")
+
+    # AFTER A RETRAIN this comparison is stale in a second, subtler way: the
+    # paperlog rows above were scored by the PREVIOUS model, so a new tau is being
+    # judged against an old score distribution. Say so rather than let the verdict
+    # read as current.
+    _warn_if_scores_predate_artifact(days)
 
 
 def label_base_rate(days: int) -> None:
