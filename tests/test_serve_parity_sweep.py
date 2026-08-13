@@ -29,10 +29,25 @@ def _cli(*argv: str):
 
 
 # Positional layout of _cli()'s return tuple, from the tail.
-_GATE_OFF, _SEC_CAP, _DEDUP, _HYST, _BRAKE = -5, -4, -3, -2, -1
+#
+# FRAGILE BY NATURE: `_cli` returns a bare 24-tuple, so appending a value shifts
+# every tail-relative index. That happened on 12-08-26 when the GOLDEN drawdown
+# budget was appended — these indices silently slid by one and produced garbage
+# comparisons (`assert True == 3`) instead of a clear failure.
+# `test_tuple_length_is_pinned` below is the tripwire: it fails FIRST and says
+# what to do, so the next person adding a return value fixes the offsets instead
+# of debugging nonsense assertions.
+_GATE_OFF, _SEC_CAP, _DEDUP, _HYST, _BRAKE, _DD_BUDGET = -6, -5, -4, -3, -2, -1
+_CLI_TUPLE_LEN = 24
 
 
 class TestServeParityShorthand:
+    def test_tuple_length_is_pinned(self):
+        assert len(_cli()) == _CLI_TUPLE_LEN, (
+            "run_backtest._cli() changed arity — the tail-relative indices in "
+            "this file (_GATE_OFF.._DD_BUDGET) must be re-based, and "
+            "_CLI_TUPLE_LEN bumped, before the assertions below mean anything.")
+
     def test_defaults_are_legacy(self):
         out = _cli()
         assert out[_GATE_OFF] == pytest.approx(-0.05)   # the historical offset
@@ -65,6 +80,23 @@ class TestServeParityShorthand:
         out = _cli("--serve-exposure-brake", "--serve-cohort-dedup")
         assert out[_BRAKE] is True and out[_DEDUP] is True
         assert out[_GATE_OFF] == pytest.approx(-0.05)   # untouched
+
+
+class TestGoldenDrawdownBudgetCli:
+    """The budget must reach `main`, and an explicit 0 must mean "no budget"."""
+
+    def test_default_comes_from_config(self):
+        from config.settings import CONFIG
+        assert _cli()[_DD_BUDGET] == pytest.approx(
+            float(CONFIG.trading.golden_max_mean_dd_pp))
+
+    def test_explicit_value_overrides_config(self):
+        assert _cli("--golden-max-mean-dd-pp", "11.5")[_DD_BUDGET] == pytest.approx(11.5)
+
+    def test_zero_disables_the_budget(self):
+        # 0.0 is falsy, and `_select_golden(rows, 0.0)` would mean "0% drawdown
+        # allowed" — excluding every arm. `_cli` must hand `main` None instead.
+        assert _cli("--golden-max-mean-dd-pp", "0")[_DD_BUDGET] is None
 
 
 class TestGateOffsetSemantics:

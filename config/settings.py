@@ -157,6 +157,24 @@ class TradingConfig:
     promote_gate_max_window_skew_days: float = 21.0
     promote_gate_min_abs_sharpe: float = 0.30
     promote_gate_max_abs_dd_pp: float = 25.0
+    # GOLDEN-selection drawdown budget (12-08-26). run_backtest picks GOLDEN as
+    # max mean OOS Net PnL; the full serve-parity sweep showed the threshold does
+    # NOT move Sharpe (all six levels span 0.056 while ONE level's 4-seed spread
+    # is 0.30) while mean DD IS monotone in the gate (-9.66% at 0.46 to -16.20%
+    # at 0.41). So an unconstrained max-PnL objective systematically walks toward
+    # maximum drawdown, and the 0.42-vs-0.43 PnL gap (1.8%) is inside seed noise —
+    # a different seed draw picks -14.83% on an unattended Saturday run.
+    #
+    # 14.0 admits the 0.43 arm the 12-08 dry sweep chose (mean DD -13.88%) and
+    # blocks 0.42/0.41, so it caps the tail without changing today's answer.
+    # Budgeted on MEAN DD across seeds, not the best seed's (the artifact stores
+    # the best seed's -12.54%, but the mean is the expected case).
+    #
+    # This is deliberately NOT the promote-gate's job: promote_gate_max_abs_dd_pp
+    # stays loose at 25% so it only blocks runaways — tightening it to the band
+    # would re-create the deadlock it was just repaired from. Set 0.0 to disable
+    # and restore plain max-PnL selection.
+    golden_max_mean_dd_pp: float = 14.0
     # Prob-scaled tranche cohort weights (plan prob-scaled-tranche-weights_PLAN_20-07-26):
     # scale within-cohort dispatch weights by normalized edge over the serve
     # signal gate (src/trading/cohort_weights.py, capped 2× equal weight).

@@ -17,7 +17,9 @@ Pipeline
                                           list  →  train/serve parity by replay
     3. Threshold sweep                    (WalkForwardEngine, VN50 gate
                                            liquid_top_n=50) over up_threshold grid
-    4. GOLDEN config                      (max mean OOS Net PnL across seeds)
+    4. GOLDEN config                      (max mean OOS Net PnL across seeds,
+                                           SUBJECT TO the mean-drawdown budget
+                                           CONFIG.trading.golden_max_mean_dd_pp)
     5. Signal evaluation                  (OOS UP-precision, pre-PnL)
     6. Persist the live-bot payload       → models/saved/v3_ensemble_{H}d.joblib
     7. Deflated Sharpe + PBO (CSCV)       on the GOLDEN's per-seed equity curves
@@ -392,7 +394,8 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
          serve_sector_cap: int = 0,
          serve_cohort_dedup: bool = False,
          serve_hysteresis_days: int = 0,
-         serve_exposure_brake: bool = False) -> None:
+         serve_exposure_brake: bool = False,
+         golden_max_mean_dd_pp: float | None = None) -> None:
     configure_logging()
     t_start = time.perf_counter()
     sweep_thresholds = list(sweep_thresholds or DEFAULT_SWEEP_THRESHOLDS)
@@ -577,8 +580,8 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, *,
         LOGGER.error("Sweep produced no successful results — aborting teardown.")
         return
 
-    # ── 4. GOLDEN CONFIG — threshold that maximises mean OOS Net PnL ─────────
-    golden = max(sweep_results, key=lambda r: r["mean_net_pnl"])
+    # ── 4. GOLDEN CONFIG — max mean OOS Net PnL WITHIN the drawdown budget ───
+    golden = _select_golden(sweep_results, max_mean_dd_pp=golden_max_mean_dd_pp)
     best_seed_record = max(golden["per_seed"], key=lambda p: p["net_sharpe"])
 
     # ── 5. Full verbose signal-eval JUST for the GOLDEN ──────────────────────
@@ -649,6 +652,78 @@ def _vintage_days_apart(new_meta: dict, old_meta: dict) -> int | None:
     except (TypeError, ValueError):
         return None
     return abs((da - db).days)
+
+
+def _select_golden(sweep_results: list[dict],
+                   max_mean_dd_pp: float | None) -> dict:
+    """GOLDEN = max mean OOS Net PnL, subject to a mean-drawdown budget.
+
+    WHY THE BUDGET EXISTS (12-08-26)
+    ────────────────────────────────
+    Selection used to be plain `max(mean_net_pnl)` with no risk term. The full
+    6-level serve-parity sweep showed why that is unsafe for an unattended weekly
+    retrain: **the threshold does not move Sharpe at all** (all six levels span
+    0.056, while ONE level's 4-seed spread is 0.30 — the whole curve fits inside
+    one level's noise), while mean DD is cleanly monotone in the gate:
+
+        0.46  -9.66%  +907M      0.43 -13.88% +1.583B  <- picked
+        0.45 -12.20% +1.218B     0.42 -14.83% +1.554B  (1.8% behind on PnL)
+        0.44 -13.17% +1.252B     0.41 -16.20% +1.453B
+
+    With Sharpe carrying no signal and PnL/DD rising together, maximising PnL
+    systematically walks toward maximum drawdown, and the 0.42/0.43 PnL gap (1.8%)
+    is well inside seed noise — so a different seed draw picks -14.83% or -16.20%
+    on a run nobody is watching. The promote-gate cannot backstop this:
+    `max_abs_dd_pp` is 25%, deliberately loose so it only blocks runaways
+    (tightening it to the band would re-create the deadlock it was just repaired
+    from). The constraint belongs here, in SELECTION.
+
+    Budgeted on **mean** DD across seeds, not the best seed's: the artifact stores
+    the best seed's figure (-12.54% on the run above) but the mean (-13.88%) is
+    the expected case, and budgeting on the lucky seed would defeat the point.
+
+    `None` disables the budget (restores plain max-PnL). If NO arm fits, the
+    lowest-mean-DD arm wins rather than aborting — a retrain must still produce a
+    candidate, and least-drawdown is the safe direction to fail in.
+    """
+    if max_mean_dd_pp is None:
+        return max(sweep_results, key=lambda r: r["mean_net_pnl"])
+
+    limit = abs(float(max_mean_dd_pp)) / 100.0
+    eligible = [r for r in sweep_results if abs(float(r["mean_dd"])) <= limit]
+    if not eligible:
+        fallback = min(sweep_results, key=lambda r: abs(float(r["mean_dd"])))
+        LOGGER.warning(
+            "GOLDEN drawdown budget %.1f%% excluded EVERY arm (best mean DD "
+            "%.2f%% at thr=%.2f) — falling back to the lowest-drawdown arm. "
+            "Either the budget is too tight or every level is now too risky.",
+            abs(float(max_mean_dd_pp)), abs(float(fallback["mean_dd"])) * 100.0,
+            fallback["up_threshold"])
+        return fallback
+
+    golden = max(eligible, key=lambda r: r["mean_net_pnl"])
+    excluded = [r for r in sweep_results if r not in eligible]
+    if excluded:
+        LOGGER.info(
+            "GOLDEN drawdown budget %.1f%% excluded %d arm(s): %s",
+            abs(float(max_mean_dd_pp)), len(excluded),
+            ", ".join(f"thr={r['up_threshold']:.2f} (mean DD "
+                      f"{abs(float(r['mean_dd'])) * 100:.2f}%, "
+                      f"PnL {r['mean_net_pnl']:+,.0f})" for r in excluded))
+        best_unconstrained = max(sweep_results, key=lambda r: r["mean_net_pnl"])
+        if best_unconstrained is not golden:
+            # `%`-formatting has no thousands flag (`%+,.0f` raises
+            # ValueError: unsupported format character ','), so pre-format.
+            LOGGER.warning(
+                "GOLDEN drawdown budget BINDING: thr=%.2f (mean DD %.2f%%, PnL "
+                "%s) would have won on PnL alone; picked thr=%.2f (mean DD "
+                "%.2f%%, PnL %s) instead.",
+                best_unconstrained["up_threshold"],
+                abs(float(best_unconstrained["mean_dd"])) * 100.0,
+                f"{best_unconstrained['mean_net_pnl']:+,.0f}",
+                golden["up_threshold"], abs(float(golden["mean_dd"])) * 100.0,
+                f"{golden['mean_net_pnl']:+,.0f}")
+    return golden
 
 
 # Which `sweep_conditions` entries make two stored Sharpes comparable.
@@ -1177,8 +1252,7 @@ def _export_only(cfg: RunConfig, tabular_features: list[str],
     LOGGER.info("=" * 100)
 
 
-def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
-                    float | None, bool, bool, str, float, int]:
+def _cli() -> tuple:   # 24 positional values — enumerating them was already wrong
     p = argparse.ArgumentParser(
         description="V4.0 Fast Evaluator — sweep + DSR/PBO on a frozen training checkpoint.")
     p.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH,
@@ -1266,6 +1340,13 @@ def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
     p.add_argument("--cscv-s", type=int, default=None)
     p.add_argument("--sweep-thresholds", type=str, default=None,
                    help="comma list of up_thresholds, e.g. '0.55,0.50,0.45,0.40'")
+    p.add_argument("--golden-max-mean-dd-pp", type=float, default=None,
+                   help="cap on the GOLDEN arm's MEAN OOS drawdown, in percent "
+                        "(default: CONFIG.trading.golden_max_mean_dd_pp = 14.0; "
+                        "pass 0 to disable and restore plain max-PnL selection). "
+                        "Needed because the threshold does NOT move Sharpe while "
+                        "mean DD is monotone in the gate, so an unconstrained "
+                        "max-PnL objective walks toward maximum drawdown")
     p.add_argument("--no-save", action="store_true",
                    help="skip persisting the live-bot payload (pure iteration)")
     p.add_argument("--export-only", "--skip-backtest", action="store_true", dest="export_only",
@@ -1297,13 +1378,19 @@ def _cli() -> tuple[Path, dict, list[float], bool, bool, str, int, float | None,
             a.serve_hysteresis_days = 2
         a.serve_cohort_dedup = True
         a.serve_exposure_brake = True
+    # DD budget: CLI wins, else CONFIG, and an explicit 0 means "no budget".
+    if a.golden_max_mean_dd_pp is None:
+        from config.settings import CONFIG  # noqa: PLC0415 — CLI-first script
+        a.golden_max_mean_dd_pp = float(
+            getattr(CONFIG.trading, "golden_max_mean_dd_pp", 14.0))
+    dd_budget = a.golden_max_mean_dd_pp or None
     return (a.checkpoint, overrides, sweep, (not a.no_save), a.export_only,
             a.mode, a.hold_days, a.tranche_pt, a.tranche_sl, a.regime_sizing,
             a.nav_tier_cap, a.admission_mode, a.admission_floor,
             a.admission_pool_cap, a.prob_weights, a.rank_breadth_trigger,
             a.rank_breadth_floor_level, a.rank_breadth_floor,
             a.gate_offset, a.serve_sector_cap, a.serve_cohort_dedup,
-            a.serve_hysteresis_days, a.serve_exposure_brake)
+            a.serve_hysteresis_days, a.serve_exposure_brake, dd_budget)
 
 
 if __name__ == "__main__":
@@ -1311,7 +1398,7 @@ if __name__ == "__main__":
      _mode, _hold, _pt, _sl, _regime, _tier_cap,
      _adm_mode, _adm_floor, _adm_cap, _prob_w,
      _rb_trigger, _rb_floor_level, _rb_floor,
-     _gate_off, _sec_cap, _dedup, _hyst, _brake) = _cli()
+     _gate_off, _sec_cap, _dedup, _hyst, _brake, _dd_budget) = _cli()
     main(_ckpt, eval_overrides=_overrides, sweep_thresholds=_sweep,
          save_bot_payload=_save, export_only=_export, mode=_mode, hold_days=_hold,
          pt_sigma=_pt, sl_sigma=_sl, use_regime_sizing=_regime,
@@ -1321,4 +1408,4 @@ if __name__ == "__main__":
          rank_breadth_floor_level=_rb_floor_level, rank_breadth_floor=_rb_floor,
          gate_offset=_gate_off, serve_sector_cap=_sec_cap,
          serve_cohort_dedup=_dedup, serve_hysteresis_days=_hyst,
-         serve_exposure_brake=_brake)
+         serve_exposure_brake=_brake, golden_max_mean_dd_pp=_dd_budget)

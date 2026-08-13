@@ -32,6 +32,15 @@ function Step($name, $argLine) {
 # winner cheaper than it looks. The 12-08 sweep showed the useful region sits
 # below serve's 0.46, which is why the grid is centred there rather than
 # reaching up to 0.50.
+#
+# GOLDEN selection is capped by CONFIG.trading.golden_max_mean_dd_pp (14.0), read
+# automatically — no flag needed here. It exists because the 12-08 full sweep
+# found the threshold does NOT move Sharpe (all six levels span 0.056 while ONE
+# level's 4-seed spread is 0.30) while mean DD IS monotone in the gate, so an
+# unconstrained max-PnL objective walks toward maximum drawdown on a run nobody
+# is watching. 14.0 admits the 0.43 arm the dry sweep chose (-13.88%) and blocks
+# 0.42 (-14.83%) / 0.41 (-16.20%). Watch the log for
+# `GOLDEN drawdown budget BINDING` — that means PnL wanted a deeper arm.
 $sweep = "0.46,0.45,0.44,0.43,0.42,0.41"
 $btArgs = "--mode tranche --hold-days 30 --serve-parity --sweep-thresholds $sweep"
 
