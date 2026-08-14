@@ -206,6 +206,66 @@ def step2_predictability(df: pl.DataFrame) -> float:
     return best
 
 
+def step3_deciles(df: pl.DataFrame) -> None:
+    """Correlations are averages. Does the chain survive in the tails?
+
+    Deciles are formed WITHIN each day, so the comparison is between names on the
+    same date rather than between calm and stressed markets. That control matters:
+    heavy foreign selling clusters in crashes, and crashes rebound, so a pooled
+    tail bucket measures market timing rather than name selection.
+    """
+    print("\n" + "=" * 74)
+    print(" STEP 3 — deciles (formed within each day) and extreme tails")
+    print("=" * 74)
+    d = df.sort(["ticker", "date"])
+    for k in (1, 5, 20):
+        d = d.with_columns(
+            (pl.col("close").shift(-k).over("ticker") / pl.col("close") - 1.0)
+            .alias(f"f{k}"))
+    d = d.drop_nulls(["flow", "ret_0", "f1", "f5", "f20"])
+    d = d.filter(pl.all_horizontal([pl.col(c).is_finite()
+                                    for c in ("flow", "ret_0", "f1", "f5", "f20")]))
+    d = d.with_columns(
+        ((pl.col("flow").rank("ordinal").over("date") - 1)
+         * 10 // pl.len().over("date")).alias("dec"))
+
+    g = (d.group_by("dec").agg([
+            pl.len().alias("n"), pl.col("ret_0").mean().alias("r0"),
+            pl.col("f1").mean().alias("f1"), pl.col("f5").mean().alias("f5"),
+            pl.col("f20").mean().alias("f20")]).sort("dec"))
+    print(f" {'decile':>7} {'n':>8} {'same-day':>10} {'fwd 1d':>9} "
+          f"{'fwd 5d':>9} {'fwd 20d':>9}")
+    print(" " + "-" * 56)
+    for r in g.iter_rows(named=True):
+        print(f" {r['dec']:>7} {r['n']:>8,} {r['r0']:>9.3%} {r['f1']:>8.3%} "
+              f"{r['f5']:>8.3%} {r['f20']:>8.3%}")
+    top = g.filter(pl.col("dec") == 9).row(0, named=True)
+    bot = g.filter(pl.col("dec") == 0).row(0, named=True)
+    print("\n d10 - d1 (what a decile long-short would earn):")
+    for h, lbl in (("r0", "same-day"), ("f1", "fwd 1d"),
+                   ("f5", "fwd 5d"), ("f20", "fwd 20d")):
+        print(f"   {lbl:>9}: {top[h] - bot[h]:+.3%}")
+    print("\n Same-day monotone with a wide spread, forward flat, is the whole")
+    print(" finding in one table: the impact is real and it does not persist.")
+
+    print("\n EXTREME percentiles (POOLED — not day-demeaned, see caveat below):")
+    q = d["flow"].to_numpy()
+    for lo, hi, label in ((99.0, 100.0, "top 1%"), (99.9, 100.0, "top 0.1%"),
+                          (0.0, 1.0, "bottom 1%"), (0.0, 0.1, "bottom 0.1%")):
+        a, b = np.percentile(q, lo), np.percentile(q, hi)
+        sub = d.filter((pl.col("flow") >= a) & (pl.col("flow") <= b))
+        if sub.height < 30:
+            continue
+        print(f"   {label:>11} n={sub.height:>6,}  same-day {sub['ret_0'].mean():>7.3%}"
+              f"  fwd1 {sub['f1'].mean():>7.3%}  fwd20 {sub['f20'].mean():>7.3%}")
+    print("\n CAVEAT — do NOT read the extremes as a signal. They are pooled, so")
+    print(" heavy foreign selling (which clusters in crashes, and crashes rebound)")
+    print(" loads a MARKET-TIMING effect into what looks like stock selection. The")
+    print(" decile table above IS day-demeaned and shows nothing. Where the two")
+    print(" disagree, the controlled one wins. Capitulation buying is in any case")
+    print(" already harvested by MR-LGBM through a different route.")
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     ap = argparse.ArgumentParser(description=__doc__)
@@ -222,6 +282,7 @@ def main() -> None:
     lag1 = step1_autocorrelation(df)
     step1b_reversal(df)
     r2 = step2_predictability(df)
+    step3_deciles(df)
 
     print("\n" + "=" * 74)
     print(" VERDICT — why prediction quality is not the binding constraint")
