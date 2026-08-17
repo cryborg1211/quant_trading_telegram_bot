@@ -300,6 +300,36 @@ class TradingConfig:
     # Sentiment at or below this blocks a tau-clearing candidate in "veto" mode.
     # Mirrors EVENT_BEAR_SENTIMENT / make_final_decision's SAFETY OVERRIDE.
     arbitrator_entry_bear_veto: float = -0.50
+    # Declared corporate-action events (13-08-26). src/data/corporate_actions.py
+    # caches vnstock `Company.events()` for held tickers and lets the portfolio
+    # guard correct PnL/drawdown with the REAL declared ratio instead of only the
+    # self-referential price-gap estimate. Motivating incident: VHM's 100% stock
+    # dividend (exright 2026-08-06) made the guard alert a hard stop at PnL
+    # -52.92% / drawdown 53.07% when the true figures were -5.84% / 6.87% and
+    # NEITHER threshold was breached.
+    #
+    # Unlike the 17-07-26 self-referential adjustment (which added zero new I/O
+    # and deliberately shipped no kill-switch), this introduces a NEW external
+    # network dependency, so it gets one. False fully short-circuits BOTH the
+    # refresh and the consumption — the guard falls back to the existing
+    # gap-detection behaviour with no other change. Kill-switch: set
+    # "corporate_action_events_enabled": false in settings.json + restart.
+    corporate_action_events_enabled: bool = True
+    # Cache staleness. Events are declared well in advance (VHM: public_date
+    # 2026-07-24 vs exright_date 2026-08-06 = 13 days of notice), so a weekly
+    # refresh stays comfortably ahead of any ex-right date.
+    ca_event_refresh_days: int = 7
+    # Hard bound on network calls per EOD run. The scoped universe is only the
+    # tickers someone actually holds (non-cron portfolio + OPEN dispatched
+    # signals) — 2 today — but a cold cache must not turn the EOD run into a
+    # long throttled crawl.
+    ca_event_max_refresh_per_run: int = 20
+    # Max abs(observed_gap / declared_factor - 1) for the DECLARED ratio to be
+    # trusted over the observed one. 0.10 accepts every real matched case
+    # measured on 2026 data (median error ~3%) except AAN's -13.37%, which
+    # correctly falls back to the self-referential estimate. Same magnitude as
+    # price_lookup.has_ca_gap's own threshold, so the two stay conceptually paired.
+    ca_event_factor_tolerance: float = 0.10
 
 
 @dataclass

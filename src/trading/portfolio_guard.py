@@ -17,7 +17,31 @@ HARD CONTRACT (do not relax without returning to PLAN)
     position. The one I/O function (`load_guard_positions`) is READ-ONLY.
   • Gemini spend is bounded by the caller (`main._run_guard_for_users`): at most
     one arbitrator batch per EOD run, only when a trigger fired. This module
-    itself makes NO network / LLM call.
+    itself makes NO network / LLM call. THIS STILL HOLDS after the 13-08-26
+    corporate-action work: declared CA events are fetched and cached by
+    `src/data/corporate_actions.py` from `main.py`'s EOD path and handed to
+    `evaluate_position` as a plain parameter, exactly like `prediction_5d` /
+    `regime`. This module only ever consumes them through a PURE resolver.
+
+CORPORATE-ACTION CORRECTION (13-08-26)
+──────────────────────────────────────
+The 17-07-26 shield detected a corporate-action price gap and downgraded the
+hard-stop / trailing-stop WORDING, but never computed the corrected number, so
+the alert still fired. VHM's 100% stock dividend (exright 2026-08-06) therefore
+produced a live hard-stop + trailing-stop alert at PnL -52.92% / drawdown 53.07%
+when the true figures were -5.84% / 6.87% — below BOTH thresholds.
+
+`resolve_lot_prices` now fixes the INPUTS (entry basis and the whole pre-event
+close segment, so the trailing-stop peak is rebased too) and the five existing
+triggers then run unchanged against the corrected numbers. Nothing is
+"suppressed": a lot that is genuinely down past the stop AND paid a stock
+dividend still fires. Only the phantom disappears.
+
+The declared factor is used ONLY when three independent conditions agree (a
+declared priceable event, an observed price gap, and factor agreement within
+tolerance) and no unpriceable rights issue sits in the window — see
+`corporate_actions.resolve_adjustment`'s tier A. Every other case falls back to
+the pre-existing behaviour.
 
 PURITY LAYERING (mirrors intraday_scanner.py / regime_policy.py precedent)
 ─────────────────────────────────────────────────────────────────────────
@@ -49,7 +73,7 @@ from datetime import date
 import duckdb
 
 from config.settings import CONFIG
-from src.data import price_lookup
+from src.data import corporate_actions, price_lookup
 from src.features.market_regime import regime_label_vi
 from src.reports.builders import _MR_SELL_VETO
 from src.trading.portfolio_manager import CRON_USER_ID
@@ -135,6 +159,87 @@ def _argmax_is_sell(prediction: list[float] | None) -> bool:
     return max(range(3), key=lambda i: vals[i]) == 0
 
 
+def resolve_lot_prices(
+    position: dict,
+    closes_since_entry_abs: list[float],
+    ca_events: list[dict] | None = None,
+    *,
+    factor_tolerance: float | None = None,
+) -> dict:
+    """Corporate-action-aware price basis for ONE lot (pure).
+
+    Single source of truth for a lot's entry basis, peak, PnL and drawdown, so
+    the trigger logic and the card's own header line can never disagree about
+    what the position is worth.
+
+    Args:
+        position: the lot dict; reads `entry_price_raw` (falls back to `price`).
+        closes_since_entry_abs: ordered daily closes in ABSOLUTE VND from entry
+            through today.
+        ca_events: declared events for this ticker inside the holding window
+            (from `corporate_actions.load_events`). `None`/`[]` ⇒ the resolver
+            can only reach tiers B/C, i.e. exactly the pre-13-08-26 behaviour.
+        factor_tolerance: overrides `CONFIG.trading.ca_event_factor_tolerance`.
+
+    Returns `{"valid", "entry_effective", "closes_effective", "today_close",
+    "peak", "pnl_pct", "drawdown_pct", "ca_tier", "ca_factor", "ca_label_vi",
+    "ca_adjusted"}`. `valid` is False (and every number 0.0) when the close
+    series is empty or the normalized entry price is non-positive — the same
+    two "insufficient data" conditions `evaluate_position` already short-circuits
+    on.
+
+    ONLY tier A ("declared, confident") rebases anything. Tier D — a declared
+    event with NO observed gap — deliberately changes nothing, because the
+    parquet is sometimes ALREADY back-adjusted and adjusting again would corrupt
+    it (see `corporate_actions`' module docstring).
+    """
+    empty = {
+        "valid": False, "entry_effective": 0.0, "closes_effective": [],
+        "today_close": 0.0, "peak": 0.0, "pnl_pct": 0.0, "drawdown_pct": 0.0,
+        "ca_tier": "C", "ca_factor": 1.0, "ca_label_vi": None, "ca_adjusted": False,
+    }
+    if not closes_since_entry_abs:
+        return dict(empty)
+    entry_abs = normalize_entry_price_vnd(
+        position.get("entry_price_raw", position.get("price"))
+    )
+    if entry_abs <= 0.0:
+        return dict(empty)
+
+    closes = [float(c) for c in closes_since_entry_abs]
+    tol = (CONFIG.trading.ca_event_factor_tolerance
+           if factor_tolerance is None else factor_tolerance)
+    adj = corporate_actions.resolve_adjustment(
+        closes, list(ca_events or []), factor_tolerance=tol
+    )
+
+    ca_adjusted = adj["tier"] == "A"
+    if ca_adjusted:
+        closes_eff = corporate_actions.back_adjust_closes(closes, adj["gap_factors"])
+        entry_eff = entry_abs * float(adj["factor"])
+        # Defensive: a corrupted factor must never produce a zero/negative basis.
+        if entry_eff <= 0.0:
+            closes_eff, entry_eff, ca_adjusted = closes, entry_abs, False
+    else:
+        closes_eff, entry_eff = closes, entry_abs
+
+    today_close = closes_eff[-1]
+    peak = max(closes_eff)
+    return {
+        "valid": True,
+        "entry_effective": entry_eff,
+        "closes_effective": closes_eff,
+        "today_close": today_close,
+        "peak": peak,
+        "pnl_pct": (today_close - entry_eff) / entry_eff,
+        "drawdown_pct": (peak - today_close) / peak if peak > 0.0 else 0.0,
+        "ca_tier": adj["tier"],
+        "ca_factor": float(adj["factor"]),
+        "ca_label_vi": adj["label_vi"] if ca_adjusted else None,
+        "ca_adjusted": ca_adjusted,
+    }
+
+
 def evaluate_position(
     position: dict,
     closes_since_entry_abs: list[float],
@@ -145,6 +250,7 @@ def evaluate_position(
     stop_loss_pct: float,
     take_profit_pct: float,
     trailing_pct: float,
+    ca_events: list[dict] | None = None,
 ) -> list[dict]:
     """Evaluate the five Stage-1 triggers for ONE lot (pure).
 
@@ -158,28 +264,46 @@ def evaluate_position(
         regime: latest cached `market_regime` int (0-7) for this ticker, or None.
         stop_loss_pct / take_profit_pct / trailing_pct: ratios (e.g. -0.07 /
             0.15 / 0.08); rendered as percentages in the message copy.
+        ca_events: declared corporate-action events for this ticker inside the
+            holding window (from `corporate_actions.load_events`). Defaults to
+            `None`, which reproduces the pre-13-08-26 behaviour EXACTLY — every
+            existing call site and test is therefore unaffected.
 
-    Returns a list of `{"kind", "message_vi", "ca_gap_downgraded"}` dicts in the
-    fixed order hard_stop, take_profit, trailing_stop, model_flip, regime_warning.
-    Degrades to `[]` immediately when the close series is empty or the normalized
-    entry price is non-positive. The corporate-action shield downgrades ONLY the
-    hard-stop and trailing-stop wording (take-profit shares the pnl exposure but
-    is left confident, exactly as approved); a downgraded trigger STILL fires
-    (event-only gating + Stage-2 eligibility unchanged).
+    Returns a list of `{"kind", "message_vi", "ca_gap_downgraded", "ca_adjusted",
+    "ca_label_vi"}` dicts in the fixed order hard_stop, take_profit,
+    trailing_stop, model_flip, regime_warning. Degrades to `[]` immediately when
+    the close series is empty or the normalized entry price is non-positive.
+
+    Two mutually exclusive corporate-action paths:
+      • AUTO-CORRECTED (tier A — declared event + observed gap + factor
+        agreement): the numbers below are already right, so the wording is
+        CONFIDENT and carries a line naming the event. `ca_adjusted=True`.
+      • SHIELDED (tier B — a gap with no confident declared match): unchanged
+        17-07-26 behaviour — the hard-stop and trailing-stop wording is
+        downgraded to a disclaimer (take-profit shares the pnl exposure but is
+        left confident, exactly as approved) and the trigger STILL fires.
     """
-    if not closes_since_entry_abs:
-        return []
-    entry_abs = normalize_entry_price_vnd(
-        position.get("entry_price_raw", position.get("price"))
-    )
-    if entry_abs <= 0.0:
+    prices = resolve_lot_prices(position, closes_since_entry_abs, ca_events)
+    if not prices["valid"]:
         return []
 
-    today_close_abs = float(closes_since_entry_abs[-1])
-    peak_abs = max(float(c) for c in closes_since_entry_abs)
-    pnl_pct = (today_close_abs - entry_abs) / entry_abs
-    drawdown_pct = (peak_abs - today_close_abs) / peak_abs if peak_abs > 0.0 else 0.0
-    ca_gap = price_lookup.has_ca_gap(closes_since_entry_abs)
+    peak_abs = prices["peak"]
+    pnl_pct = prices["pnl_pct"]
+    drawdown_pct = prices["drawdown_pct"]
+    ca_adjusted = prices["ca_adjusted"]
+    ca_label = prices["ca_label_vi"]
+    # Only the UNCORRECTED path needs the disclaimer. Once the numbers are
+    # rebased on a declared ratio they are trusted and shown, not hedged.
+    ca_gap = (not ca_adjusted) and price_lookup.has_ca_gap(closes_since_entry_abs)
+    ca_note = (
+        f"\n<i>ℹ️ Đã tự động điều chỉnh giá theo {html.escape(ca_label)} — "
+        f"số liệu trên là PnL thực tế sau điều chỉnh.</i>"
+        if ca_adjusted and ca_label else ""
+    )
+
+    def _mark(kind: str, msg: str, downgraded: bool) -> dict:
+        return {"kind": kind, "message_vi": msg, "ca_gap_downgraded": downgraded,
+                "ca_adjusted": ca_adjusted, "ca_label_vi": ca_label}
 
     triggers: list[dict] = []
 
@@ -195,17 +319,17 @@ def evaluate_position(
         else:
             msg = (
                 f"🔴 <b>CẮT LỖ</b>: PnL hiện tại {pnl_pct * 100:+.1f}% "
-                f"(đã vượt ngưỡng cắt lỗ {stop_loss_pct * 100:.0f}%)"
+                f"(đã vượt ngưỡng cắt lỗ {stop_loss_pct * 100:.0f}%){ca_note}"
             )
-        triggers.append({"kind": "hard_stop", "message_vi": msg, "ca_gap_downgraded": ca_gap})
+        triggers.append(_mark("hard_stop", msg, ca_gap))
 
     # 2. Take-profit (info; NOT CA-gap shielded, per approved scope).
     if pnl_pct >= take_profit_pct:
         msg = (
             f"🟢 <b>CHỐT LỜI</b>: PnL hiện tại {pnl_pct * 100:+.1f}% "
-            f"(đã vượt ngưỡng chốt lời {take_profit_pct * 100:.0f}%)"
+            f"(đã vượt ngưỡng chốt lời {take_profit_pct * 100:.0f}%){ca_note}"
         )
-        triggers.append({"kind": "take_profit", "message_vi": msg, "ca_gap_downgraded": False})
+        triggers.append(_mark("take_profit", msg, False))
 
     # 3. Trailing stop (CA-gap shielded).
     if peak_abs > 0.0 and drawdown_pct >= trailing_pct:
@@ -219,9 +343,9 @@ def evaluate_position(
             msg = (
                 f"🟠 <b>TRAILING STOP</b>: giá đã giảm {drawdown_pct * 100:.1f}% "
                 f"từ đỉnh {peak_abs:,.0f} VND kể từ khi mua "
-                f"(ngưỡng {trailing_pct * 100:.0f}%)"
+                f"(ngưỡng {trailing_pct * 100:.0f}%){ca_note}"
             )
-        triggers.append({"kind": "trailing_stop", "message_vi": msg, "ca_gap_downgraded": ca_gap})
+        triggers.append(_mark("trailing_stop", msg, ca_gap))
 
     # 4. Model flip — OR across T+5 / T+20; one line per flipped horizon.
     flip_lines: list[str] = []
@@ -236,9 +360,7 @@ def evaluate_position(
             f"(P(Tăng)={float(prediction_20d[2]) * 100:.0f}%)"
         )
     if flip_lines:
-        triggers.append(
-            {"kind": "model_flip", "message_vi": "\n".join(flip_lines), "ca_gap_downgraded": False}
-        )
+        triggers.append(_mark("model_flip", "\n".join(flip_lines), False))
 
     # 5. Regime warning — NO_TRADE regimes {0, 7}.
     if regime is not None and int(regime) in NO_TRADE_REGIMES:
@@ -247,7 +369,7 @@ def evaluate_position(
             f"{regime_label_vi(regime)} (Regime {int(regime)}) — rủi ro hệ thống "
             f"cao, hạn chế mở/giữ vị thế mới."
         )
-        triggers.append({"kind": "regime_warning", "message_vi": msg, "ca_gap_downgraded": False})
+        triggers.append(_mark("regime_warning", msg, False))
 
     return triggers
 
@@ -421,6 +543,7 @@ def load_guard_positions(
 
 __all__ = [
     "normalize_entry_price_vnd",
+    "resolve_lot_prices",
     "evaluate_position",
     "build_guard_alert_card",
     "load_guard_positions",

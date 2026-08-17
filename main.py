@@ -22,7 +22,7 @@ from config.settings import CONFIG
 from src.features.alpha360_generator import Alpha360Generator
 from src.features.mr_features import MR_FEATURE_COLUMNS, build_mr_features
 from src.features.market_regime import REGIME_LABELS_VI, regime_label_vi
-from src.data import price_lookup  # fresh-parquet price lookups (stock_ohlcv retired)
+from src.data import corporate_actions, price_lookup  # fresh-parquet price lookups (stock_ohlcv retired)
 # ─── V3 V1-faithful Tabular Ensemble (locked-in GOLDEN, the only inference route) ─
 from src.bot.bot_inference import V3BotInference
 from src.bot.sizing import suggested_weight
@@ -2582,6 +2582,55 @@ def rebalance_portfolio(user_id: str, window_rows: int = 120) -> str:
     return _build_rebalance_report(holdings_context, advice)
 
 
+def _refresh_corporate_actions_safe() -> int:
+    """Best-effort corporate-action cache warm-up. NEVER raises.
+
+    WHY THIS EXISTS (14-08-26)
+    ──────────────────────────
+    The 15:30 EOD cron CRASHED with `NameError: name 'refresh_corporate_actions'
+    is not defined`, killing the run after inference had already succeeded — so
+    the portfolio guard, the EOD position report and the regret report were all
+    skipped, and a crash alert went to both chats instead.
+
+    Cause: the in-progress CA-events work wired two call sites in `full_pipeline`
+    / `inference_only` to a `refresh_corporate_actions()` orchestration wrapper
+    that was never written. `src/data/corporate_actions.py` provides the PIECES
+    (`tickers_needing_refresh`, `refresh_events`, `ensure_tables`) but not the
+    step that resolves the held-ticker universe, applies
+    `ca_event_refresh_days` / `ca_event_max_refresh_per_run`, and honours the
+    `corporate_action_events_enabled` kill-switch.
+
+    This does NOT implement that wrapper — finishing someone else's half-built
+    feature inside an unrelated fix would ship a new external network dependency
+    on the EOD path unreviewed. It makes the step DEGRADE instead of crash, which
+    is the contract every other optional step in this pipeline already follows
+    (`notify_tranche_exits`, `notify_portfolio_guard`, the breadth refresh:
+    try/except → log → continue). The guard then falls back to its existing
+    price-gap detection, exactly as the kill-switch-off path intends.
+
+    Returns the number of tickers refreshed (0 whenever it no-ops).
+    """
+    if not getattr(CONFIG.trading, "corporate_action_events_enabled", False):
+        LOGGER.info("[corporate-actions] disabled by config — skipping refresh.")
+        return 0
+    fn = getattr(corporate_actions, "refresh_corporate_actions", None)
+    if fn is None:
+        LOGGER.warning(
+            "[corporate-actions] NOT WIRED: src/data/corporate_actions.py has no "
+            "refresh_corporate_actions() orchestration wrapper (it exposes "
+            "refresh_events + tickers_needing_refresh; the held-ticker resolution "
+            "and per-run cap are still missing). Skipping — the portfolio guard "
+            "falls back to price-gap detection. See "
+            "process/general-plans/active/vnstock-ca-event-detection_PLAN_13-08-26.md"
+        )
+        return 0
+    try:
+        return int(fn() or 0)
+    except Exception:  # noqa: BLE001 — an optional cache warm-up must never kill EOD
+        LOGGER.exception("[corporate-actions] refresh failed — continuing EOD pipeline.")
+        return 0
+
+
 def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> None:
     """End-of-day pipeline: OHLCV crawl → LLM sentiment → inference → exit alerts.
 
@@ -2666,7 +2715,10 @@ def full_pipeline(force_crawl: bool = False, days_back: int | None = None) -> No
         notify_tranche_exits()
 
     # 5. Portfolio guard — EOD protective sweep of every non-cron user's /add
-    #    holdings (alert-only; never writes, never auto-sells).
+    #    holdings (alert-only; never writes, never auto-sells). The CA refresh
+    #    runs FIRST so the guard reads a warm cache and makes no network call.
+    with timed_step("Corporate-action event refresh (held tickers)"):
+        _refresh_corporate_actions_safe()
     with timed_step("Portfolio guard EOD check"):
         notify_portfolio_guard()
 
@@ -2700,6 +2752,8 @@ def inference_only() -> None:
     daily_inference()
     with timed_step("Tranche exit-due check (signal ledger)"):
         notify_tranche_exits()
+    with timed_step("Corporate-action event refresh (held tickers)"):
+        _refresh_corporate_actions_safe()
     with timed_step("Portfolio guard EOD check"):
         notify_portfolio_guard()
     with timed_step("EOD position report (signal ledger)"):
