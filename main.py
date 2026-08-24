@@ -760,9 +760,13 @@ def _log_sentiment_entry_paperlog(
     a name's liquidity changes. Pass None when the caller has no universe (e.g.
     /verify): the flag stays NULL = unknown, which must never be read as False.
 
-    Idempotent: the `UNIQUE (log_date, ticker, source)` constraint + INSERT OR
-    IGNORE silently suppress same-day duplicates, so re-running a pipeline on
-    the same date does not double-log.
+    Idempotent AND self-correcting: the `UNIQUE (log_date, ticker, source)`
+    constraint + INSERT OR IGNORE suppress same-day duplicates, and a follow-up
+    UPDATE refreshes the PREDICTION columns of an unsettled row so a later,
+    better-informed run of the same date wins instead of losing to the first one
+    (see the comment at the UPDATE for the 24-08-26 SSI case). Outcome columns
+    (`entry_close` / `ret_3d` / `ret_20d` / `outcome_filled`) are never touched
+    here — they belong to `_backfill_paperlog_outcomes`.
 
     Args:
         db: object exposing `.conn` (DuckDB connection) and `._audit_lock`
@@ -838,6 +842,45 @@ def _log_sentiment_entry_paperlog(
                     p_down_secondary, p_side_secondary, p_up_secondary,
                     primary_horizon_days, liquid_at_log, final_decision,
                     sentiment_score,
+                ],
+            )
+            # CORRECT AN UNSETTLED SAME-DAY ROW (24-08-26). INSERT OR IGNORE alone
+            # meant FIRST WRITE WINS, so a later, better-informed run of the same
+            # date could not fix a stale row. That is normally invisible (one cron
+            # per day) but it bit on 24-08: a catch-up run at 08:11 scored SSI at
+            # 0.3227 using data 3 sessions old and the pre-retrain gate, the 15:30
+            # cron then died on the DuckDB lock, and the 23:05 re-run computed
+            # 0.4592 and ADMITTED SSI — yet the paperlog kept 0.3227. The research
+            # table contradicted the decision the system actually made that day,
+            # and check_drift / calibration studies read this table.
+            #
+            # Only PREDICTION columns are refreshed, and only while the row is
+            # still pure prediction. `entry_close` / `ret_3d` / `ret_20d` /
+            # `outcome_filled` belong to `_backfill_paperlog_outcomes` and must
+            # never be clobbered: once a return has been measured against the
+            # original prediction, rewriting that prediction would decouple the
+            # pair and silently corrupt the experiment. In practice the guard
+            # means "same-day corrections allowed, matured rows frozen", because
+            # no return window can have matured on the log date itself.
+            db.conn.execute(
+                """
+                UPDATE sentiment_entry_paperlog
+                   SET p_down_primary = ?, p_side_primary = ?, p_up_primary = ?,
+                       decision_primary = ?,
+                       p_down_secondary = ?, p_side_secondary = ?,
+                       p_up_secondary = ?,
+                       primary_horizon_days = ?, liquid_at_log = ?,
+                       final_decision = ?, sentiment_score = ?
+                 WHERE log_date = ? AND ticker = ? AND source = ?
+                   AND COALESCE(outcome_filled, FALSE) = FALSE
+                   AND ret_3d IS NULL AND ret_20d IS NULL
+                """,
+                [
+                    p_down_primary, p_side_primary, p_up_primary, decision_primary,
+                    p_down_secondary, p_side_secondary, p_up_secondary,
+                    primary_horizon_days, liquid_at_log, final_decision,
+                    sentiment_score,
+                    log_date, ticker, source,
                 ],
             )
         inserted += 1

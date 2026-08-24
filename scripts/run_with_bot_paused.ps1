@@ -131,7 +131,17 @@ finally {
     # EOD run silently leaves the operator without a bot until they notice.
     if ($botWasRunning) {
         if (@(Get-BotProcs).Count -eq 0) {
-            Start-Process -FilePath $py -ArgumentList "run_bot.py" -WorkingDirectory $repo -WindowStyle Hidden | Out-Null
+            # CAPTURE THE BOT'S OUTPUT (24-08-26). The first version started it
+            # bare, so when a restarted bot later died it left NO trace and the
+            # cause was unrecoverable - exactly what happened to PID 8128. The
+            # bot logs to stderr, so without this the post-mortem is guesswork.
+            $stamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
+            $botOut  = Join-Path $repo ("logs\bot_{0}.log" -f $stamp)
+            $botErr  = Join-Path $repo ("logs\bot_{0}.err" -f $stamp)
+            Start-Process -FilePath $py -ArgumentList "run_bot.py" `
+                -WorkingDirectory $repo -WindowStyle Hidden `
+                -RedirectStandardOutput $botOut -RedirectStandardError $botErr | Out-Null
+            Say ("Bot output -> {0} (+ .err)" -f $botOut)
             Start-Sleep -Seconds 5
             $now = @(Get-BotProcs)
             if ($now.Count -gt 0) { Say ("Bot restarted (PID {0})." -f ($now.ProcessId -join ', ')) }

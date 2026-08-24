@@ -489,3 +489,113 @@ def test_backfill_ca_gap_settles_long_with_null(fake_db, monkeypatch) -> None:
     assert ret_3d is None      # short window also CA-contaminated -> skipped
     assert ret_20d is None     # settled with NULL = permanently excluded
     assert filled is True
+
+
+# --------------------------------------------------------------------------- #
+# Test Group D - same-day self-correction (24-08-26)
+#
+# `INSERT OR IGNORE` alone made the paperlog FIRST-WRITE-WINS. Normally invisible
+# (one cron per day), it bit on 24-08:
+#
+#   08:11  catch-up run scores SSI 0.3227 - data 3 sessions old, pre-retrain gate
+#   09:10  retrain lowers the T+20 gate 0.43 -> 0.42
+#   15:30  the real cron dies on the DuckDB lock before writing anything
+#   23:05  re-run scores SSI 0.4592 and ADMITS it
+#
+# The paperlog kept 0.3227, so the research table recorded a probability that
+# contradicted the gate decision the system actually made that day - and
+# check_drift / the calibration studies read this table.
+#
+# THE LINE THAT MUST NOT MOVE: outcome columns belong to
+# `_backfill_paperlog_outcomes`. Once a return has been measured against the
+# original prediction, rewriting that prediction decouples the pair.
+# --------------------------------------------------------------------------- #
+
+
+def _write_ssi(db, p_up: float, *, sentiment: float = 0.1, source: str = "daily") -> int:
+    return main._log_sentiment_entry_paperlog(
+        db=db,
+        candidate_tickers=["SSI"],
+        stacking_5d={"SSI": [round(1 - p_up - 0.01, 6), 0.01, p_up]},
+        stacking_20d={"SSI": [0.50, 0.01, 0.49]},
+        final_decisions={"SSI": 2},
+        all_sentiments={"SSI": {"sentiment_score": sentiment}},
+        source=source,
+    )
+
+
+def _ssi_p_up(db) -> float:
+    return float(db.conn.execute(
+        "SELECT p_up_primary FROM sentiment_entry_paperlog WHERE ticker='SSI'"
+    ).fetchone()[0])
+
+
+def _ssi_rows(db) -> int:
+    return int(db.conn.execute(
+        "SELECT COUNT(*) FROM sentiment_entry_paperlog WHERE ticker='SSI'"
+    ).fetchone()[0])
+
+
+def test_later_same_day_run_corrects_a_stale_probability(fake_db) -> None:
+    _write_ssi(fake_db, 0.3227)
+    _write_ssi(fake_db, 0.4592)
+    assert _ssi_rows(fake_db) == 1, "UNIQUE constraint must still prevent duplicates"
+    assert _ssi_p_up(fake_db) == pytest.approx(0.4592), "better-informed run must win"
+
+
+def test_repeated_corrections_never_duplicate(fake_db) -> None:
+    for p in (0.30, 0.35, 0.40, 0.4592):
+        _write_ssi(fake_db, p)
+    assert _ssi_rows(fake_db) == 1
+    assert _ssi_p_up(fake_db) == pytest.approx(0.4592)
+
+
+def test_a_settled_row_is_frozen(fake_db) -> None:
+    """outcome_filled=TRUE means a return was measured against THAT prediction."""
+    _write_ssi(fake_db, 0.3227)
+    fake_db.conn.execute(
+        "UPDATE sentiment_entry_paperlog SET outcome_filled = TRUE, ret_20d = 0.05 "
+        "WHERE ticker='SSI'")
+    _write_ssi(fake_db, 0.4592)
+    assert _ssi_p_up(fake_db) == pytest.approx(0.3227)
+
+
+def test_a_matured_short_return_also_freezes_the_row(fake_db) -> None:
+    """ret_3d lands first; the prediction/outcome pair is already coupled."""
+    _write_ssi(fake_db, 0.3227)
+    fake_db.conn.execute(
+        "UPDATE sentiment_entry_paperlog SET ret_3d = 0.01 WHERE ticker='SSI'")
+    _write_ssi(fake_db, 0.4592)
+    assert _ssi_p_up(fake_db) == pytest.approx(0.3227)
+
+
+def test_correction_never_touches_backfilled_entry_close(fake_db) -> None:
+    _write_ssi(fake_db, 0.3227)
+    fake_db.conn.execute(
+        "UPDATE sentiment_entry_paperlog SET entry_close = 41.5 WHERE ticker='SSI'")
+    _write_ssi(fake_db, 0.4592)
+    entry, p_up = fake_db.conn.execute(
+        "SELECT entry_close, p_up_primary FROM sentiment_entry_paperlog WHERE ticker='SSI'"
+    ).fetchone()
+    assert float(entry) == pytest.approx(41.5), "entry_close belongs to the backfill"
+    assert float(p_up) == pytest.approx(0.4592)
+
+
+def test_sources_remain_independent(fake_db) -> None:
+    """UNIQUE is (log_date, ticker, source) - /verify must not overwrite daily."""
+    _write_ssi(fake_db, 0.3227, source="daily")
+    _write_ssi(fake_db, 0.9000, source="verify")
+    rows = dict(fake_db.conn.execute(
+        "SELECT source, p_up_primary FROM sentiment_entry_paperlog WHERE ticker='SSI'"
+    ).fetchall())
+    assert rows["daily"] == pytest.approx(0.3227)
+    assert rows["verify"] == pytest.approx(0.9000)
+
+
+def test_sentiment_is_refreshed_by_a_correction(fake_db) -> None:
+    _write_ssi(fake_db, 0.3227, sentiment=-0.40)
+    _write_ssi(fake_db, 0.4592, sentiment=0.70)
+    s = fake_db.conn.execute(
+        "SELECT sentiment_score FROM sentiment_entry_paperlog WHERE ticker='SSI'"
+    ).fetchone()[0]
+    assert float(s) == pytest.approx(0.70)

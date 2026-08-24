@@ -1943,7 +1943,41 @@ def build_application() -> Application:
     # (see the block above `_INTRADAY_STATE_KEY`). The bot now registers no
     # repeating jobs at all.
 
+    # --- Release the DuckDB file lock between commands (24-08-26) ---
+    # group=99 → runs AFTER the command handlers in group 0, on every update.
+    # PTB walks every group in ascending order (an exception in one group goes to
+    # the error handler and processing continues), so this fires even when a
+    # command failed — which is exactly when a lock must not be left held.
+    #
+    # Safe to release per-update because this Application is built WITHOUT
+    # `concurrent_updates`, i.e. PTB processes updates sequentially, so no other
+    # handler can be mid-query when this runs.
+    app.add_handler(TypeHandler(Update, _release_db_lock), group=99)
+
     return app
+
+
+async def _release_db_lock(_update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drop the process's DuckDB connection once a command has finished.
+
+    DuckDB allows ONE writing process, and DuckDBEngine holds the file
+    read-write for the process lifetime. A running bot therefore locked out the
+    15:30 EOD cron (it crashed AFTER paying for the Gemini sentiment stage) and
+    even refused read-only diagnostics. Releasing here shrinks the bot's hold
+    from "always" to "only while a command is actually executing".
+
+    This is a complement to `scripts/run_with_bot_paused.ps1`, not a replacement:
+    that wrapper remains the DETERMINISTIC serialisation for scheduled jobs. This
+    only removes the idle-bot blockade.
+
+    Never raises — a failure to release must not surface to the user as a command
+    error, and the next `DuckDBEngine()` re-opens lazily either way.
+    """
+    try:
+        from src.data.db_engine import DuckDBEngine  # noqa: PLC0415
+        DuckDBEngine.dispose()
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        LOGGER.debug("[DuckDB] post-update release failed.", exc_info=True)
 
 
 def main() -> None:

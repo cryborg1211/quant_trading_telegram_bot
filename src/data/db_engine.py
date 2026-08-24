@@ -437,25 +437,54 @@ class DuckDBEngine:
         return self.conn.execute(sql).df()
 
     def close(self):
-        """Closes the database connection and resets the singleton state."""
+        """Close the connection and reset the singleton so it can re-open later.
+
+        Safe to call repeatedly: the next `DuckDBEngine()` rebuilds the singleton
+        and re-opens the file, and no caller in this codebase caches `.conn`
+        across calls (they all construct `DuckDBEngine()` inside the function that
+        uses it), so releasing here cannot strand a live cursor.
+        """
         if hasattr(self, 'conn'):
             try:
                 self.conn.close()
             except Exception:
                 pass
             del self.conn
-        
+
         # Reset initialization flag to allow re-initialization if needed
         if hasattr(self, 'initialized'):
             del self.initialized
-            
+
         # Clear the singleton instance
         DuckDBEngine._instance = None
-        print("DuckDB connection closed and engine state reset.")
+        # Was a bare print() — unusable in a long-running process and noisy once
+        # the bot began releasing after every update (24-08-26).
+        LOGGER.debug("[DuckDB] connection closed and engine state reset.")
 
     @classmethod
     def dispose(cls):
-        """Class method to safely dispose of the singleton instance."""
+        """Release the process's DuckDB file lock, if one is held.
+
+        WHY THIS IS CALLED PER-UPDATE BY THE BOT (24-08-26)
+        ──────────────────────────────────────────────────
+        DuckDB permits ONE writing process. This singleton holds the file
+        read-write for the life of the process, so a running `run_bot.py` locked
+        out every other writer — the 15:30 EOD cron died with
+        "IOException: ... already open in python.exe (PID 19940)" AFTER paying for
+        the Gemini sentiment stage, and even a read-only diagnostic (or a plain
+        file copy) was refused.
+
+        `main.py` already worked around one instance of this by refusing to
+        construct PortfolioManager on `persist=False` previews; that reasoning
+        just was never extended to the process as a whole.
+
+        Releasing between updates shrinks the bot's lock from "always" to "only
+        while a command is actually running". It does NOT make concurrent access
+        safe — that is what `scripts/run_with_bot_paused.ps1` is for, and it stays
+        the deterministic mechanism for scheduled jobs. This is the complement:
+        it keeps ad-hoc reads and an off-schedule run from being blocked by an
+        idle bot.
+        """
         if cls._instance:
             cls._instance.close()
 
