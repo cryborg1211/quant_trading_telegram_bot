@@ -94,6 +94,32 @@ MARKET_CLOSE = dt_time(15, 0)
 
 _VN_PRICE_SCALE_THRESHOLD = 1_000.0  # VN stocks quoted in thousands; raw < 1000 → multiply by 1000
 
+
+def _fmt_pct_pair(value_pct: float, threshold_pct: float, *, max_dp: int = 3) -> tuple[str, str]:
+    """Render a value and the threshold it is compared against so they DIFFER.
+
+    WHY (25-08-26). Both were printed with `:.0f`, so a name just under the gate
+    rendered as "Cửa tăng chỉ 43% (dưới ngưỡng an toàn 43%)" — text that reads
+    like a broken gate. Real 24-08 rows: MBB 0.4275, GMD 0.4263, GAS 0.4252 all
+    printed "43% < 43%". The DECISION was correct every time; only the wording
+    was self-contradictory.
+
+    Latent until the gate moved. At 0.45/0.46 the gate sat above the dense part
+    of the p_up distribution and the rounded pair rarely collided; at 0.42/0.43 it
+    sits inside it, so collisions became routine.
+
+    Simply widening to `:.1f` is NOT a fix — it only shrinks the window: 0.4305
+    against a 0.43 gate still renders "43.0%" twice. So step the precision up
+    until the two strings actually differ, which is a guarantee rather than a
+    hope. Equal values (a legitimate exact tie) keep the base precision, because
+    then printing them identically is correct, not misleading.
+    """
+    for dp in range(1, max_dp + 1):
+        a, b = f"{value_pct:.{dp}f}", f"{threshold_pct:.{dp}f}"
+        if a != b or value_pct == threshold_pct:
+            return a, b
+    return f"{value_pct:.{max_dp}f}", f"{threshold_pct:.{max_dp}f}"
+
 # How many NEW names a single dispatch may open. Raised 3 → 5 on 13-08-26 to match
 # the engine's validated `max_positions=5`; it was a bare `[:3]` literal before.
 #
@@ -1225,20 +1251,21 @@ def _select_candidates(
         _floor_pct = _tau5 * 100.0
         for t in candidate_tickers:
             _pu = predictions[t][2] * 100.0
+            _pu_s, _thr_s = _fmt_pct_pair(_pu, _floor_pct)
             if t in _hysteresis_held:
                 # ADMITTED by the gate, parked for a streak. Saying "below the
                 # threshold" here would contradict what the system did.
                 _have, _need = _hysteresis_held[t]
                 fallback_reasons[t] = (
-                    f"Cửa tăng {_pu:.0f}% ĐÃ QUA cổng {_floor_pct:.0f}%, nhưng "
+                    f"Cửa tăng {_pu_s}% ĐÃ QUA cổng {_thr_s}%, nhưng "
                     f"mới đủ điều kiện {_have}/{_need} ngày liên tiếp — chờ thêm "
                     f"{_need - _have} phiên xác nhận trước khi vào lệnh "
                     f"(chống tín hiệu nhảy vào/ra)."
                 )
             elif _pu < _floor_pct:
                 fallback_reasons[t] = (
-                    f"Cửa tăng chỉ {_pu:.0f}% (dưới ngưỡng an toàn "
-                    f"{_floor_pct:.0f}%) — không bõ công đánh đổi với rủi ro "
+                    f"Cửa tăng chỉ {_pu_s}% (dưới ngưỡng an toàn "
+                    f"{_thr_s}%) — không bõ công đánh đổi với rủi ro "
                     f"thị trường chung đang yếu."
                 )
             elif not meta_gate.get(t, True):
@@ -1778,8 +1805,11 @@ def build_event_overrides(
             "status": "EVENT-DRIVEN (BẮT TIN)",
             "weight": _EVENT_CAP,
             "ly_do": (
+                # `:.1f` on BOTH sides — see the fallback-reason comment above:
+                # a `:.1f` value against a `:.0f` threshold prints "45.0% (dưới
+                # ngưỡng an toàn 45%)" for a name at 0.4496.
                 f"P(Tăng)={pu * 100:.1f}% (dưới ngưỡng an toàn "
-                f"{SAFE_BUY_THRESHOLD * 100:.0f}% nhưng ≥ {EVENT_MIN_P_UP * 100:.0f}%) "
+                f"{SAFE_BUY_THRESHOLD * 100:.1f}% nhưng ≥ {EVENT_MIN_P_UP * 100:.1f}%) "
                 f"+ sentiment={ss:+.2f} ≥ {EVENT_BULL_SENTIMENT:.2f}, GIỚI HẠN "
                 f"{_EVENT_CAP * 100:.0f}% NAV → Bắt tin: {_smart_truncate(reason, 160)}"
             ),
