@@ -120,23 +120,33 @@ def _fmt_pct_pair(value_pct: float, threshold_pct: float, *, max_dp: int = 3) ->
             return a, b
     return f"{value_pct:.{max_dp}f}", f"{threshold_pct:.{max_dp}f}"
 
-# How many NEW names a single dispatch may open. Raised 3 → 5 on 13-08-26 to match
-# the engine's validated `max_positions=5`; it was a bare `[:3]` literal before.
+# How many NEW names a single dispatch may open.
 #
-# THIS IS NOT A LEVERAGE CHANGE. The tranche cohort weight is
+# 13-08-26: raised 3 → 5 to match the engine's validated `max_positions=5` (it was
+# a bare `[:3]` literal). 26-08-26: back to 3 — OPERATOR DECISION on breadth, see
+# below. The engine still runs max_positions=5, so serve is deliberately NARROWER
+# than the validated config here; that is a concentration choice, not a bug, and
+# `sweep_conditions` will show the mismatch to anyone auditing later.
+#
+# NEITHER MOVE CHANGES LEVERAGE. The tranche cohort weight is
 # `min(1/(hold_days × n_picks), 0.20)` (see `_tranche_signal_fields`), so the daily
-# budget NAV/hold_days is SPLIT across whatever picks exist: 3 picks → 1.111% each,
-# 5 picks → 0.667% each, and 3.33% NAV/day deployed either way. Going to 5 spreads
-# the same money over more names, which lowers single-name concentration.
+# budget NAV/hold_days is SPLIT across whatever picks exist:
+#     3 picks → 1.111% each,  5 picks → 0.667% each,  3.33% NAV/day either way.
+# Fewer names means MORE concentration per name, not less money at risk.
 #
-# Why it matters now: top-3-vs-top-5 was measured VACUOUS earlier, because under
-# τ=0.46 the admitted set never reached 3 names anyway. That finding carried the
-# condition "this changes if the gate is ever loosened" — and the 13-08 retrain
-# loosened it (τ 0.46 → 0.43 took scores clearing the gate from 1.1% to 5.5%), so
-# the slice can now actually bind.
+# WHY IT MOVED BACK. top-3-vs-top-5 was measured VACUOUS when τ was 0.46 — the
+# admitted set never reached 3 names, so the slice never bound. That finding
+# carried the condition "this changes if the gate is ever loosened", and two
+# retrains loosened it (0.46 → 0.43 → 0.42). Measured liquid names clearing τ=0.42
+# per session: 8, 6, 1, 1, 5, 5, 5 — a steady ~5/day, not a transient. With the
+# slice at 5 that produced 5 and 4 real dispatches on consecutive days, against
+# 1 in the whole preceding fortnight. The operator asked for fewer names; the
+# slice is the honest lever for that, because the gate itself is chosen by the
+# retrain sweep and hand-setting it is the threshold-mining this repo spent a week
+# removing.
 #
-# No extra Gemini cost: arbitration runs on the pool BEFORE this slice.
-_MAX_NEW_POSITIONS_PER_DAY = 5
+# No extra Gemini cost either way: arbitration runs on the pool BEFORE this slice.
+_MAX_NEW_POSITIONS_PER_DAY = 3
 
 # Survivor-pool size sent to the arbitrator. Was a local constant inside
 # `_select_candidates`; promoted to module level 13-08-26 so the invariant below
