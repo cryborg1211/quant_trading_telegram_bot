@@ -152,20 +152,50 @@ def record_dispatch(
     try:
         with _connect(db_path) as conn:
             ensure_table(conn)
+            # Carry is_paper, not just the key. A PAPER row must never block the
+            # REAL dispatch of the same name on the same day.
+            #
+            # LIVE FAILURE (27-08-26). A /suggest tap at 08:47 wrote a paper row
+            # for GVR. That evening's cron dispatched GVR for real — cards went to
+            # both chats — but the plain (ticker, horizon) dedup saw the paper row
+            # and SKIPPED the insert. The log read "Recorded 2 OPEN" against three
+            # cards sent, and GVR sat in the book as paper: excluded from the real
+            # position report and from tranche exit alerts, so the operator held a
+            # name the system would never tell them to close.
             existing = {
-                (str(r[0]).upper(), int(r[1]) if r[1] is not None else None)
+                (str(r[0]).upper(), int(r[1]) if r[1] is not None else None):
+                    bool(r[2])
                 for r in conn.execute(
-                    f"SELECT ticker, horizon FROM {TABLE} WHERE dispatch_date = ?", [today]
+                    f"SELECT ticker, horizon, COALESCE(is_paper, FALSE) FROM {TABLE} "
+                    "WHERE dispatch_date = ?", [today]
                 ).fetchall()
             }
-            rows = [r for r in rows if (r[0], r[2]) not in existing]
-            if rows:
+            fresh = [r for r in rows if (r[0], r[2]) not in existing]
+            # Paper -> real is an UPGRADE: the preview said "candidate", the cron
+            # then actually dispatched it. Never the reverse — a later /suggest tap
+            # must not demote a real cohort to paper.
+            upgrades = [
+                r for r in rows
+                if existing.get((r[0], r[2])) is True and not is_paper
+            ]
+            if fresh:
                 conn.executemany(
                     f"INSERT INTO {TABLE} "
                     "(ticker, dispatch_date, horizon, hold_days, weight, is_paper) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
-                    rows,
+                    fresh,
                 )
+            for r in upgrades:
+                conn.execute(
+                    f"UPDATE {TABLE} SET is_paper = FALSE, weight = ?, hold_days = ? "
+                    "WHERE ticker = ? AND dispatch_date = ? AND horizon = ?",
+                    [r[4], r[3], r[0], r[1], r[2]],
+                )
+            if upgrades:
+                LOGGER.info(
+                    "[SignalLedger] Upgraded %s paper row(s) to REAL: %s",
+                    len(upgrades), [r[0] for r in upgrades])
+            rows = fresh + upgrades
     except Exception:  # noqa: BLE001 — ledger must never kill the dispatch path
         LOGGER.exception("[SignalLedger] record_dispatch failed.")
         return 0
