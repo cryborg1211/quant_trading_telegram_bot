@@ -105,6 +105,7 @@ def record_dispatch(
     horizon: int,
     db_path: str | None = None,
     today: date | None = None,
+    is_paper: bool = False,
 ) -> int:
     """Record OPEN ledger rows for a broadcast tranche dispatch.
 
@@ -113,6 +114,22 @@ def record_dispatch(
     pipeline re-run on the same day cannot double-book a cohort — the horizon is
     part of the dedup key so a T+5 tracking row and a T+20 tranche row for the
     same ticker+day both persist independently.
+
+    `is_paper=True` marks the row as TRACKED-BUT-NOT-HELD, which keeps it out of
+    `open_tickers()` and therefore out of the open-cohort dedup veto.
+
+    WHY THAT MATTERS (27-08-26). `/suggest` is a preview command, yet it recorded
+    real cohorts, so a second tap 17 minutes later contradicted the first:
+
+        08:18  dedup skips GVR,VRE,PNJ  -> 1 survivor  -> VJC dispatched
+        08:35  dedup skips GVR,VRE,VJC,PNJ -> 0 survivors -> "THỊ TRƯỜNG XẤU"
+
+    The meta-gate rejected the identical 46 names both times; the model had not
+    changed its mind. VJC simply moved from "candidate" to "already held" because
+    the FIRST tap booked it. The second report then told the operator no name was
+    good enough, while GVR 44.1% / VRE 43.0% / VJC 42.4% had all cleared the 0.42
+    gate — they were excluded for being held, not for being weak. Left alone this
+    also consumes the day's candidates before the 15:30 cron ever runs.
 
     Returns the number of rows actually inserted.
     """
@@ -125,7 +142,7 @@ def record_dispatch(
     today = today or datetime.now().date()
     rows = [
         (str(s["ticker"]).upper(), today, int(horizon), hold_days,
-         float(s.get("suggested_weight") or 0.0))
+         float(s.get("suggested_weight") or 0.0), bool(is_paper))
         for s in signals
         if s.get("ticker")
     ]
@@ -144,16 +161,18 @@ def record_dispatch(
             rows = [r for r in rows if (r[0], r[2]) not in existing]
             if rows:
                 conn.executemany(
-                    f"INSERT INTO {TABLE} (ticker, dispatch_date, horizon, hold_days, weight) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    f"INSERT INTO {TABLE} "
+                    "(ticker, dispatch_date, horizon, hold_days, weight, is_paper) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     rows,
                 )
     except Exception:  # noqa: BLE001 — ledger must never kill the dispatch path
         LOGGER.exception("[SignalLedger] record_dispatch failed.")
         return 0
 
-    LOGGER.info("[SignalLedger] Recorded %s OPEN signals (hold=%s sessions).",
-                len(rows), hold_days)
+    LOGGER.info("[SignalLedger] Recorded %s %s signals (hold=%s sessions).",
+                len(rows), "TRACKED (paper, not held)" if is_paper else "OPEN",
+                hold_days)
     return len(rows)
 
 

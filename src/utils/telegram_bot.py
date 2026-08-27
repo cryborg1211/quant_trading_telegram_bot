@@ -784,10 +784,17 @@ async def _suggest_buy_dispatch(update: Update, horizon: int) -> None:
             # portfolio-window convention (hold_days=30, NOT 20) — mirrors the
             # dual-dispatch convention in main.py / the EOD position-report plan.
             _hold_days = 5 if int(horizon) == 5 else 30
+            # is_paper=True (27-08-26): TRACK the picks without booking them as
+            # held. Recording them as real cohorts made /suggest self-defeating —
+            # a second tap 17 minutes later reported "THỊ TRƯỜNG XẤU / no name is
+            # good enough" purely because the FIRST tap had booked the survivors,
+            # and the same rows would then be dedup'd out of the 15:30 cron. A
+            # preview command must not consume the day's candidates.
             signal_ledger.record_dispatch(
                 signal_data_list,
                 {"mode": "tranche", "hold_days": _hold_days},
                 int(horizon),
+                is_paper=True,
             )
         except Exception:  # noqa: BLE001 — ledger tracking must never break delivery
             LOGGER.exception(
