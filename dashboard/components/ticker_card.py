@@ -64,8 +64,14 @@ def _render_oversight_row(sig: dict) -> None:
 def _render_analysis_expander(sig: dict) -> None:
     """Collapsible full-detail section — parity with the Telegram BUY card."""
     with st.expander("Phân tích chi tiết & tin tức"):
+        # `gate_margin_vi` replaced `base_decision_vi` on 27-08-26 (the argmax
+        # read SELL on 361/361 names, so it never varied). Falls back to the old
+        # field for signal dicts built before the change.
+        gate_margin = sig.get("gate_margin_vi")
         base = sig.get("base_decision_vi")
-        if base:
+        if gate_margin:
+            st.caption(f"Biên qua cổng: **{gate_margin}**")
+        elif base:
             st.caption(f"Phân loại gốc của mô hình: **{base}**")
         regime_action = sig.get("regime_action_vi")
         if regime_action:

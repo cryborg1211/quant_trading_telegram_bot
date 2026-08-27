@@ -80,7 +80,7 @@ def test_card_escapes_conclusion_html():
 # ── Unified 4-section attribution card (02-07-26) ──────────────────────────
 
 _ATTRIBUTION = dict(
-    base_decision_vi="MUA (BUY)",
+    gate_margin_vi="+0.41pp trên cổng (42.4% vs 42.0%)",
     regime_action_vi="Không điều chỉnh",
     garch_scalar=0.85,
     arb_note_vi="Không can thiệp",
@@ -106,7 +106,10 @@ def test_attribution_card_renders_operator_sections():
     assert "<b>BỐI CẢNH</b>" in c
     assert "Phanh biến động GARCH: <b>Đang phanh — hạ tỷ trọng ×0.85</b>" in c
     assert "Trọng tài tin tức: Không can thiệp" in c
-    assert "Phân loại gốc của mô hình: <b>MUA (BUY)</b>" in c
+    assert "Biên qua cổng: <b>+0.41pp trên cổng (42.4% vs 42.0%)</b>" in c
+    assert "Phân loại gốc" not in c, (
+        "the argmax line is retired — it read SELL on 361/361 names, so it "
+        "never varied and read as a per-name warning")
     assert "<b>THAM CHIẾU</b>" in c
     assert "Đi vốn: <b>20.0% NAV</b>" in c
     assert "ĐIỂM TỔNG:" in c                                # checklist score
@@ -181,3 +184,72 @@ def test_both_horizon_probabilities_shown_without_commentary():
     c = _card(**_ATTRIBUTION, p_up_5d=0.38, p_up_20d=0.45)
     assert "T+5: <b>38.0%</b>" in c
     assert "T+20: <b>45.0%</b>" in c
+
+
+# ── Gate margin replaces the argmax line (27-08-26) ────────────────────────
+#
+# `base_decision_vi` rendered the model's ARGMAX class and was CONSTANT: measured
+# on the live artifact, argmax == SELL for 361 of 361 scored names (0 HOLD,
+# 0 BUY). Even the strongest name in the market (p_up 0.4740) still has p_down
+# 0.5169. Same fact that forced arbitrator_entry_mode "gate" -> "veto" on 12-08,
+# where requiring argmax == UP produced ZERO buys in 920 days.
+#
+# A field that says "BÁN (SELL)" on every card every day carries no information
+# and actively misleads - the operator reads it as a warning about that specific
+# name and distrusts every candidate. The margin varies and answers the real
+# question: comfortably through, or scraping the floor?
+
+
+def test_gate_margin_formats_both_sides_and_the_delta():
+    from main import _gate_margin_vi
+    assert _gate_margin_vi(0.4241, 0.42) == "+0.41pp trên cổng (42.4% vs 42.0%)"
+
+
+def test_gate_margin_marks_a_name_below_the_gate():
+    from main import _gate_margin_vi
+    s = _gate_margin_vi(0.4150, 0.42)
+    assert s.startswith("-0.50pp")
+    assert "DƯỚI cổng" in s
+
+
+def test_gate_margin_never_prints_the_two_figures_identically():
+    """Inherits `_fmt_pct_pair`'s anti-collision rule.
+
+    A name 0.05pp over the gate would otherwise render "42.0% vs 42.0%" - the
+    same self-contradiction fixed in the fallback reasons on 25-08.
+    """
+    from main import _gate_margin_vi
+    s = _gate_margin_vi(0.4205, 0.42)
+    assert "42.05% vs 42.00%" in s, s
+
+
+def test_gate_margin_returns_none_when_an_input_is_missing():
+    """No guessing from a half-known state.
+
+    The secondary artifact can fail to load; inventing a margin would repeat the
+    pinned-threshold class of bug fixed on 13-08 and 25-08.
+    """
+    from main import _gate_margin_vi
+    assert _gate_margin_vi(0.4241, None) is None
+    assert _gate_margin_vi(None, 0.42) is None
+
+
+def test_card_falls_back_to_base_decision_for_unmigrated_callers():
+    """Signal dicts built before 27-08 still render rather than losing a line."""
+    c = _card(regime_action_vi="Không điều chỉnh", garch_scalar=0.85,
+              arb_note_vi="Không can thiệp", risk_tier="RISK_MID",
+              risk_tier_pct=60, risk_tier_label_vi="TRUNG BÌNH — thận trọng",
+              market_regime=3, regime_label="Strong Trend",
+              base_decision_vi="MUA (BUY)")
+    assert "Phân loại gốc của mô hình: <b>MUA (BUY)</b>" in c
+
+
+def test_gate_margin_wins_when_both_fields_are_present():
+    c = _card(regime_action_vi="Không điều chỉnh", garch_scalar=0.85,
+              arb_note_vi="Không can thiệp", risk_tier="RISK_MID",
+              risk_tier_pct=60, risk_tier_label_vi="TRUNG BÌNH — thận trọng",
+              market_regime=3, regime_label="Strong Trend",
+              base_decision_vi="MUA (BUY)",
+              gate_margin_vi="+0.41pp trên cổng (42.4% vs 42.0%)")
+    assert "Biên qua cổng: <b>+0.41pp trên cổng (42.4% vs 42.0%)</b>" in c
+    assert "Phân loại gốc" not in c

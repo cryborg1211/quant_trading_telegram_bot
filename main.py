@@ -1876,13 +1876,43 @@ def _tranche_signal_fields(strategy: dict | None, n_picks: int, horizon: int = 2
     return fields
 
 
-# Argmax class → VN display label for the card's "Phân loại gốc" line.
-# Shares the arbitrator/paperlog decision encoding: 0=SELL, 1=HOLD, 2=BUY.
-_BASE_DECISION_VI: dict[int, str] = {
-    0: "BÁN (SELL)",
-    1: "GIỮ (HOLD)",
-    2: "MUA (BUY)",
-}
+# RETIRED 27-08-26 — `_BASE_DECISION_VI` and the card's "Phân loại gốc" line.
+#
+# The line rendered the model's ARGMAX class, and it was constant. Measured on the
+# live artifact across the full scored universe: argmax == SELL for 361 of 361
+# names (100%), 0 HOLD, 0 BUY. Even the strongest name in the market
+# (p_up 0.4740) still has p_down 0.5169, so p_down wins everywhere.
+#
+# That is the same fact that forced `arbitrator_entry_mode` from "gate" to "veto"
+# on 12-08: requiring argmax == UP produced ZERO buys in 920 days. It is an off
+# switch, not a filter — this strategy admits on an ABSOLUTE p_up threshold, and
+# the model ranks rather than picks a side.
+#
+# A field that reads "BÁN (SELL)" on every card every day carries no information,
+# and it actively misleads: the operator reasonably reads it as a warning specific
+# to that name and distrusts every candidate.
+#
+# REPLACED BY the gate margin, which varies and answers the question the operator
+# is actually asking — is this name comfortably through, or scraping the floor?
+# VJC on 27-08 cleared by +0.41pp; that is worth seeing, "SELL" is not.
+
+
+def _gate_margin_vi(p_up: float | None, tau: float | None) -> str | None:
+    """`+0.41pp trên cổng (42.41% vs 42.00%)` — or None when either input is absent.
+
+    None (not a guess) when a threshold is missing: the secondary artifact can
+    fail to load, and inventing a margin from a half-known state would be the
+    same class of error as the pinned thresholds fixed on 13-08 and 25-08.
+    """
+    if p_up is None or tau is None:
+        return None
+    pu, th = float(p_up) * 100.0, float(tau) * 100.0
+    # Same anti-collision rule as `_fmt_pct_pair`: two figures the reader is meant
+    # to compare must never render identically.
+    pu_s, th_s = _fmt_pct_pair(pu, th)
+    delta = pu - th
+    side = "trên" if delta >= 0 else "DƯỚI"
+    return f"{delta:+.2f}pp {side} cổng ({pu_s}% vs {th_s}%)"
 
 
 def _horizon_card_fields(
@@ -2076,14 +2106,17 @@ def _dispatch_signals(
             _status = "MUA"
             _ly_do = ""
 
-        _base_idx = max(range(3), key=lambda i: _p5[i])
         signal_data = {
             "action": "MUA",
             "ticker": ticker,
             "price": f"{exec_price:,.0f} VND",
             "horizon_label": f"T+{int(horizon)}",
             # ── Attribution contract (unified card + downstream audit) ────
-            "base_decision_vi": _BASE_DECISION_VI[_base_idx],
+            # Replaces `base_decision_vi` (retired 27-08-26 — it read SELL on
+            # 361/361 names, see `_gate_margin_vi`). `_p5` is the PRIMARY
+            # horizon's probability triple, so pair it with `tau_primary`.
+            "gate_margin_vi": _gate_margin_vi(
+                _p5[2] if len(_p5) >= 3 else None, tau_primary),
             "regime_action_vi": _regime_action_vi,
             # Per-leg, NOT the combined min. Feeding the combined value in as
             # "garch_scalar" mislabelled a breadth- or drift-driven cut as a

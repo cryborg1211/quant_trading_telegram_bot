@@ -217,6 +217,11 @@ class TelegramBot:
 
         # ── Attribution fields (unified 4-section contract) ──────────────
         # All optional: absent → legacy layout, no stray "N/A" lines.
+        # `gate_margin_vi` replaced `base_decision_vi` on 27-08-26: the old field
+        # printed the model's argmax, which is SELL on 361/361 names, so it never
+        # varied and read as a per-name warning. The margin actually moves.
+        # `base_decision_vi` is still honoured for any caller not yet migrated.
+        gate_margin = signal_data.get("gate_margin_vi")
         base_decision = signal_data.get("base_decision_vi")
         garch_scalar = signal_data.get("garch_scalar")
         arb_note = signal_data.get("arb_note_vi")
@@ -242,7 +247,10 @@ class TelegramBot:
                                (tier_label and tier_pct is not None))
 
         base_line = ""
-        if base_decision:
+        if gate_margin:
+            base_line = (f"Biên qua cổng: "
+                         f"<b>{html.escape(str(gate_margin))}</b>\n")
+        elif base_decision:
             base_line = (f"Phân loại gốc của mô hình: "
                          f"<b>{html.escape(str(base_decision))}</b>\n")
 
@@ -343,7 +351,9 @@ class TelegramBot:
         if mr_fired is not None:
             ctx_lines.append("Bắt đáy (MR): "
                              + ("<b>đã kích hoạt</b>" if mr_fired else "chưa kích hoạt"))
-        if base_decision:
+        if gate_margin:
+            ctx_lines.append(f"Biên qua cổng: <b>{html.escape(str(gate_margin))}</b>")
+        elif base_decision:
             ctx_lines.append(f"Phân loại gốc của mô hình: "
                              f"<b>{html.escape(str(base_decision))}</b>")
         ctx_block = ""
