@@ -1,31 +1,31 @@
 {
-  "train_rows": 783272,
-  "train_pos_rate": 0.039668212319602894,
+  "train_rows": 791808,
+  "train_pos_rate": 0.03934034513417394,
   "oof_selection": {
-    "tau": 0.96,
-    "oof_precision": 0.5775,
-    "oof_recall": 0.0117,
-    "oof_fires": 632,
+    "tau": 0.97,
+    "oof_precision": 0.5703,
+    "oof_recall": 0.0023,
+    "oof_fires": 128,
     "target_precision": 0.6,
     "target_precision_met": false,
     "min_fires": 40
   },
   "holdout": {
-    "n": 84061,
-    "pos": 2359,
-    "fires": 17,
-    "precision": 0.6471,
-    "recall": 0.0047,
-    "f1": 0.0093,
-    "avg_precision": 0.3168,
+    "n": 84352,
+    "pos": 2805,
+    "fires": 3,
+    "precision": 0.6667,
+    "recall": 0.0007,
+    "f1": 0.0014,
+    "avg_precision": 0.309,
     "confusion_matrix": [
       [
-        81696,
-        6
+        81546,
+        1
       ],
       [
-        2348,
-        11
+        2803,
+        2
       ]
     ]
   },
@@ -50,7 +50,7 @@
     "subsample_for_bin": 200000,
     "subsample_freq": 1,
     "max_bin": 255,
-    "scale_pos_weight": 24.20910173473657,
+    "scale_pos_weight": 24.4191974317817,
     "device_type": "gpu",
     "gpu_use_dp": false,
     "verbose": -1
